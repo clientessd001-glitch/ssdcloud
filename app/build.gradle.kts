@@ -21,6 +21,12 @@ android {
         buildConfigField("String", "TELEGRAM_API_HASH", "\"$apiHash\"")
     }
 
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     buildFeatures {
         compose = true
         buildConfig = true
@@ -40,7 +46,6 @@ android {
     }
 }
 
-// Trava de segurança: impede que bibliotecas externas forcem o Kotlin 2.2.10
 configurations.all {
     resolutionStrategy.eachDependency {
         if (requested.group == "org.jetbrains.kotlin") {
@@ -65,7 +70,6 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     kapt("androidx.room:room-compiler:$roomVersion")
 
-    // Motor Real do Telegram (TDLib via JitPack) com exclusão de conflito do Kotlin
     implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
         exclude(group = "org.jetbrains.kotlin")
     }
