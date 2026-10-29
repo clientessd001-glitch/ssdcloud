@@ -31,9 +31,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.delay
 
-// Importações do Motor Real do Telegram
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
@@ -124,8 +122,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 Spacer(Modifier.height(24.dp))
                 Button(
                     onClick = { 
-                        // Envio real do número para a TDLib
-                        client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber), null) 
+                        // Adicionado o segundo argumento null exigido pelo construtor da TDLib
+                        client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber, null), null) 
                         loginStep = 1 
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
@@ -139,7 +137,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 Spacer(Modifier.height(24.dp))
                 Button(
                     onClick = { 
-                        // Envio real do código SMS para a TDLib
                         client.send(TdApi.CheckAuthenticationCode(smsCode), null) 
                         loginStep = 2 
                     },
