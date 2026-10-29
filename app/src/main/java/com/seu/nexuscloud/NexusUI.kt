@@ -1,5 +1,10 @@
 package com.seu.nexuscloud
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.*
@@ -11,6 +16,7 @@ import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
 import androidx.lifecycle.ViewModel
@@ -33,8 +39,22 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     fun criarPasta(nome: String) = viewModelScope.launch {
         if (nome.isNotBlank()) dao.criarPasta(PastaNuvem(nomePasta = nome))
     }
-    fun mover(arq: Int, pasta: Int?) = viewModelScope.launch { dao.moverArquivo(arq, pasta) }
+    fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch { dao.salvarArquivo(arq) }
     fun apagar(arq: Int) = viewModelScope.launch { dao.apagarArquivo(arq) }
+}
+
+fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
+    var nome = "Arquivo"
+    var tamanho = 0L
+    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            val iNome = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val iTamanho = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (iNome != -1) nome = cursor.getString(iNome)
+            if (iTamanho != -1) tamanho = cursor.getLong(iTamanho)
+        }
+    }
+    return Pair(nome, tamanho)
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -56,10 +76,26 @@ fun NexusUI(dao: NexusDao) {
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val sheetState = rememberModalBottomSheetState()
+    val context = LocalContext.current
 
     var showStorage by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
     var nomeNovaPasta by remember { mutableStateOf("") }
+
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let {
+            val (nome, tamanho) = obterDetalhesFicheiro(context, it)
+            vm.salvarArquivo(
+                ArquivoNuvem(
+                    fileId = 0,
+                    nomeArquivo = nome,
+                    tamanhoBytes = tamanho,
+                    dataUpload = System.currentTimeMillis(),
+                    caminhoMiniatura = it.toString()
+                )
+            )
+        }
+    }
 
     if (!isLogged) {
         Column(
@@ -77,7 +113,7 @@ fun NexusUI(dao: NexusDao) {
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier.fillMaxWidth().height(56.dp)
             ) {
-                Text("ENTRAR COM TELEGRAM", fontWeight = FontWeight.Bold, color = Color.White)
+                Text("ENTRAR NO SISTEMA", fontWeight = FontWeight.Bold, color = Color.White)
             }
         }
         return
@@ -88,18 +124,14 @@ fun NexusUI(dao: NexusDao) {
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
                 Icon(Icons.Default.AccountCircle, null, tint = Gold, modifier = Modifier.padding(16.dp).size(48.dp))
-                Text("Meu Nexus Cloud", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp))
+                Text("FJU Machine Admin", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp))
                 Spacer(Modifier.height(16.dp))
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Default.PieChart, null) },
                     label = { Text("Armazenamento") },
                     selected = false,
                     onClick = { showStorage = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(
-                        unselectedContainerColor = Color.Transparent,
-                        unselectedTextColor = Color.White,
-                        unselectedIconColor = Gold
-                    )
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
                 )
             }
         }
@@ -127,7 +159,11 @@ fun NexusUI(dao: NexusDao) {
                 }
             },
             floatingActionButton = {
-                FloatingActionButton(onClick = {}, containerColor = DangerRed, contentColor = Color.White) {
+                FloatingActionButton(
+                    onClick = { filePicker.launch(arrayOf("*/*")) },
+                    containerColor = DangerRed,
+                    contentColor = Color.White
+                ) {
                     Icon(Icons.Default.Add, null)
                 }
             },
@@ -135,21 +171,27 @@ fun NexusUI(dao: NexusDao) {
         ) { innerPadding ->
             Box(Modifier.padding(innerPadding).fillMaxSize()) {
                 if (selectedTab == 0) {
-                    LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize()) {
+                    LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(4.dp)) {
                         items(arquivos) { arq ->
                             Box(
                                 modifier = Modifier
                                     .aspectRatio(1f)
-                                    .padding(2.dp)
-                                    .background(SurfaceDark)
-                                    .clickable { selectedFile = arq }
+                                    .padding(4.dp)
+                                    .background(SurfaceDark, RoundedCornerShape(8.dp))
+                                    .clickable { selectedFile = arq },
+                                contentAlignment = Alignment.Center
                             ) {
-                                Text(
-                                    text = arq.nomeArquivo,
-                                    color = Color.White,
-                                    fontSize = 10.sp,
-                                    modifier = Modifier.align(Alignment.BottomCenter).padding(4.dp)
-                                )
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(32.dp))
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(
+                                        text = arq.nomeArquivo,
+                                        color = Color.White,
+                                        fontSize = 10.sp,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 8.dp)
+                                    )
+                                }
                             }
                         }
                     }
@@ -168,74 +210,69 @@ fun NexusUI(dao: NexusDao) {
                                     colors = CardDefaults.cardColors(containerColor = SurfaceDark),
                                     modifier = Modifier.padding(4.dp)
                                 ) {
-                                    Text(pasta.nomePasta, color = Color.White, modifier = Modifier.padding(16.dp))
+                                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Folder, null, tint = Gold)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(pasta.nomePasta, color = Color.White)
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        if (selectedFile != null) {
-            ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
-                Column(Modifier.padding(bottom = 24.dp)) {
-                    Text(selectedFile!!.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
-                    ListItem(
-                        headlineContent = { Text("Baixar", color = Color.White) },
-                        leadingContent = { Icon(Icons.Default.Download, null, tint = Color.White) },
-                        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                    )
-                    ListItem(
-                        headlineContent = { Text("Apagar", color = DangerRed) },
-                        leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
-                        modifier = Modifier.clickable {
-                            vm.apagar(selectedFile!!.id)
-                            selectedFile = null
-                        },
-                        colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                    )
-                }
-            }
-        }
-
-        if (showNewFolder) {
-            AlertDialog(
-                onDismissRequest = { showNewFolder = false },
-                containerColor = SurfaceDark,
-                title = { Text("Nova Pasta", color = Gold, fontWeight = FontWeight.Bold) },
-                text = {
-                    OutlinedTextField(
-                        value = nomeNovaPasta,
-                        onValueChange = { nomeNovaPasta = it },
-                        label = { Text("Nome da pasta", color = Color.Gray) }
-                    )
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            vm.criarPasta(nomeNovaPasta)
-                            nomeNovaPasta = ""
-                            showNewFolder = false
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed)
-                    ) { Text("Criar", color = Color.White) }
-                }
-            )
-        }
-
-        if (showStorage) {
-            AlertDialog(
-                onDismissRequest = { showStorage = false },
-                containerColor = SurfaceDark,
-                title = { Text("Armazenamento", color = Gold, fontWeight = FontWeight.Bold) },
-                text = { Text("Uso Local (Room): ${armazenamento ?: 0} Bytes\n\nNuvem: ILIMITADO DISPONÍVEL", color = Color.White) },
-                confirmButton = {
-                    Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed)) {
-                        Text("Fechar", color = Color.White)
+            if (selectedFile != null) {
+                ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
+                    Column(Modifier.padding(bottom = 24.dp)) {
+                        Text(selectedFile!!.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
+                        ListItem(
+                            headlineContent = { Text("Apagar", color = DangerRed) },
+                            leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
+                            modifier = Modifier.clickable { vm.apagar(selectedFile!!.id); selectedFile = null },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
                     }
                 }
-            )
+            }
+
+            if (showNewFolder) {
+                AlertDialog(
+                    onDismissRequest = { showNewFolder = false },
+                    containerColor = SurfaceDark,
+                    title = { Text("Nova Pasta", color = Gold, fontWeight = FontWeight.Bold) },
+                    text = {
+                        OutlinedTextField(
+                            value = nomeNovaPasta,
+                            onValueChange = { nomeNovaPasta = it },
+                            label = { Text("Nome da pasta", color = Color.Gray) }
+                        )
+                    },
+                    confirmButton = {
+                        Button(
+                            onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false },
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed)
+                        ) { Text("Criar", color = Color.White) }
+                    }
+                )
+            }
+
+            if (showStorage) {
+                AlertDialog(
+                    onDismissRequest = { showStorage = false },
+                    containerColor = SurfaceDark,
+                    title = { Text("Armazenamento", color = Gold, fontWeight = FontWeight.Bold) },
+                    text = {
+                        val mb = (armazenamento ?: 0) / (1024 * 1024)
+                        Text("Uso Local: $mb MB\n\nNuvem: ILIMITADO", color = Color.White)
+                    },
+                    confirmButton = {
+                        Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed)) {
+                            Text("Fechar", color = Color.White)
+                        }
+                    }
+                )
+            }
         }
     }
 }
