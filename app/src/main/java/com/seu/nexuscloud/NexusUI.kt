@@ -77,7 +77,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
 
-    var loginStep by remember { mutableIntStateOf(2) } // Definido para 2 para testes diretos da galeria
+    var loginStep by remember { mutableIntStateOf(0) } // <-- Corrigido para 0 (Mostra o Login)
     var phoneNumber by remember { mutableStateOf("+55 85 9999-9999") }
     var smsCode by remember { mutableStateOf("") }
     
@@ -89,6 +89,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val context = LocalContext.current
 
     var showStorage by remember { mutableStateOf(false) }
+    var showSync by remember { mutableStateOf(false) } // <-- Estado do menu de Sincronização
     var showNewFolder by remember { mutableStateOf(false) }
     var nomeNovaPasta by remember { mutableStateOf("") }
 
@@ -109,16 +110,30 @@ fun NexusUI(dao: NexusDao, client: Client) {
             Spacer(Modifier.height(16.dp))
             Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black)
             Spacer(Modifier.height(48.dp))
-            OutlinedTextField(
-                value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número de Telemóvel", color = Color.Gray) },
-                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(24.dp))
-            Button(
-                onClick = { loginStep = 2 }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-            ) { Text("ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
+
+            if (loginStep == 0) {
+                OutlinedTextField(
+                    value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número de Telemóvel", color = Color.Gray) }, singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = { client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber)); loginStep = 1 },
+                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
+            } else {
+                OutlinedTextField(
+                    value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código de Autenticação", color = Color.Gray) }, singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = { client.send(TdApi.CheckAuthenticationCode(smsCode)); loginStep = 2 },
+                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
+            }
         }
         return
     }
@@ -146,7 +161,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 )
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização") }, selected = false,
-                    onClick = { scope.launch { drawerState.close() } },
+                    onClick = { showSync = true; scope.launch { drawerState.close() } }, // <-- Ativa a aba de Sincronização
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
                 )
             }
@@ -195,7 +210,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         verticalArrangement = Arrangement.spacedBy(2.dp)
                     ) {
                         items(arquivos) { arq ->
-                            // Lógica simples para simular os cartões da imagem baseados no nome do arquivo
                             val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
                             Box(
                                 modifier = Modifier.aspectRatio(1f).background(SurfaceDark).clickable { selectedFile = arq },
@@ -254,14 +268,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
             if (showStorage) {
                 Dialog(onDismissRequest = { showStorage = false }) {
                     Surface(
-                        shape = RoundedCornerShape(16.dp),
-                        color = SurfaceDarker,
-                        border = BorderStroke(1.dp, Gold),
-                        modifier = Modifier.fillMaxWidth()
+                        shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
                             Box(modifier = Modifier.size(72.dp), contentAlignment = Alignment.Center) {
-                                // Círculo tracejado simulado
                                 Canvas(modifier = Modifier.matchParentSize()) {
                                     drawCircle(color = Gold, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)))
                                 }
@@ -276,11 +286,38 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("Armazenamento TDLib", color = TextGrey, fontSize = 10.sp)
                             Spacer(Modifier.height(32.dp))
                             Button(
-                                onClick = { showStorage = false }, 
-                                colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
                             ) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                        }
+                    }
+                }
+            }
+
+            // <-- Novo Menu de Sincronização
+            if (showSync) {
+                Dialog(onDismissRequest = { showSync = false }) {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            Icon(Icons.Default.Sync, null, tint = Gold, modifier = Modifier.size(64.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text("SINCRONIZAÇÃO", color = Gold, fontWeight = FontWeight.Black, fontSize = 20.sp, letterSpacing = 1.sp)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Status: Conectado à TDLib", color = TextGrey, fontSize = 12.sp)
+                            Spacer(Modifier.height(24.dp))
+                            LinearProgressIndicator(
+                                progress = 1f,
+                                modifier = Modifier.fillMaxWidth().height(6.dp),
+                                color = DangerRed,
+                                trackColor = SurfaceDark
+                            )
+                            Spacer(Modifier.height(24.dp))
+                            Button(
+                                onClick = { showSync = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
+                            ) { Text("OK", color = Color.White, fontWeight = FontWeight.Bold) }
                         }
                     }
                 }
