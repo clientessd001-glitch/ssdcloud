@@ -18,6 +18,7 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.*
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -70,7 +71,11 @@ fun NexusUI(dao: NexusDao) {
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
 
-    var isLogged by remember { mutableStateOf(false) }
+    // Sistema de Login: 0 = Pedir Número, 1 = Pedir SMS, 2 = Logado
+    var loginStep by remember { mutableIntStateOf(0) }
+    var phoneNumber by remember { mutableStateOf("+55") }
+    var smsCode by remember { mutableStateOf("") }
+    
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     val scope = rememberCoroutineScope()
@@ -97,7 +102,7 @@ fun NexusUI(dao: NexusDao) {
         }
     }
 
-    if (!isLogged) {
+    if (loginStep < 2) {
         Column(
             modifier = Modifier.fillMaxSize().background(DarkBlue).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -107,13 +112,53 @@ fun NexusUI(dao: NexusDao) {
             Spacer(Modifier.height(16.dp))
             Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black)
             Spacer(Modifier.height(48.dp))
-            Button(
-                onClick = { isLogged = true },
-                colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth().height(56.dp)
-            ) {
-                Text("ENTRAR NO SISTEMA", fontWeight = FontWeight.Bold, color = Color.White)
+
+            if (loginStep == 0) {
+                OutlinedTextField(
+                    value = phoneNumber,
+                    onValueChange = { phoneNumber = it },
+                    label = { Text("Número de Telemóvel", color = Color.Gray) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Gold,
+                        unfocusedBorderColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = { loginStep = 1 }, // Avança para o ecrã do SMS provisoriamente
+                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) {
+                    Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White)
+                }
+            } else {
+                OutlinedTextField(
+                    value = smsCode,
+                    onValueChange = { smsCode = it },
+                    label = { Text("Código de Autenticação", color = Color.Gray) },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color.White,
+                        unfocusedTextColor = Color.White,
+                        focusedBorderColor = Gold,
+                        unfocusedBorderColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = { loginStep = 2 }, // Conclui o login e abre a galeria
+                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth().height(56.dp)
+                ) {
+                    Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White)
+                }
             }
         }
         return
