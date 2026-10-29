@@ -18,7 +18,6 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.*
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -60,7 +59,7 @@ fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NexusUI(dao: NexusDao) {
+fun NexusUI(dao: NexusDao, client: Client) { // <-- Cliente TDLib adicionado aqui
     val vm: UIViewModel = viewModel(
         factory = object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST")
@@ -71,7 +70,6 @@ fun NexusUI(dao: NexusDao) {
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
 
-    // Sistema de Login: 0 = Pedir Número, 1 = Pedir SMS, 2 = Logado
     var loginStep by remember { mutableIntStateOf(0) }
     var phoneNumber by remember { mutableStateOf("+55") }
     var smsCode by remember { mutableStateOf("") }
@@ -91,13 +89,7 @@ fun NexusUI(dao: NexusDao) {
         uri?.let {
             val (nome, tamanho) = obterDetalhesFicheiro(context, it)
             vm.salvarArquivo(
-                ArquivoNuvem(
-                    fileId = 0,
-                    nomeArquivo = nome,
-                    tamanhoBytes = tamanho,
-                    dataUpload = System.currentTimeMillis(),
-                    caminhoMiniatura = it.toString()
-                )
+                ArquivoNuvem(fileId = 0, nomeArquivo = nome, tamanhoBytes = tamanho, dataUpload = System.currentTimeMillis(), caminhoMiniatura = it.toString())
             )
         }
     }
@@ -120,22 +112,21 @@ fun NexusUI(dao: NexusDao) {
                     label = { Text("Número de Telemóvel", color = Color.Gray) },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = Gold,
-                        unfocusedBorderColor = Color.Gray
+                        focusedTextColor = Color.White, unfocusedTextColor = Color.White,
+                        focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(24.dp))
                 Button(
-                    onClick = { loginStep = 1 }, // Avança para o ecrã do SMS provisoriamente
+                    onClick = { 
+                        client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber)) // <-- Envia o número para o motor
+                        loginStep = 1 
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) {
-                    Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White)
-                }
+                ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
             } else {
                 OutlinedTextField(
                     value = smsCode,
@@ -143,22 +134,21 @@ fun NexusUI(dao: NexusDao) {
                     label = { Text("Código de Autenticação", color = Color.Gray) },
                     singleLine = true,
                     colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = Gold,
-                        unfocusedBorderColor = Color.Gray
+                        focusedTextColor = Color.White, unfocusedTextColor = Color.White,
+                        focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(24.dp))
                 Button(
-                    onClick = { loginStep = 2 }, // Conclui o login e abre a galeria
+                    onClick = { 
+                        client.send(TdApi.CheckAuthenticationCode(smsCode)) // <-- Envia o código SMS para o motor
+                        loginStep = 2 
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
                     shape = RoundedCornerShape(12.dp),
                     modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) {
-                    Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White)
-                }
+                ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
             }
         }
         return
@@ -172,9 +162,7 @@ fun NexusUI(dao: NexusDao) {
                 Text("FJU Machine Admin", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp))
                 Spacer(Modifier.height(16.dp))
                 NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.PieChart, null) },
-                    label = { Text("Armazenamento") },
-                    selected = false,
+                    icon = { Icon(Icons.Default.PieChart, null) }, label = { Text("Armazenamento") }, selected = false,
                     onClick = { showStorage = true; scope.launch { drawerState.close() } },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
                 )
@@ -185,14 +173,11 @@ fun NexusUI(dao: NexusDao) {
             topBar = {
                 Column(Modifier.background(DarkBlue)) {
                     Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
-                            Icon(Icons.Default.Menu, null, tint = Color.White)
-                        }
+                        IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }
                         Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black)
                     }
                     TabRow(
-                        selectedTabIndex = selectedTab,
-                        containerColor = DarkBlue,
+                        selectedTabIndex = selectedTab, containerColor = DarkBlue,
                         indicator = { TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(it[selectedTab]), color = Gold) }
                     ) {
                         listOf("GALERIA", "PASTAS").forEachIndexed { i, title ->
@@ -204,11 +189,7 @@ fun NexusUI(dao: NexusDao) {
                 }
             },
             floatingActionButton = {
-                FloatingActionButton(
-                    onClick = { filePicker.launch(arrayOf("*/*")) },
-                    containerColor = DangerRed,
-                    contentColor = Color.White
-                ) {
+                FloatingActionButton(onClick = { filePicker.launch(arrayOf("*/*")) }, containerColor = DangerRed, contentColor = Color.White) {
                     Icon(Icons.Default.Add, null)
                 }
             },
@@ -219,23 +200,13 @@ fun NexusUI(dao: NexusDao) {
                     LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(4.dp)) {
                         items(arquivos) { arq ->
                             Box(
-                                modifier = Modifier
-                                    .aspectRatio(1f)
-                                    .padding(4.dp)
-                                    .background(SurfaceDark, RoundedCornerShape(8.dp))
-                                    .clickable { selectedFile = arq },
+                                modifier = Modifier.aspectRatio(1f).padding(4.dp).background(SurfaceDark, RoundedCornerShape(8.dp)).clickable { selectedFile = arq },
                                 contentAlignment = Alignment.Center
                             ) {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                     Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(32.dp))
                                     Spacer(Modifier.height(4.dp))
-                                    Text(
-                                        text = arq.nomeArquivo,
-                                        color = Color.White,
-                                        fontSize = 10.sp,
-                                        maxLines = 1,
-                                        modifier = Modifier.padding(horizontal = 8.dp)
-                                    )
+                                    Text(text = arq.nomeArquivo, color = Color.White, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(horizontal = 8.dp))
                                 }
                             }
                         }
@@ -243,18 +214,11 @@ fun NexusUI(dao: NexusDao) {
                 } else {
                     Column(Modifier.padding(16.dp)) {
                         OutlinedButton(
-                            onClick = { showNewFolder = true },
-                            border = BorderStroke(1.dp, Gold),
-                            modifier = Modifier.fillMaxWidth().height(56.dp)
-                        ) {
-                            Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold)
-                        }
+                            onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(56.dp)
+                        ) { Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold) }
                         LazyVerticalGrid(columns = GridCells.Fixed(2), modifier = Modifier.padding(top = 16.dp)) {
                             items(pastas) { pasta ->
-                                Card(
-                                    colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-                                    modifier = Modifier.padding(4.dp)
-                                ) {
+                                Card(colors = CardDefaults.cardColors(containerColor = SurfaceDark), modifier = Modifier.padding(4.dp)) {
                                     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Icon(Icons.Default.Folder, null, tint = Gold)
                                         Spacer(Modifier.width(8.dp))
@@ -266,56 +230,32 @@ fun NexusUI(dao: NexusDao) {
                     }
                 }
             }
-
             if (selectedFile != null) {
                 ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
                     Column(Modifier.padding(bottom = 24.dp)) {
                         Text(selectedFile!!.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(16.dp))
                         ListItem(
-                            headlineContent = { Text("Apagar", color = DangerRed) },
-                            leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
+                            headlineContent = { Text("Apagar", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
                             modifier = Modifier.clickable { vm.apagar(selectedFile!!.id); selectedFile = null },
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent)
                         )
                     }
                 }
             }
-
             if (showNewFolder) {
                 AlertDialog(
-                    onDismissRequest = { showNewFolder = false },
-                    containerColor = SurfaceDark,
+                    onDismissRequest = { showNewFolder = false }, containerColor = SurfaceDark,
                     title = { Text("Nova Pasta", color = Gold, fontWeight = FontWeight.Bold) },
-                    text = {
-                        OutlinedTextField(
-                            value = nomeNovaPasta,
-                            onValueChange = { nomeNovaPasta = it },
-                            label = { Text("Nome da pasta", color = Color.Gray) }
-                        )
-                    },
-                    confirmButton = {
-                        Button(
-                            onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false },
-                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed)
-                        ) { Text("Criar", color = Color.White) }
-                    }
+                    text = { OutlinedTextField(value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome da pasta", color = Color.Gray) }) },
+                    confirmButton = { Button(onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed)) { Text("Criar", color = Color.White) } }
                 )
             }
-
             if (showStorage) {
                 AlertDialog(
-                    onDismissRequest = { showStorage = false },
-                    containerColor = SurfaceDark,
+                    onDismissRequest = { showStorage = false }, containerColor = SurfaceDark,
                     title = { Text("Armazenamento", color = Gold, fontWeight = FontWeight.Bold) },
-                    text = {
-                        val mb = (armazenamento ?: 0) / (1024 * 1024)
-                        Text("Uso Local: $mb MB\n\nNuvem: ILIMITADO", color = Color.White)
-                    },
-                    confirmButton = {
-                        Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed)) {
-                            Text("Fechar", color = Color.White)
-                        }
-                    }
+                    text = { Text("Uso Local: ${(armazenamento ?: 0) / (1024 * 1024)} MB\n\nNuvem: ILIMITADO", color = Color.White) },
+                    confirmButton = { Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed)) { Text("Fechar", color = Color.White) } }
                 )
             }
         }
