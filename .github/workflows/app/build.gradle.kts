@@ -39,5 +39,5 @@ dependencies {
     ksp("androidx.room:room-compiler:$roomVer")
     
     implementation("androidx.work:work-runtime-ktx:2.9.0")
-    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
+    implementation("com.github.core-tg:tdlib-android:1.8.0")
 }
