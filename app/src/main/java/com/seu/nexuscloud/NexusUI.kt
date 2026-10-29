@@ -79,9 +79,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
 
-    var loginStep by remember { mutableIntStateOf(0) }
-    var phoneNumber by remember { mutableStateOf("+55") }
+    // Escuta o estado real vindo dos servidores do Telegram
+    val loginStep by TelegramAuth.step.collectAsState()
+    val statusText by TelegramAuth.statusText.collectAsState()
+    val errorText by TelegramAuth.errorText.collectAsState()
+
+    var phoneNumber by remember { mutableStateOf("+5585") }
     var smsCode by remember { mutableStateOf("") }
+    var password2FA by remember { mutableStateOf("") }
     
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
@@ -93,7 +98,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showStorage by remember { mutableStateOf(false) }
     var showSync by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
-    var nomeNovaPasta by remember { mutableStateOf("") }
+
+    val responseHandler = remember {
+        Client.ResultHandler { obj ->
+            if (obj is TdApi.Error) {
+                TelegramAuth.errorText.value = "Erro (${obj.code}): ${obj.message}"
+            }
+        }
+    }
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
@@ -102,7 +114,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    if (loginStep < 2) {
+    if (loginStep < 3) {
         Column(
             modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -111,37 +123,67 @@ fun NexusUI(dao: NexusDao, client: Client) {
             Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp))
             Spacer(Modifier.height(16.dp))
             Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black)
-            Spacer(Modifier.height(48.dp))
+            Spacer(Modifier.height(8.dp))
+            Text(statusText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
 
-            if (loginStep == 0) {
-                OutlinedTextField(
-                    value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número de Telemóvel", color = Color.Gray) }, singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(24.dp))
-                Button(
-                    onClick = { 
-                        // Adicionado o segundo argumento null exigido pelo construtor da TDLib
-                        client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber, null), null) 
-                        loginStep = 1 
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
-            } else {
-                OutlinedTextField(
-                    value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código de Autenticação", color = Color.Gray) }, singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(24.dp))
-                Button(
-                    onClick = { 
-                        client.send(TdApi.CheckAuthenticationCode(smsCode), null) 
-                        loginStep = 2 
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
+            if (errorText != null) {
+                Spacer(Modifier.height(12.dp))
+                Text(errorText!!, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+            }
+
+            Spacer(Modifier.height(32.dp))
+
+            when (loginStep) {
+                0 -> {
+                    OutlinedTextField(
+                        value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (Ex: +5585999999999)", color = Color.Gray) }, singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Button(
+                        onClick = { 
+                            TelegramAuth.errorText.value = null
+                            TelegramAuth.statusText.value = "Contactando servidores do Telegram..."
+                            val cleanPhone = phoneNumber.replace(" ", "").replace("-", "")
+                            val settings = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
+                            client.send(TdApi.SetAuthenticationPhoneNumber(cleanPhone, settings), responseHandler) 
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                    ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
+                }
+                1 -> {
+                    OutlinedTextField(
+                        value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código recebido no Telegram/SMS", color = Color.Gray) }, singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Button(
+                        onClick = { 
+                            TelegramAuth.errorText.value = null
+                            TelegramAuth.statusText.value = "Verificando código..."
+                            client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler) 
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                    ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
+                }
+                2 -> {
+                    OutlinedTextField(
+                        value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha de Duas Etapas (2FA)", color = Color.Gray) }, singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Button(
+                        onClick = { 
+                            TelegramAuth.errorText.value = null
+                            TelegramAuth.statusText.value = "Verificando senha..."
+                            client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler) 
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                    ) { Text("DESBLOQUEAR CONTA", fontWeight = FontWeight.Bold, color = Color.White) }
+                }
             }
         }
         return
