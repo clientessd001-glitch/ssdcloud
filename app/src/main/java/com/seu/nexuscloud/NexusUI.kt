@@ -33,6 +33,10 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 
+// Importações do Motor Real do Telegram
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+
 val BgBlack = Color(0xFF05070A)
 val SurfaceDark = Color(0xFF161A25)
 val SurfaceDarker = Color(0xFF10131B)
@@ -77,8 +81,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
 
-    var loginStep by remember { mutableIntStateOf(0) } // <-- Corrigido para 0 (Mostra o Login)
-    var phoneNumber by remember { mutableStateOf("+55 85 9999-9999") }
+    var loginStep by remember { mutableIntStateOf(0) }
+    var phoneNumber by remember { mutableStateOf("+55") }
     var smsCode by remember { mutableStateOf("") }
     
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -89,7 +93,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val context = LocalContext.current
 
     var showStorage by remember { mutableStateOf(false) }
-    var showSync by remember { mutableStateOf(false) } // <-- Estado do menu de Sincronização
+    var showSync by remember { mutableStateOf(false) }
     var showNewFolder by remember { mutableStateOf(false) }
     var nomeNovaPasta by remember { mutableStateOf("") }
 
@@ -119,7 +123,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 )
                 Spacer(Modifier.height(24.dp))
                 Button(
-                    onClick = { client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber)); loginStep = 1 },
+                    onClick = { 
+                        // Envio real do número para a TDLib
+                        client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber), null) 
+                        loginStep = 1 
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
                 ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
             } else {
@@ -130,7 +138,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 )
                 Spacer(Modifier.height(24.dp))
                 Button(
-                    onClick = { client.send(TdApi.CheckAuthenticationCode(smsCode)); loginStep = 2 },
+                    onClick = { 
+                        // Envio real do código SMS para a TDLib
+                        client.send(TdApi.CheckAuthenticationCode(smsCode), null) 
+                        loginStep = 2 
+                    },
                     colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
                 ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
             }
@@ -161,7 +173,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 )
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização") }, selected = false,
-                    onClick = { showSync = true; scope.launch { drawerState.close() } }, // <-- Ativa a aba de Sincronização
+                    onClick = { showSync = true; scope.launch { drawerState.close() } },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
                 )
             }
@@ -294,7 +306,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             }
 
-            // <-- Novo Menu de Sincronização
             if (showSync) {
                 Dialog(onDismissRequest = { showSync = false }) {
                     Surface(
