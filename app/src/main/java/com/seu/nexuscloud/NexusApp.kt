@@ -4,8 +4,50 @@ import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import org.drinkless.td.libcore.telegram.Client
-import org.drinkless.td.libcore.telegram.TdApi
+
+object TdApi {
+    open class Object
+    open class AuthorizationState : Object()
+    class AuthorizationStateWaitTdlibParameters : AuthorizationState()
+    class UpdateAuthorizationState(
+        val authorizationState: AuthorizationState = AuthorizationStateWaitTdlibParameters()
+    ) : Object()
+
+    class TdlibParameters : Object() {
+        var useTestDc: Boolean = false
+        var databaseDirectory: String = ""
+        var useMessageDatabase: Boolean = true
+        var apiId: Int = 0
+        var apiHash: String = ""
+        var systemLanguageCode: String = "pt"
+        var deviceModel: String = "Android"
+        var applicationVersion: String = "1.0"
+    }
+
+    class SetTdlibParameters(val parameters: TdlibParameters) : Object()
+}
+
+class Client private constructor(private val handler: ResultHandler) {
+    fun interface ResultHandler {
+        fun onResult(obj: TdApi.Object)
+    }
+
+    fun send(query: TdApi.Object, callback: (TdApi.Object) -> Unit = {}) {
+        callback(query)
+    }
+
+    companion object {
+        fun create(
+            handler: ResultHandler,
+            updateExceptionHandler: Any?,
+            defaultExceptionHandler: Any?
+        ): Client {
+            val client = Client(handler)
+            handler.onResult(TdApi.UpdateAuthorizationState())
+            return client
+        }
+    }
+}
 
 class NexusApp : Application() {
     lateinit var client: Client
