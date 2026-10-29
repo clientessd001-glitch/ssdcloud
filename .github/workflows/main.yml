@@ -1,15 +1,16 @@
-name: Compilar APK Nexus Cloud
+name: Android CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout do Código
+      - name: Fazer Checkout do Código
         uses: actions/checkout@v4
 
       - name: Configurar JDK 17
@@ -25,12 +26,12 @@ jobs:
 
       - name: Compilar APK de Debug
         env:
-          API_ID_SECRETA: ${{ secrets.TELEGRAM_API_ID }}
-          API_HASH_SECRETA: ${{ secrets.TELEGRAM_API_HASH }}
-        run: gradle assembleDebug
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: gradle assembleDebug --stacktrace
 
       - name: Upload do APK Pronto
         uses: actions/upload-artifact@v4
         with:
-          name: nexus-cloud-apk
+          name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
