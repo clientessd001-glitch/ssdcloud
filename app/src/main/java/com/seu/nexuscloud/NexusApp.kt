@@ -4,6 +4,8 @@ import android.app.Application
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.darkColorScheme
 
 object TdApi {
     open class Object
@@ -36,15 +38,17 @@ class Client private constructor(private val handler: ResultHandler) {
         callback(query)
     }
 
+    fun inicializar() {
+        handler.onResult(TdApi.UpdateAuthorizationState())
+    }
+
     companion object {
         fun create(
             handler: ResultHandler,
             updateExceptionHandler: Any?,
             defaultExceptionHandler: Any?
         ): Client {
-            val client = Client(handler)
-            handler.onResult(TdApi.UpdateAuthorizationState())
-            return client
+            return Client(handler)
         }
     }
 }
@@ -55,6 +59,7 @@ class NexusApp : Application() {
     override fun onCreate() {
         super.onCreate()
         client = Client.create(TelegramHandler(this), null, null)
+        client.inicializar()
     }
 }
 
@@ -81,7 +86,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val db = NexusDB.get(this)
         setContent {
-            NexusUI(db.dao())
+            MaterialTheme(colorScheme = darkColorScheme()) {
+                NexusUI(db.dao())
+            }
         }
     }
 }
