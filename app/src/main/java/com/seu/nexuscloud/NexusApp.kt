@@ -15,7 +15,6 @@ class NexusApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        // O Cliente agora liga-se fisicamente aos servidores do Telegram
         client = Client.create(TelegramHandler(this), null, null)
         client.send(TdApi.GetAuthorizationState(), TelegramHandler(this))
     }
@@ -24,23 +23,23 @@ class NexusApp : Application() {
 class TelegramHandler(private val app: Application) : Client.ResultHandler {
     override fun onResult(obj: TdApi.Object) {
         if (obj is TdApi.UpdateAuthorizationState) {
-            when (val state = obj.authorizationState) {
+            when (obj.authorizationState) {
                 is TdApi.AuthorizationStateWaitTdlibParameters -> {
-                    val params = TdApi.TdlibParameters().apply {
+                    val request = TdApi.SetTdlibParameters().apply {
                         databaseDirectory = app.filesDir.absolutePath + "/tdlib"
                         useMessageDatabase = true
-                        useTestDc = false
+                        useSecretChats = false
                         apiId = BuildConfig.TELEGRAM_API_ID
                         apiHash = BuildConfig.TELEGRAM_API_HASH
                         systemLanguageCode = "pt"
                         deviceModel = "Android"
                         applicationVersion = "1.0"
                     }
-                    (app as NexusApp).client.send(TdApi.SetTdlibParameters(params), this)
+                    (app as NexusApp).client.send(request, this)
                 }
-                is TdApi.AuthorizationStateWaitPhoneNumber -> Log.d("NexusCloud", "Aguardando SMS")
-                is TdApi.AuthorizationStateWaitCode -> Log.d("NexusCloud", "Aguardando Código")
-                is TdApi.AuthorizationStateReady -> Log.d("NexusCloud", "Autenticado!")
+                is TdApi.AuthorizationStateWaitPhoneNumber -> Log.d("NexusCloud", "Aguardando Número")
+                is TdApi.AuthorizationStateWaitCode -> Log.d("NexusCloud", "Aguardando SMS")
+                is TdApi.AuthorizationStateReady -> Log.d("NexusCloud", "Autenticado na Nuvem!")
             }
         }
     }
