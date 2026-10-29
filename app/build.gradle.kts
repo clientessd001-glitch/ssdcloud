@@ -40,6 +40,15 @@ android {
     }
 }
 
+// Trava de segurança: impede que bibliotecas externas forcem o Kotlin 2.2.10
+configurations.all {
+    resolutionStrategy.eachDependency {
+        if (requested.group == "org.jetbrains.kotlin") {
+            useVersion("1.9.22")
+        }
+    }
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
@@ -56,6 +65,8 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     kapt("androidx.room:room-compiler:$roomVersion")
 
-    // Motor Real do Telegram (TDLib via JitPack)
-    implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT")
+    // Motor Real do Telegram (TDLib via JitPack) com exclusão de conflito do Kotlin
+    implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
+        exclude(group = "org.jetbrains.kotlin")
+    }
 }
