@@ -110,9 +110,19 @@ fun enviarParaMensagensSalvas(client: Client, caminhoLocal: String, nomeOriginal
                     val inputFile = TdApi.InputFileLocal(caminhoLocal)
                     val legenda = TdApi.FormattedText("☁️ Nexus Cloud • $nomeOriginal", emptyArray())
                     val conteudo = TdApi.InputMessageDocument(inputFile, null, false, legenda)
-                    client.send(TdApi.SendMessage(chatObj.id, 0, 0, null, null, conteudo)) { msgObj ->
+                    
+                    // CORREÇÃO DE SEGURANÇA 1: Usar o bloco apply seguro para a TDLib
+                    val req = TdApi.SendMessage().apply {
+                        chatId = chatObj.id
+                        inputMessageContent = conteudo
+                    }
+                    
+                    client.send(req) { msgObj ->
                         when (msgObj) {
-                            is TdApi.Message -> onResult(true, (msgObj.content as? TdApi.MessageDocument)?.document?.document?.id ?: 0, "Enviado para Mensagens Salvas!")
+                            is TdApi.Message -> {
+                                val fileId = (msgObj.content as? TdApi.MessageDocument)?.document?.document?.id ?: 0
+                                onResult(true, fileId, "Enviado para Mensagens Salvas!")
+                            }
                             is TdApi.Error -> onResult(false, 0, "Erro TDLib: ${msgObj.message}")
                             else -> onResult(true, 0, "Upload iniciado na TDLib!")
                         }
@@ -171,8 +181,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
-    
-    // NOVO ESTADO: Ficheiro a ser mostrado em ecrã inteiro
     var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     
     val scope = rememberCoroutineScope()
@@ -216,7 +224,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // VISUALIZADOR INTERNO EM ECRÃ INTEIRO
     if (viewerFile != null) {
         Dialog(
             onDismissRequest = { viewerFile = null },
@@ -234,13 +241,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         modifier = Modifier.fillMaxSize()
                     )
                 } else if (isVideo) {
+                    // CORREÇÃO DE SEGURANÇA 2: Resolução exata de contexto do VideoView para não falhar
                     AndroidView(
                         factory = { ctx ->
-                            android.widget.VideoView(ctx).apply {
-                                setVideoURI(Uri.parse(viewerFile!!.caminhoMiniatura))
-                                setMediaController(android.widget.MediaController(ctx).apply { setAnchorView(this@apply) })
-                                start()
-                            }
+                            val videoView = android.widget.VideoView(ctx)
+                            val mediaController = android.widget.MediaController(ctx)
+                            mediaController.setAnchorView(videoView)
+                            videoView.setMediaController(mediaController)
+                            videoView.setVideoURI(Uri.parse(viewerFile!!.caminhoMiniatura))
+                            videoView.start()
+                            videoView
                         },
                         modifier = Modifier.fillMaxSize().align(Alignment.Center)
                     )
@@ -248,7 +258,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(64.dp))
                         Spacer(Modifier.height(16.dp))
-                        Text("Documento/Ficheiro sem pré-visualização interna.", color = Color.White)
+                        Text("Sem visualização interna.", color = Color.White)
                     }
                 }
 
@@ -268,7 +278,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                             context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
                         } catch (e: Exception) {
-                            Toast.makeText(context, "Por favor, baixe o ficheiro para o partilhar.", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, "Baixe o ficheiro para partilhar.", Toast.LENGTH_SHORT).show()
                         }
                     }) { Icon(Icons.Default.Share, null, tint = Color.White) }
                 }
@@ -284,7 +294,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
             when (loginStep) {
                 0 -> {
                     OutlinedTextField(value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (+55...)", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp))
-                    Button(onClick = { TelegramAuth.errorText.value = null; TelegramAuth.statusText.value = "A contactar..."; client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber.replace(" ", "").replace("-", ""), TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENVIAR SMS", fontWeight = FontWeight.Bold, color = Color.White) }
+                    Button(
+                        onClick = { 
+                            TelegramAuth.errorText.value = null; TelegramAuth.statusText.value = "A contactar..."
+                            val settings = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
+                            client.send(TdApi.SetAuthenticationPhoneNumber(phoneNumber.replace(" ", "").replace("-", ""), settings), responseHandler) 
+                        }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
+                    ) { Text("ENVIAR SMS", fontWeight = FontWeight.Bold, color = Color.White) }
                 }
                 1 -> {
                     OutlinedTextField(value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código recebido", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp))
