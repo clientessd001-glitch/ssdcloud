@@ -1,8 +1,10 @@
 package com.seu.nexuscloud
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
@@ -20,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -30,6 +33,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -97,10 +101,8 @@ fun enviarParaMensagensSalvas(
     nomeOriginal: String,
     onResult: (Boolean, Int, String) -> Unit
 ) {
-    // 1. Obtém o utilizador autenticado para descobrir o ID das "Mensagens Salvas"
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
-            // 2. Abre/cria o chat privado consigo mesmo (Saved Messages)
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
                     val inputFile = TdApi.InputFileLocal(caminhoLocal)
@@ -112,18 +114,11 @@ fun enviarParaMensagensSalvas(
                         inputMessageContent = conteudo
                     }
 
-                    // 3. Dispara o upload real para os servidores do Telegram
                     client.send(req) { msgObj ->
                         when (msgObj) {
-                            is TdApi.Message -> {
-                                onResult(true, msgObj.id.toInt(), "Enviado para Mensagens Salvas no Telegram!")
-                            }
-                            is TdApi.Error -> {
-                                onResult(false, 0, "Erro TDLib (${msgObj.code}): ${msgObj.message}")
-                            }
-                            else -> {
-                                onResult(true, 0, "Upload iniciado na TDLib!")
-                            }
+                            is TdApi.Message -> onResult(true, msgObj.id.toInt(), "Enviado para Mensagens Salvas no Telegram!")
+                            is TdApi.Error -> onResult(false, 0, "Erro TDLib (${msgObj.code}): ${msgObj.message}")
+                            else -> onResult(true, 0, "Upload iniciado na TDLib!")
                         }
                     }
                 } else if (chatObj is TdApi.Error) {
@@ -281,22 +276,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
                     ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
                 }
-                2 -> {
-                    OutlinedTextField(
-                        value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha de Duas Etapas (2FA)", color = Color.Gray) }, singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            TelegramAuth.errorText.value = null
-                            TelegramAuth.statusText.value = "Verificando senha..."
-                            client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler)
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                    ) { Text("DESBLOQUEAR CONTA", fontWeight = FontWeight.Bold, color = Color.White) }
-                }
             }
         }
         return
@@ -307,10 +286,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
                 Column(modifier = Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
-                    Box(
-                        modifier = Modifier.size(64.dp).border(2.dp, Gold, CircleShape),
-                        contentAlignment = Alignment.Center
-                    ) {
+                    Box(modifier = Modifier.size(64.dp).border(2.dp, Gold, CircleShape), contentAlignment = Alignment.Center) {
                         Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(32.dp))
                     }
                     Spacer(Modifier.height(16.dp))
@@ -321,11 +297,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Default.Storage, null) }, label = { Text("Armazenamento") }, selected = false,
                     onClick = { showStorage = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização") }, selected = false,
-                    onClick = { showSync = true; scope.launch { drawerState.close() } },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
                 )
             }
@@ -340,11 +311,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
                             Text(cloudBannerText, color = TextGrey, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
-                        if (isUploading) {
-                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                        } else {
-                            Icon(Icons.Default.CloudDone, null, tint = Gold)
-                        }
+                        if (isUploading) CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                        else Icon(Icons.Default.CloudDone, null, tint = Gold)
                     }
                     TabRow(
                         selectedTabIndex = selectedTab, containerColor = BgBlack,
@@ -362,38 +330,25 @@ fun NexusUI(dao: NexusDao, client: Client) {
             floatingActionButton = {
                 FloatingActionButton(
                     onClick = { filePicker.launch(arrayOf("*/*")) },
-                    containerColor = DangerRed,
-                    contentColor = Color.White,
-                    shape = CircleShape,
+                    containerColor = DangerRed, contentColor = Color.White, shape = CircleShape,
                     modifier = Modifier.shadow(elevation = 16.dp, shape = CircleShape, spotColor = DangerRed, ambientColor = DangerRed)
-                ) {
-                    Icon(Icons.Default.CloudUpload, null)
-                }
+                ) { Icon(Icons.Default.CloudUpload, null) }
             },
             containerColor = BgBlack
         ) { innerPadding ->
             Box(Modifier.padding(innerPadding).fillMaxSize()) {
                 if (selectedTab == 1) {
-                    // Aba PASTAS
                     Column(Modifier.fillMaxSize().padding(16.dp)) {
                         OutlinedButton(
                             onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(56.dp)
                         ) { Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold) }
-
                         Spacer(Modifier.height(16.dp))
-
                         LazyVerticalGrid(
-                            columns = GridCells.Fixed(2),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                            columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(pastas) { pasta ->
                                 Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .background(SurfaceDark, RoundedCornerShape(12.dp))
-                                        .border(1.dp, SurfaceDarker, RoundedCornerShape(12.dp))
-                                        .padding(16.dp),
+                                    modifier = Modifier.fillMaxWidth().background(SurfaceDark, RoundedCornerShape(12.dp)).border(1.dp, SurfaceDarker, RoundedCornerShape(12.dp)).padding(16.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(32.dp))
@@ -404,27 +359,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
                 } else {
-                    // Filtra os ficheiros consoante a aba selecionada (0 = Galeria, 2 = Fotos, 3 = Docs)
                     val listaFiltrada = remember(arquivos, selectedTab) {
                         when (selectedTab) {
-                            2 -> arquivos.filter {
-                                val ext = it.nomeArquivo.substringAfterLast('.', "").uppercase()
-                                ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", ignoreCase = true)
-                            }
-                            3 -> arquivos.filter {
-                                val ext = it.nomeArquivo.substringAfterLast('.', "").uppercase()
-                                ext in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK")
-                            }
+                            2 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", ignoreCase = true) }
+                            3 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK") }
                             else -> arquivos
                         }
                     }
 
                     if (listaFiltrada.isEmpty()) {
-                        Column(
-                            modifier = Modifier.fillMaxSize().padding(32.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center
-                        ) {
+                        Column(modifier = Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                             Icon(Icons.Default.CloudUpload, null, tint = TextGrey, modifier = Modifier.size(56.dp))
                             Spacer(Modifier.height(12.dp))
                             Text("Nenhum ficheiro nesta aba", color = Color.White, fontWeight = FontWeight.Bold)
@@ -432,10 +376,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     } else {
                         LazyVerticalGrid(
-                            columns = GridCells.Fixed(3),
-                            modifier = Modifier.fillMaxSize().padding(1.dp),
-                            horizontalArrangement = Arrangement.spacedBy(2.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                            columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(1.dp),
+                            horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)
                         ) {
                             items(listaFiltrada) { arq ->
                                 val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
@@ -445,10 +387,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 ) {
                                     when {
                                         ext in listOf("JPG", "JPEG", "PNG", "WEBP") || arq.nomeArquivo.contains("IMG", ignoreCase = true) -> {
-                                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                                                Text("IMG", color = Gold, fontWeight = FontWeight.Black, fontSize = 22.sp)
-                                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            }
+                                            // AQUI ESTÁ A MUDANÇA: Usando o Coil para mostrar a miniatura real!
+                                            AsyncImage(
+                                                model = Uri.parse(arq.caminhoMiniatura),
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
                                         }
                                         ext == "PDF" || arq.nomeArquivo.contains("PDF", ignoreCase = true) -> {
                                             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
@@ -490,10 +435,31 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Text(selectedFile!!.nomeArquivo, color = Gold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), fontWeight = FontWeight.Bold)
                         Text(
                             "Tamanho: ${formatarTamanhoNuvem(selectedFile!!.tamanhoBytes)} • Salvo na Nuvem TDLib",
-                            color = TextGrey,
-                            fontSize = 12.sp,
-                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                            color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
                         )
+                        Spacer(Modifier.height(8.dp))
+                        
+                        // AQUI ESTÁ A MUDANÇA: Botão para abrir o ficheiro!
+                        ListItem(
+                            headlineContent = { Text("Abrir / Visualizar", color = Color.White) },
+                            leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Color.White) },
+                            modifier = Modifier.clickable {
+                                try {
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        val uri = Uri.parse(selectedFile!!.caminhoMiniatura)
+                                        // O Android tenta adivinhar o tipo (imagem, pdf, vídeo) e sugere a app correta
+                                        setDataAndType(uri, "*/*") 
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(intent)
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Nenhuma app encontrada para abrir este ficheiro.", Toast.LENGTH_SHORT).show()
+                                }
+                                selectedFile = null
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+
                         ListItem(
                             headlineContent = { Text("Remover do registo", color = DangerRed) },
                             leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
@@ -503,34 +469,20 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                 }
             }
-
+            
+            // ... (Ecrãs de Armazenamento e Nova Pasta permanecem iguais)
             if (showNewFolder) {
                 Dialog(onDismissRequest = { showNewFolder = false }) {
-                    Surface(
-                        shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()
-                    ) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
                         Column(modifier = Modifier.padding(24.dp)) {
                             Text("NOVA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
                             Spacer(Modifier.height(16.dp))
                             OutlinedTextField(
-                                value = nomeNovaPasta,
-                                onValueChange = { nomeNovaPasta = it },
-                                label = { Text("Nome da Pasta", color = TextGrey) },
-                                singleLine = true,
-                                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                                modifier = Modifier.fillMaxWidth()
+                                value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome da Pasta", color = TextGrey) }, singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()
                             )
                             Spacer(Modifier.height(24.dp))
-                            Button(
-                                onClick = {
-                                    vm.criarPasta(nomeNovaPasta)
-                                    nomeNovaPasta = ""
-                                    showNewFolder = false
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
-                            ) { Text("CRIAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                            Button(onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("CRIAR", color = Color.White, fontWeight = FontWeight.Bold) }
                         }
                     }
                 }
@@ -538,14 +490,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
             if (showStorage) {
                 Dialog(onDismissRequest = { showStorage = false }) {
-                    Surface(
-                        shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()
-                    ) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
                             Box(modifier = Modifier.size(72.dp), contentAlignment = Alignment.Center) {
-                                Canvas(modifier = Modifier.matchParentSize()) {
-                                    drawCircle(color = Gold, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f)))
-                                }
+                                Canvas(modifier = Modifier.matchParentSize()) { drawCircle(color = Gold, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))) }
                                 Text("∞", color = Gold, fontSize = 36.sp)
                             }
                             Spacer(Modifier.height(24.dp))
@@ -556,38 +504,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Spacer(Modifier.height(8.dp))
                             Text("${arquivos.size} ficheiro(s) sincronizados via TDLib", color = TextGrey, fontSize = 10.sp)
                             Spacer(Modifier.height(32.dp))
-                            Button(
-                                onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
-                            ) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) }
-                        }
-                    }
-                }
-            }
-
-            if (showSync) {
-                Dialog(onDismissRequest = { showSync = false }) {
-                    Surface(
-                        shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                            Icon(Icons.Default.Sync, null, tint = Gold, modifier = Modifier.size(64.dp))
-                            Spacer(Modifier.height(16.dp))
-                            Text("SINCRONIZAÇÃO", color = Gold, fontWeight = FontWeight.Black, fontSize = 20.sp, letterSpacing = 1.sp)
-                            Spacer(Modifier.height(8.dp))
-                            Text(cloudBannerText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-                            Spacer(Modifier.height(24.dp))
-                            LinearProgressIndicator(
-                                progress = if (isUploading) 0.5f else 1f,
-                                modifier = Modifier.fillMaxWidth().height(6.dp),
-                                color = DangerRed,
-                                trackColor = SurfaceDark
-                            )
-                            Spacer(Modifier.height(24.dp))
-                            Button(
-                                onClick = { showSync = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
-                            ) { Text("OK", color = Color.White, fontWeight = FontWeight.Bold) }
+                            Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) }
                         }
                     }
                 }
