@@ -143,6 +143,26 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     }
 }
 
+@Composable
+fun LinhaSincronizacao(nomePasta: String, ativo: Boolean, onAtivoChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.FolderSync, null, tint = if (ativo) Gold else TextGrey, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Text(nomePasta, color = if (ativo) Color.White else TextGrey, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        }
+        Switch(
+            checked = ativo,
+            onCheckedChange = onAtivoChange,
+            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = DangerRed, uncheckedThumbColor = TextGrey, uncheckedTrackColor = SurfaceDark)
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
@@ -176,6 +196,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showNewFolder by remember { mutableStateOf(false) }
     var nomeNovaPasta by remember { mutableStateOf("") }
 
+    var syncCamera by remember { mutableStateOf(true) }
+    var syncWhatsApp by remember { mutableStateOf(false) }
+    var syncDownloads by remember { mutableStateOf(false) }
+    var syncDocumentos by remember { mutableStateOf(false) }
+
     var isUploading by remember { mutableStateOf(false) }
     var cloudBannerText by remember { mutableStateOf("Nuvem TDLib Ativa • Mensagens Salvas") }
 
@@ -189,6 +214,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
+            // CORREÇÃO 1: Tranca a permissão de leitura permanentemente no Android
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    it,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // Dispositivos mais antigos podem não suportar, ignoramos o erro
+            }
+
             scope.launch {
                 isUploading = true
                 val (nome, tamanho) = obterDetalhesFicheiro(context, it)
@@ -299,6 +334,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     onClick = { showStorage = true; scope.launch { drawerState.close() } },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
                 )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização Auto") }, selected = false,
+                    onClick = { showSync = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
             }
         }
     ) {
@@ -387,7 +427,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 ) {
                                     when {
                                         ext in listOf("JPG", "JPEG", "PNG", "WEBP") || arq.nomeArquivo.contains("IMG", ignoreCase = true) -> {
-                                            // AQUI ESTÁ A MUDANÇA: Usando o Coil para mostrar a miniatura real!
                                             AsyncImage(
                                                 model = Uri.parse(arq.caminhoMiniatura),
                                                 contentDescription = arq.nomeArquivo,
@@ -439,21 +478,22 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         )
                         Spacer(Modifier.height(8.dp))
                         
-                        // AQUI ESTÁ A MUDANÇA: Botão para abrir o ficheiro!
                         ListItem(
                             headlineContent = { Text("Abrir / Visualizar", color = Color.White) },
                             leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Color.White) },
                             modifier = Modifier.clickable {
                                 try {
+                                    val uri = Uri.parse(selectedFile!!.caminhoMiniatura)
+                                    // CORREÇÃO 2: Ler o tipo do ficheiro diretamente do sistema
+                                    val mimeType = context.contentResolver.getType(uri) ?: "*/*"
+                                    
                                     val intent = Intent(Intent.ACTION_VIEW).apply {
-                                        val uri = Uri.parse(selectedFile!!.caminhoMiniatura)
-                                        // O Android tenta adivinhar o tipo (imagem, pdf, vídeo) e sugere a app correta
-                                        setDataAndType(uri, "*/*") 
+                                        setDataAndType(uri, mimeType) 
                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                     }
                                     context.startActivity(intent)
                                 } catch (e: Exception) {
-                                    Toast.makeText(context, "Nenhuma app encontrada para abrir este ficheiro.", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Erro: Este ficheiro já não se encontra no telemóvel.", Toast.LENGTH_SHORT).show()
                                 }
                                 selectedFile = null
                             },
@@ -470,7 +510,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             }
             
-            // ... (Ecrãs de Armazenamento e Nova Pasta permanecem iguais)
             if (showNewFolder) {
                 Dialog(onDismissRequest = { showNewFolder = false }) {
                     Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
@@ -505,6 +544,33 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("${arquivos.size} ficheiro(s) sincronizados via TDLib", color = TextGrey, fontSize = 10.sp)
                             Spacer(Modifier.height(32.dp))
                             Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                        }
+                    }
+                }
+            }
+
+            if (showSync) {
+                Dialog(onDismissRequest = { showSync = false }) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            Icon(Icons.Default.CloudSync, null, tint = Gold, modifier = Modifier.size(56.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text("BACKUP AUTOMÁTICO", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp, letterSpacing = 1.sp)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Escolha as pastas locais que deseja enviar automaticamente para a nuvem.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(24.dp))
+                            Column(modifier = Modifier.fillMaxWidth()) {
+                                LinhaSincronizacao("Câmera (Fotos e Vídeos)", syncCamera) { syncCamera = it }
+                                LinhaSincronizacao("WhatsApp Images", syncWhatsApp) { syncWhatsApp = it }
+                                LinhaSincronizacao("Downloads", syncDownloads) { syncDownloads = it }
+                                LinhaSincronizacao("Documentos / PDFs", syncDocumentos) { syncDocumentos = it }
+                            }
+                            Spacer(Modifier.height(24.dp))
+                            Button(
+                                onClick = { showSync = false; cloudBannerText = "Sincronização em segundo plano ativada!" }, 
+                                colors = ButtonDefaults.buttonColors(containerColor = DangerRed), 
+                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
+                            ) { Text("SALVAR PREFERÊNCIAS", color = Color.White, fontWeight = FontWeight.Bold) }
                         }
                     }
                 }
