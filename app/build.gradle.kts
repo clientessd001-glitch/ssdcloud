@@ -70,6 +70,9 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     kapt("androidx.room:room-compiler:$roomVersion")
 
+    // Biblioteca Coil para gerar miniaturas de imagens
+    implementation("io.coil-kt:coil-compose:2.6.0")
+
     implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
         exclude(group = "org.jetbrains.kotlin")
     }
