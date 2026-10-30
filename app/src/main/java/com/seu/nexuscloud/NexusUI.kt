@@ -102,7 +102,12 @@ fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nomeArquivo: String): Fi
     } catch (e: Exception) { null }
 }
 
-fun enviarParaMensagensSalvas(client: Client, caminhoLocal: String, nomeOriginal: String, onResult: (Boolean, Int, String) -> Unit) {
+fun enviarParaMensagensSalvas(
+    client: Client,
+    caminhoLocal: String,
+    nomeOriginal: String,
+    onResult: (Boolean, Int, String) -> Unit
+) {
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
@@ -110,36 +115,48 @@ fun enviarParaMensagensSalvas(client: Client, caminhoLocal: String, nomeOriginal
                     val inputFile = TdApi.InputFileLocal(caminhoLocal)
                     val legenda = TdApi.FormattedText("☁️ Nexus Cloud • $nomeOriginal", emptyArray())
                     val conteudo = TdApi.InputMessageDocument(inputFile, null, false, legenda)
-                    
-                    // CORREÇÃO DE SEGURANÇA 1: Usar o bloco apply seguro para a TDLib
+
                     val req = TdApi.SendMessage().apply {
                         chatId = chatObj.id
                         inputMessageContent = conteudo
                     }
-                    
+
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
                                 val fileId = (msgObj.content as? TdApi.MessageDocument)?.document?.document?.id ?: 0
-                                onResult(true, fileId, "Enviado para Mensagens Salvas!")
+                                onResult(true, fileId, "Enviado para Mensagens Salvas no Telegram!")
                             }
-                            is TdApi.Error -> onResult(false, 0, "Erro TDLib: ${msgObj.message}")
+                            is TdApi.Error -> onResult(false, 0, "Erro TDLib (${msgObj.code}): ${msgObj.message}")
                             else -> onResult(true, 0, "Upload iniciado na TDLib!")
                         }
                     }
-                } else if (chatObj is TdApi.Error) onResult(false, 0, "Erro chat: ${chatObj.message}")
+                } else if (chatObj is TdApi.Error) {
+                    onResult(false, 0, "Erro ao abrir cofre (${chatObj.code}): ${chatObj.message}")
+                }
             }
-        } else if (meObj is TdApi.Error) onResult(false, 0, "Erro sessão: ${meObj.message}")
+        } else if (meObj is TdApi.Error) {
+            onResult(false, 0, "Erro de sessão (${meObj.code}): ${meObj.message}")
+        }
     }
 }
 
 fun baixarFicheiroDaNuvem(client: Client, fileId: Int, onResult: (String) -> Unit) {
-    if (fileId == 0) { onResult("ID do ficheiro ausente."); return }
+    if (fileId == 0) {
+        onResult("Ficheiro não sincronizado corretamente. ID ausente.")
+        return
+    }
     client.send(TdApi.DownloadFile(fileId, 1, 0, 0, false)) { result ->
         when (result) {
-            is TdApi.File -> if (result.local?.isDownloadingCompleted == true) onResult("Ficheiro descarregado!") else onResult("Download em segundo plano iniciado!")
-            is TdApi.Error -> onResult("Erro no download: ${result.message}")
-            else -> onResult("A preparar download...")
+            is TdApi.File -> {
+                if (result.local?.isDownloadingCompleted == true) {
+                    onResult("Ficheiro descarregado: ${result.local.path}")
+                } else {
+                    onResult("Download em segundo plano iniciado!")
+                }
+            }
+            is TdApi.Error -> onResult("Erro no download (${result.code}): ${result.message}")
+            else -> onResult("A preparar download da nuvem...")
         }
     }
 }
@@ -211,48 +228,50 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 val (nome, tamanho) = obterDetalhesFicheiro(context, it)
                 cloudBannerText = "Enviando '$nome'..."
                 val isImage = nome.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP")
+                
                 val arquivoTemp = withContext(Dispatchers.IO) { copiarUriParaCacheTDLib(context, it, nome) }
                 val miniaturaSegura = withContext(Dispatchers.IO) { if (isImage) salvarMiniaturaPrivada(context, it, nome) else it.toString() }
 
                 if (arquivoTemp != null) {
                     enviarParaMensagensSalvas(client, arquivoTemp.absolutePath, nome) { sucesso, msgId, detalhe ->
                         isUploading = false; cloudBannerText = detalhe
-                        if (sucesso) vm.salvarArquivo(ArquivoNuvem(fileId = msgId, nomeArquivo = nome, tamanhoBytes = if (tamanho > 0) tamanho else arquivoTemp.length(), dataUpload = System.currentTimeMillis(), caminhoMiniatura = miniaturaSegura))
+                        if (sucesso) {
+                            vm.salvarArquivo(ArquivoNuvem(fileId = msgId, nomeArquivo = nome, tamanhoBytes = if (tamanho > 0) tamanho else arquivoTemp.length(), dataUpload = System.currentTimeMillis(), caminhoMiniatura = miniaturaSegura))
+                        }
                     }
                 } else { isUploading = false; cloudBannerText = "Erro ao ler ficheiro." }
             }
         }
     }
 
+    // VISUALIZADOR INTERNO SEGURO
     if (viewerFile != null) {
+        val file = viewerFile!!
         Dialog(
             onDismissRequest = { viewerFile = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false, dismissOnBackPress = true)
+            properties = DialogProperties(usePlatformDefaultWidth = false)
         ) {
             Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
-                val ext = viewerFile!!.nomeArquivo.substringAfterLast('.', "").uppercase()
-                val isVideo = ext in listOf("MP4", "MKV", "MOV", "AVI") || viewerFile!!.nomeArquivo.contains("Video", ignoreCase = true)
-                val isImage = ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || viewerFile!!.nomeArquivo.contains("IMG", ignoreCase = true)
+                val ext = file.nomeArquivo.substringAfterLast('.', "").uppercase()
+                val isVideo = ext in listOf("MP4", "MKV", "MOV", "AVI") || file.nomeArquivo.contains("Video", ignoreCase = true)
+                val isImage = ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || file.nomeArquivo.contains("IMG", ignoreCase = true)
 
                 if (isImage) {
                     AsyncImage(
-                        model = Uri.parse(viewerFile!!.caminhoMiniatura),
+                        model = Uri.parse(file.caminhoMiniatura),
                         contentDescription = null,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit
                     )
                 } else if (isVideo) {
-                    // CORREÇÃO DE SEGURANÇA 2: Resolução exata de contexto do VideoView para não falhar
                     AndroidView(
                         factory = { ctx ->
-                            val videoView = android.widget.VideoView(ctx)
-                            val mediaController = android.widget.MediaController(ctx)
-                            mediaController.setAnchorView(videoView)
-                            videoView.setMediaController(mediaController)
-                            videoView.setVideoURI(Uri.parse(viewerFile!!.caminhoMiniatura))
-                            videoView.start()
-                            videoView
+                            android.widget.VideoView(ctx).apply {
+                                setVideoURI(Uri.parse(file.caminhoMiniatura))
+                                start() // Começa a tocar o vídeo automaticamente de forma limpa
+                            }
                         },
-                        modifier = Modifier.fillMaxSize().align(Alignment.Center)
+                        modifier = Modifier.fillMaxSize()
                     )
                 } else {
                     Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -262,25 +281,42 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                 }
 
+                // Barra Superior Escurecida
                 Row(
-                    modifier = Modifier.fillMaxWidth().background(Color(0x80000000)).padding(16.dp).align(Alignment.TopCenter),
-                    horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.6f))
+                        .padding(16.dp)
+                        .align(Alignment.TopCenter),
+                    horizontalArrangement = Arrangement.SpaceBetween, 
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
-                    Text(viewerFile!!.nomeArquivo, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(horizontal = 16.dp))
+                    IconButton(onClick = { viewerFile = null }) { 
+                        Icon(Icons.Default.ArrowBack, null, tint = Color.White) 
+                    }
+                    Text(
+                        text = file.nomeArquivo, 
+                        color = Color.White, 
+                        fontSize = 14.sp, 
+                        maxLines = 1, 
+                        overflow = TextOverflow.Ellipsis, 
+                        modifier = Modifier.weight(1f).padding(horizontal = 16.dp)
+                    )
                     IconButton(onClick = {
                         try {
-                            val uri = Uri.parse(viewerFile!!.caminhoMiniatura)
+                            val uri = Uri.parse(file.caminhoMiniatura)
                             val shareIntent = Intent(Intent.ACTION_SEND).apply {
                                 type = context.contentResolver.getType(uri) ?: "*/*"
                                 putExtra(Intent.EXTRA_STREAM, uri)
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
-                            context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
+                            context.startActivity(Intent.createChooser(shareIntent, "Partilhar ficheiro"))
                         } catch (e: Exception) {
                             Toast.makeText(context, "Baixe o ficheiro para partilhar.", Toast.LENGTH_SHORT).show()
                         }
-                    }) { Icon(Icons.Default.Share, null, tint = Color.White) }
+                    }) { 
+                        Icon(Icons.Default.Share, null, tint = Color.White) 
+                    }
                 }
             }
         }
