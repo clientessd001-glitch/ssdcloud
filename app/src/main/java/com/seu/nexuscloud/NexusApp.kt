@@ -1,7 +1,6 @@
 package com.seu.nexuscloud
 
 import android.app.Application
-import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -20,10 +19,13 @@ import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
 object TelegramAuth {
-    // 0 = Número, 1 = Código SMS, 2 = Senha 2FA (se tiver), 3 = Autenticado (Galeria)
     val step = MutableStateFlow(0)
     val statusText = MutableStateFlow("Conectando à TDLib...")
     val errorText = MutableStateFlow<String?>(null)
+
+    // Estados para o progresso em tempo real (0% a 100%)
+    val transferProgress = MutableStateFlow<Int?>(null)
+    val transferLabel = MutableStateFlow("")
 }
 
 class NexusApp : Application() {
@@ -39,11 +41,10 @@ class NexusApp : Application() {
 
             val handler = TelegramHandler(this)
             client = Client.create(handler, null, null)
-            client?.send(TdApi.SetLogVerbosityLevel(1), handler)
             client?.send(TdApi.GetAuthorizationState(), handler)
         } catch (e: Throwable) {
             Log.e("NexusCloud", "Falha no arranque da TDLib", e)
-            startupError = "${e.javaClass.simpleName}: ${e.message}\n\nCausa: ${e.cause?.message ?: "N/A"}"
+            startupError = "${e.javaClass.simpleName}: ${e.message}"
         }
     }
 }
@@ -53,9 +54,40 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
         when (obj) {
             is TdApi.UpdateAuthorizationState -> handleAuthState(obj.authorizationState)
             is TdApi.AuthorizationState -> handleAuthState(obj)
+            is TdApi.UpdateFile -> handleFileProgress(obj.file)
             is TdApi.Error -> {
                 Log.e("NexusCloud", "Erro TDLib [${obj.code}]: ${obj.message}")
-                TelegramAuth.errorText.value = "Erro TDLib (${obj.code}): ${obj.message}"
+                if (obj.code != 400) {
+                    TelegramAuth.errorText.value = "Erro TDLib (${obj.code}): ${obj.message}"
+                }
+            }
+        }
+    }
+
+    private fun handleFileProgress(file: TdApi.File) {
+        val totalBytes = if (file.expectedSize.toLong() > 0L) file.expectedSize.toLong() else file.size.toLong()
+        val remote = file.remote
+        val local = file.local
+
+        when {
+            remote != null && remote.isUploadingActive -> {
+                val enviados = remote.uploadedSize.toLong()
+                val pct = if (totalBytes > 0L) ((enviados * 100L) / totalBytes).toInt().coerceIn(1, 99) else 0
+                TelegramAuth.transferProgress.value = pct
+                TelegramAuth.transferLabel.value = "Enviando para a nuvem: $pct%"
+            }
+            local != null && local.isDownloadingActive -> {
+                val baixados = local.downloadedSize.toLong()
+                val pct = if (totalBytes > 0L) ((baixados * 100L) / totalBytes).toInt().coerceIn(1, 99) else 0
+                TelegramAuth.transferProgress.value = pct
+                TelegramAuth.transferLabel.value = "Baixando da nuvem: $pct%"
+            }
+            (remote != null && remote.isUploadingCompleted) || (local != null && local.isDownloadingCompleted) -> {
+                if (TelegramAuth.transferProgress.value != null) {
+                    TelegramAuth.transferProgress.value = 100
+                    TelegramAuth.transferLabel.value = "Transferência concluída (100%)"
+                    TelegramAuth.transferProgress.value = null
+                }
             }
         }
     }
@@ -63,27 +95,21 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
     private fun handleAuthState(state: TdApi.AuthorizationState) {
         when (state) {
             is TdApi.AuthorizationStateWaitTdlibParameters -> {
-                TelegramAuth.statusText.value = "Validando chaves da API..."
+                TelegramAuth.statusText.value = "Configurando cofre na nuvem..."
                 if (BuildConfig.TELEGRAM_API_ID == 0 || BuildConfig.TELEGRAM_API_HASH.isBlank()) {
-                    TelegramAuth.errorText.value = "TELEGRAM_API_ID ou API_HASH estão vazios nos Secrets do GitHub!"
+                    TelegramAuth.errorText.value = "TELEGRAM_API_ID ou API_HASH vazios nos Secrets!"
                     return
                 }
-                val request = TdApi.SetTdlibParameters(
-                    false,
-                    app.filesDir.absolutePath + "/tdlib",
-                    app.filesDir.absolutePath + "/tdlib_files",
-                    byteArrayOf(),
-                    true,
-                    true,
-                    true,
-                    false,
-                    BuildConfig.TELEGRAM_API_ID,
-                    BuildConfig.TELEGRAM_API_HASH,
-                    "pt",
-                    Build.MODEL ?: "Android",
-                    Build.VERSION.RELEASE ?: "14",
-                    "1.0"
-                )
+                val request = TdApi.SetTdlibParameters().apply {
+                    databaseDirectory = app.filesDir.absolutePath + "/tdlib"
+                    useMessageDatabase = true
+                    useSecretChats = false
+                    apiId = BuildConfig.TELEGRAM_API_ID
+                    apiHash = BuildConfig.TELEGRAM_API_HASH
+                    systemLanguageCode = "pt"
+                    deviceModel = "Android"
+                    applicationVersion = "1.0"
+                }
                 (app as NexusApp).client?.send(request, this)
             }
             is TdApi.AuthorizationStateWaitPhoneNumber -> {
@@ -93,12 +119,12 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
             }
             is TdApi.AuthorizationStateWaitCode -> {
                 TelegramAuth.errorText.value = null
-                TelegramAuth.statusText.value = "Código solicitado! Verifique seu app do Telegram ou SMS."
+                TelegramAuth.statusText.value = "Código solicitado! Verifique o Telegram."
                 TelegramAuth.step.value = 1
             }
             is TdApi.AuthorizationStateWaitPassword -> {
                 TelegramAuth.errorText.value = null
-                TelegramAuth.statusText.value = "Conta protegida com verificação em duas etapas (2FA)."
+                TelegramAuth.statusText.value = "Conta protegida com 2FA."
                 TelegramAuth.step.value = 2
             }
             is TdApi.AuthorizationStateReady -> {
@@ -123,25 +149,13 @@ class MainActivity : ComponentActivity() {
                     NexusUI(db.dao(), activeClient)
                 } else {
                     Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(Color(0xFF05070A))
-                            .padding(24.dp),
+                        modifier = Modifier.fillMaxSize().background(Color(0xFF05070A)).padding(24.dp),
                         verticalArrangement = Arrangement.Center,
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text(
-                            text = "DIAGNÓSTICO DO MOTOR TDLIB",
-                            color = Color(0xFFFFD700),
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.Black
-                        )
+                        Text("DIAGNÓSTICO TDLIB", color = Color(0xFFFFD700), fontSize = 18.sp, fontWeight = FontWeight.Black)
                         Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = nexusApp.startupError ?: "Erro desconhecido ao inicializar Client.",
-                            color = Color(0xFFE53935),
-                            fontSize = 14.sp
-                        )
+                        Text(nexusApp.startupError ?: "Erro desconhecido.", color = Color(0xFFE53935), fontSize = 14.sp)
                     }
                 }
             }
