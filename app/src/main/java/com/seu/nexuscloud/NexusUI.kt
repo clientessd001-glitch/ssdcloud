@@ -31,6 +31,7 @@ import androidx.compose.ui.unit.*
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.FileProvider // NOVO IMPORT PARA PARTILHA SEGURA
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -66,7 +67,6 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
 }
 
-// Guarda e lê o vínculo entre cada ficheiro (pelo timestamp único) e a pasta escolhida
 fun carregarVinculosPastas(context: Context): Map<Long, String> {
     val prefs = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
     val mapa = mutableMapOf<Long, String>()
@@ -113,9 +113,9 @@ fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String): Str
                 input.copyTo(output)
             }
         }
-        Uri.fromFile(thumbFile).toString()
+        thumbFile.absolutePath // Mudei para devolver o caminho do ficheiro puro em vez do Uri string
     } catch (e: Exception) {
-        uri.toString()
+        uri.toString() // Fallback
     }
 }
 
@@ -133,6 +133,43 @@ fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nomeArquivo: String): Fi
         destino
     } catch (e: Exception) {
         null
+    }
+}
+
+// CORREÇÃO: Função centralizada e segura para partilhar ficheiros usando o FileProvider
+fun partilharFicheiroSeguro(context: Context, caminhoFicheiro: String) {
+    try {
+        val file = File(caminhoFicheiro)
+        if (!file.exists()) {
+            Toast.makeText(context, "Baixe o ficheiro da nuvem primeiro.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val uriSegura = FileProvider.getUriForFile(
+            context,
+            "${context.packageName}.provider",
+            file
+        )
+
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = context.contentResolver.getType(uriSegura) ?: "*/*"
+            putExtra(Intent.EXTRA_STREAM, uriSegura)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
+    } catch (e: Exception) {
+        // Se a conversão falhar (caso seja um URI original que não é File)
+        try {
+            val fallbackUri = Uri.parse(caminhoFicheiro)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = context.contentResolver.getType(fallbackUri) ?: "*/*"
+                putExtra(Intent.EXTRA_STREAM, fallbackUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
+        } catch (e2: Exception) {
+            Toast.makeText(context, "Erro a partilhar: ficheiro indisponível", Toast.LENGTH_SHORT).show()
+        }
     }
 }
 
@@ -162,11 +199,7 @@ fun enviarParaMensagensSalvas(
                             is TdApi.Message -> {
                                 val docContent = msgObj.content as? TdApi.MessageDocument
                                 val remoteFileId = docContent?.document?.document?.id ?: 0
-                                val msgSucesso = if (pastaDestino.isNotBlank()) {
-                                    "Guardado na pasta '$pastaDestino' e na nuvem!"
-                                } else {
-                                    "Enviado para Mensagens Salvas no Telegram!"
-                                }
+                                val msgSucesso = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino' e na nuvem!" else "Enviado para Mensagens Salvas no Telegram!"
                                 onResult(true, remoteFileId, msgSucesso)
                             }
                             is TdApi.Error -> onResult(false, 0, "Erro TDLib (${msgObj.code}): ${msgObj.message}")
@@ -230,98 +263,34 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
 
 @Composable
 fun LinhaSincronizacao(nomePasta: String, ativo: Boolean, onAtivoChange: (Boolean) -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(Icons.Default.Folder, null, tint = if (ativo) Gold else TextGrey, modifier = Modifier.size(24.dp))
             Spacer(Modifier.width(12.dp))
             Text(nomePasta, color = if (ativo) Color.White else TextGrey, fontSize = 14.sp, fontWeight = FontWeight.Bold)
         }
-        Switch(
-            checked = ativo,
-            onCheckedChange = onAtivoChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = Color.White,
-                checkedTrackColor = DangerRed,
-                uncheckedThumbColor = TextGrey,
-                uncheckedTrackColor = SurfaceDark
-            )
-        )
+        Switch(checked = ativo, onCheckedChange = onAtivoChange, colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = DangerRed, uncheckedThumbColor = TextGrey, uncheckedTrackColor = SurfaceDark))
     }
 }
 
 @Composable
-fun GrelhaArquivos(
-    lista: List<ArquivoNuvem>,
-    mapaPastas: Map<Long, String>,
-    onFileClick: (ArquivoNuvem) -> Unit
-) {
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
-        modifier = Modifier.fillMaxSize().padding(1.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
+fun GrelhaArquivos(lista: List<ArquivoNuvem>, mapaPastas: Map<Long, String>, onFileClick: (ArquivoNuvem) -> Unit) {
+    LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(1.dp), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         items(lista) { arq ->
             val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
             val pastaAssociada = mapaPastas[arq.dataUpload]
+            val isPathUri = arq.caminhoMiniatura.startsWith("content://")
+            val uriFormatada = if (isPathUri) Uri.parse(arq.caminhoMiniatura) else Uri.fromFile(File(arq.caminhoMiniatura))
 
-            Box(
-                modifier = Modifier.aspectRatio(1f).background(SurfaceDark).clickable { onFileClick(arq) },
-                contentAlignment = Alignment.Center
-            ) {
+            Box(modifier = Modifier.aspectRatio(1f).background(SurfaceDark).clickable { onFileClick(arq) }, contentAlignment = Alignment.Center) {
                 when {
-                    ext in listOf("JPG", "JPEG", "PNG", "WEBP") || arq.nomeArquivo.contains("IMG", ignoreCase = true) -> {
-                        AsyncImage(
-                            model = Uri.parse(arq.caminhoMiniatura),
-                            contentDescription = arq.nomeArquivo,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    }
-                    ext == "PDF" || arq.nomeArquivo.contains("PDF", ignoreCase = true) -> {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                            Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
-                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
-                    ext in listOf("ZIP", "RAR", "APK") || arq.nomeArquivo.contains("ZIP", ignoreCase = true) -> {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                            Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
-                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
-                    ext in listOf("MP4", "MKV", "MOV") || arq.nomeArquivo.contains("Video", ignoreCase = true) -> {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(44.dp).align(Alignment.Center))
-                            Box(modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp).background(Color.Black, RoundedCornerShape(4.dp))) {
-                                Text(ext.ifBlank { "VID" }, color = Gold, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
-                            }
-                        }
-                    }
-                    else -> {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                            Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp))
-                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
+                    ext in listOf("JPG", "JPEG", "PNG", "WEBP") || arq.nomeArquivo.contains("IMG", ignoreCase = true) -> AsyncImage(model = uriFormatada, contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                    ext == "PDF" || arq.nomeArquivo.contains("PDF", ignoreCase = true) -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) { Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp)); Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    ext in listOf("ZIP", "RAR", "APK") || arq.nomeArquivo.contains("ZIP", ignoreCase = true) -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) { Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp)); Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                    ext in listOf("MP4", "MKV", "MOV") || arq.nomeArquivo.contains("Video", ignoreCase = true) -> Box(modifier = Modifier.fillMaxSize()) { Icon(Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(44.dp).align(Alignment.Center)); Box(modifier = Modifier.align(Alignment.BottomEnd).padding(4.dp).background(Color.Black, RoundedCornerShape(4.dp))) { Text(ext.ifBlank { "VID" }, color = Gold, fontSize = 8.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)) } }
+                    else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) { Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp)); Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 }
-
-                // Etiqueta no canto superior mostrando a pasta a que pertence
-                if (!pastaAssociada.isNullOrBlank()) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopStart)
-                            .padding(4.dp)
-                            .background(BgBlack.copy(alpha = 0.75f), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                    ) {
-                        Text(pastaAssociada, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
-                    }
-                }
+                if (!pastaAssociada.isNullOrBlank()) { Box(modifier = Modifier.align(Alignment.TopStart).padding(4.dp).background(BgBlack.copy(alpha = 0.75f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp)) { Text(pastaAssociada, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1) } }
             }
         }
     }
@@ -330,16 +299,10 @@ fun GrelhaArquivos(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
-    val vm: UIViewModel = viewModel(
-        factory = object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(mClass: Class<T>) = UIViewModel(dao) as T
-        }
-    )
+    val vm: UIViewModel = viewModel(factory = object : ViewModelProvider.Factory { @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(mClass: Class<T>) = UIViewModel(dao) as T })
     val arquivos by vm.arquivos.collectAsState()
     val pastas by vm.pastas.collectAsState()
     val armazenamento by vm.armazenamento.collectAsState()
-
     val loginStep by TelegramAuth.step.collectAsState()
     val statusText by TelegramAuth.statusText.collectAsState()
     val errorText by TelegramAuth.errorText.collectAsState()
@@ -349,17 +312,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var phoneNumber by remember { mutableStateOf("+5585") }
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
-
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
-
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val sheetState = rememberModalBottomSheetState()
     val context = LocalContext.current
 
-    // Estado de pastas e vínculos
     var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastaAberta by remember { mutableStateOf<String?>(null) }
     var pendingUploadUri by remember { mutableStateOf<Uri?>(null) }
@@ -374,17 +334,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var syncWhatsApp by remember { mutableStateOf(false) }
     var syncDownloads by remember { mutableStateOf(false) }
     var syncDocumentos by remember { mutableStateOf(false) }
-
     var isUploading by remember { mutableStateOf(false) }
     var cloudBannerText by remember { mutableStateOf("Nuvem TDLib Ativa • Mensagens Salvas") }
 
-    val responseHandler = remember {
-        Client.ResultHandler { obj ->
-            if (obj is TdApi.Error) {
-                TelegramAuth.errorText.value = "Erro (${obj.code}): ${obj.message}"
-            }
-        }
-    }
+    val responseHandler = remember { Client.ResultHandler { obj -> if (obj is TdApi.Error) TelegramAuth.errorText.value = "Erro (${obj.code}): ${obj.message}" } }
 
     fun executarUpload(uri: Uri, pastaEscolhida: String) {
         scope.launch {
@@ -394,154 +347,52 @@ fun NexusUI(dao: NexusDao, client: Client) {
             TelegramAuth.transferLabel.value = "Preparando '$nome'..."
             cloudBannerText = "Enviando '$nome' para o Telegram..."
 
-            val arquivoTemp = withContext(Dispatchers.IO) {
-                copiarUriParaCacheTDLib(context, uri, nome)
-            }
-            val copiaPrivada = withContext(Dispatchers.IO) {
-                salvarMiniaturaPrivada(context, uri, nome)
-            }
+            val arquivoTemp = withContext(Dispatchers.IO) { copiarUriParaCacheTDLib(context, uri, nome) }
+            val copiaPrivada = withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome) }
 
             if (arquivoTemp != null) {
                 enviarParaMensagensSalvas(client, arquivoTemp.absolutePath, nome, pastaEscolhida) { sucesso, remoteId, detalhe ->
-                    isUploading = false
-                    TelegramAuth.transferProgress.value = null
-                    cloudBannerText = detalhe
+                    isUploading = false; TelegramAuth.transferProgress.value = null; cloudBannerText = detalhe
                     if (sucesso) {
                         val timestamp = System.currentTimeMillis()
-                        if (pastaEscolhida.isNotBlank()) {
-                            salvarVinculoPasta(context, timestamp, pastaEscolhida)
-                            mapaPastas = carregarVinculosPastas(context)
-                        }
-                        vm.salvarArquivo(
-                            ArquivoNuvem(
-                                fileId = remoteId,
-                                nomeArquivo = nome,
-                                tamanhoBytes = if (tamanho > 0) tamanho else arquivoTemp.length(),
-                                dataUpload = timestamp,
-                                caminhoMiniatura = copiaPrivada
-                            )
-                        )
+                        if (pastaEscolhida.isNotBlank()) { salvarVinculoPasta(context, timestamp, pastaEscolhida); mapaPastas = carregarVinculosPastas(context) }
+                        vm.salvarArquivo(ArquivoNuvem(fileId = remoteId, nomeArquivo = nome, tamanhoBytes = if (tamanho > 0) tamanho else arquivoTemp.length(), dataUpload = timestamp, caminhoMiniatura = copiaPrivada))
                     }
                 }
-            } else {
-                isUploading = false
-                TelegramAuth.transferProgress.value = null
-                cloudBannerText = "Erro ao ler o ficheiro selecionado."
-            }
+            } else { isUploading = false; TelegramAuth.transferProgress.value = null; cloudBannerText = "Erro ao ler o ficheiro selecionado." }
         }
     }
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let {
-            try {
-                context.contentResolver.takePersistableUriPermission(
-                    it,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {}
-
-            // Se o utilizador já estiver dentro de uma pasta aberta, guarda diretamente nela.
-            // Se houver pastas criadas, pergunta onde deseja guardar. Caso contrário, envia direto.
-            if (pastaAberta != null) {
-                executarUpload(it, pastaAberta!!)
-            } else if (pastas.isNotEmpty()) {
-                pendingUploadUri = it
-            } else {
-                executarUpload(it, "")
-            }
+            try { context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            if (pastaAberta != null) executarUpload(it, pastaAberta!!) else if (pastas.isNotEmpty()) pendingUploadUri = it else executarUpload(it, "")
         }
     }
 
-    // JANELA: Escolher em qual pasta guardar o ficheiro no momento do envio
     if (pendingUploadUri != null) {
         val uriAtual = pendingUploadUri!!
         Dialog(onDismissRequest = { pendingUploadUri = null }) {
             Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(24.dp)) {
-                    Text("GUARDAR NA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Text("GUARDAR NA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp); Spacer(Modifier.height(8.dp)); Text("Escolha onde organizar este ficheiro:", color = TextGrey, fontSize = 12.sp); Spacer(Modifier.height(16.dp))
+                    OutlinedButton(onClick = { pendingUploadUri = null; executarUpload(uriAtual, "") }, border = BorderStroke(1.dp, TextGrey), modifier = Modifier.fillMaxWidth()) { Text("Galeria Geral (Sem pasta)", color = Color.White) }
                     Spacer(Modifier.height(8.dp))
-                    Text("Escolha onde organizar este ficheiro:", color = TextGrey, fontSize = 12.sp)
-                    Spacer(Modifier.height(16.dp))
-
-                    OutlinedButton(
-                        onClick = {
-                            pendingUploadUri = null
-                            executarUpload(uriAtual, "")
-                        },
-                        border = BorderStroke(1.dp, TextGrey),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Galeria Geral (Sem pasta)", color = Color.White)
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-
-                    pastas.forEach { p ->
-                        Button(
-                            onClick = {
-                                pendingUploadUri = null
-                                executarUpload(uriAtual, p.nomePasta)
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark),
-                            shape = RoundedCornerShape(10.dp),
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                        ) {
-                            Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp))
-                            Spacer(Modifier.width(8.dp))
-                            Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold)
-                        }
-                    }
+                    pastas.forEach { p -> Button(onClick = { pendingUploadUri = null; executarUpload(uriAtual, p.nomePasta) }, colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) { Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold) } }
                 }
             }
         }
     }
 
-    // JANELA: Mover um ficheiro já existente para uma pasta
     if (fileToMove != null) {
         val arqMover = fileToMove!!
         Dialog(onDismissRequest = { fileToMove = null }) {
             Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
                 Column(modifier = Modifier.padding(24.dp)) {
-                    Text("MOVER PARA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Text("MOVER PARA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp); Spacer(Modifier.height(8.dp)); Text(arqMover.nomeArquivo, color = TextGrey, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Spacer(Modifier.height(16.dp))
+                    OutlinedButton(onClick = { salvarVinculoPasta(context, arqMover.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); fileToMove = null }, border = BorderStroke(1.dp, TextGrey), modifier = Modifier.fillMaxWidth()) { Text("Remover da Pasta (Apenas Galeria)", color = Color.White) }
                     Spacer(Modifier.height(8.dp))
-                    Text(arqMover.nomeArquivo, color = TextGrey, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Spacer(Modifier.height(16.dp))
-
-                    OutlinedButton(
-                        onClick = {
-                            salvarVinculoPasta(context, arqMover.dataUpload, "")
-                            mapaPastas = carregarVinculosPastas(context)
-                            fileToMove = null
-                        },
-                        border = BorderStroke(1.dp, TextGrey),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Remover da Pasta (Apenas Galeria)", color = Color.White)
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-
-                    if (pastas.isEmpty()) {
-                        Text("Crie uma pasta na aba PASTAS primeiro.", color = DangerRed, fontSize = 12.sp)
-                    } else {
-                        pastas.forEach { p ->
-                            Button(
-                                onClick = {
-                                    salvarVinculoPasta(context, arqMover.dataUpload, p.nomePasta)
-                                    mapaPastas = carregarVinculosPastas(context)
-                                    fileToMove = null
-                                    Toast.makeText(context, "Movido para ${p.nomePasta}!", Toast.LENGTH_SHORT).show()
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark),
-                                shape = RoundedCornerShape(10.dp),
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                            ) {
-                                Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold)
-                            }
-                        }
-                    }
+                    if (pastas.isEmpty()) Text("Crie uma pasta na aba PASTAS primeiro.", color = DangerRed, fontSize = 12.sp) else pastas.forEach { p -> Button(onClick = { salvarVinculoPasta(context, arqMover.dataUpload, p.nomePasta); mapaPastas = carregarVinculosPastas(context); fileToMove = null; Toast.makeText(context, "Movido para ${p.nomePasta}!", Toast.LENGTH_SHORT).show() }, colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark), shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) { Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp)); Spacer(Modifier.width(8.dp)); Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold) } }
                 }
             }
         }
@@ -549,155 +400,51 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     if (viewerFile != null) {
         val currentFile = viewerFile!!
-        Dialog(
-            onDismissRequest = { viewerFile = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
+        val isPathUri = currentFile.caminhoMiniatura.startsWith("content://")
+        val uriFormatada = if (isPathUri) Uri.parse(currentFile.caminhoMiniatura) else Uri.fromFile(File(currentFile.caminhoMiniatura))
+
+        Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
                 val ext = currentFile.nomeArquivo.substringAfterLast('.', "").uppercase()
                 val isVideo = ext in listOf("MP4", "MKV", "MOV", "AVI") || currentFile.nomeArquivo.contains("Video", ignoreCase = true)
                 val isImage = ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || currentFile.nomeArquivo.contains("IMG", ignoreCase = true)
 
                 if (isImage) {
-                    AsyncImage(
-                        model = Uri.parse(currentFile.caminhoMiniatura),
-                        contentDescription = currentFile.nomeArquivo,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit
-                    )
+                    AsyncImage(model = uriFormatada, contentDescription = currentFile.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
                 } else if (isVideo) {
-                    AndroidView(
-                        factory = { ctx ->
-                            android.widget.VideoView(ctx).apply {
-                                setVideoURI(Uri.parse(currentFile.caminhoMiniatura))
-                                start()
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize().align(Alignment.Center)
-                    )
+                    AndroidView(factory = { ctx -> android.widget.VideoView(ctx).apply { setVideoURI(uriFormatada); start() } }, modifier = Modifier.fillMaxSize().align(Alignment.Center))
                 } else {
-                    Column(
-                        modifier = Modifier.align(Alignment.Center).padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(64.dp))
-                        Spacer(Modifier.height(16.dp))
-                        Text(currentFile.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                        Spacer(Modifier.height(8.dp))
-                        Text("Use o botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-                    }
+                    Column(modifier = Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(64.dp)); Spacer(Modifier.height(16.dp)); Text(currentFile.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center); Spacer(Modifier.height(8.dp)); Text("Use o botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center) }
                 }
 
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(BgBlack.copy(alpha = 0.75f))
-                        .padding(16.dp)
-                        .align(Alignment.TopCenter),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = { viewerFile = null }) {
-                        Icon(Icons.Default.ArrowBack, null, tint = Color.White)
-                    }
-                    Text(
-                        text = currentFile.nomeArquivo,
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f).padding(horizontal = 12.dp)
-                    )
+                Row(modifier = Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.75f)).padding(16.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
+                    Text(text = currentFile.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(horizontal = 12.dp))
                     IconButton(onClick = {
-                        try {
-                            val uri = Uri.parse(currentFile.caminhoMiniatura)
-                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                type = context.contentResolver.getType(uri) ?: "*/*"
-                                putExtra(Intent.EXTRA_STREAM, uri)
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Baixe o ficheiro da nuvem para compartilhar.", Toast.LENGTH_SHORT).show()
-                        }
-                    }) {
-                        Icon(Icons.Default.Share, null, tint = Gold)
-                    }
+                        partilharFicheiroSeguro(context, currentFile.caminhoMiniatura) // Usa o sistema seguro novo aqui também
+                    }) { Icon(Icons.Default.Share, null, tint = Gold) }
                 }
             }
         }
     }
 
     if (loginStep < 3) {
-        Column(
-            modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp))
-            Spacer(Modifier.height(16.dp))
-            Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black)
-            Spacer(Modifier.height(8.dp))
-            Text(statusText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-
-            if (errorText != null) {
-                Spacer(Modifier.height(12.dp))
-                Text(errorText!!, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-            }
-
+        Column(modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp)); Spacer(Modifier.height(16.dp)); Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black); Spacer(Modifier.height(8.dp)); Text(statusText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+            if (errorText != null) { Spacer(Modifier.height(12.dp)); Text(errorText!!, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) }
             Spacer(Modifier.height(32.dp))
-
             when (loginStep) {
                 0 -> {
-                    OutlinedTextField(
-                        value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (Ex: +5585999999999)", color = Color.Gray) }, singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            TelegramAuth.errorText.value = null
-                            TelegramAuth.statusText.value = "Contactando servidores do Telegram..."
-                            val cleanPhone = phoneNumber.replace(" ", "").replace("-", "")
-                            val settings = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
-                            client.send(TdApi.SetAuthenticationPhoneNumber(cleanPhone, settings), responseHandler)
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                    ) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
+                    OutlinedTextField(value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (Ex: +5585999999999)", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp))
+                    Button(onClick = { TelegramAuth.errorText.value = null; TelegramAuth.statusText.value = "Contactando servidores..."; val cleanPhone = phoneNumber.replace(" ", "").replace("-", ""); val settings = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray()); client.send(TdApi.SetAuthenticationPhoneNumber(cleanPhone, settings), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENVIAR CÓDIGO SMS", fontWeight = FontWeight.Bold, color = Color.White) }
                 }
                 1 -> {
-                    OutlinedTextField(
-                        value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código recebido no Telegram/SMS", color = Color.Gray) }, singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            TelegramAuth.errorText.value = null
-                            TelegramAuth.statusText.value = "Verificando código..."
-                            client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler)
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                    ) { Text("CONFIRMAR E ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
+                    OutlinedTextField(value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código recebido no Telegram", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp))
+                    Button(onClick = { TelegramAuth.errorText.value = null; TelegramAuth.statusText.value = "Verificando..."; client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENTRAR", fontWeight = FontWeight.Bold, color = Color.White) }
                 }
                 2 -> {
-                    OutlinedTextField(
-                        value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha de Duas Etapas (2FA)", color = Color.Gray) }, singleLine = true,
-                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(Modifier.height(24.dp))
-                    Button(
-                        onClick = {
-                            TelegramAuth.errorText.value = null
-                            TelegramAuth.statusText.value = "Verificando senha..."
-                            client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler)
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)
-                    ) { Text("DESBLOQUEAR CONTA", fontWeight = FontWeight.Bold, color = Color.White) }
+                    OutlinedTextField(value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha de Duas Etapas (2FA)", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp))
+                    Button(onClick = { TelegramAuth.errorText.value = null; TelegramAuth.statusText.value = "Verificando senha..."; client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("DESBLOQUEAR", fontWeight = FontWeight.Bold, color = Color.White) }
                 }
             }
         }
@@ -705,187 +452,36 @@ fun NexusUI(dao: NexusDao, client: Client) {
     }
 
     ModalNavigationDrawer(
-        drawerState = drawerState,
-        drawerContent = {
-            ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
-                Column(modifier = Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
-                    Box(modifier = Modifier.size(64.dp).border(2.dp, Gold, CircleShape), contentAlignment = Alignment.Center) {
-                        Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(32.dp))
-                    }
-                    Spacer(Modifier.height(16.dp))
-                    Text("Admin SSD", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                    Text(phoneNumber, color = TextGrey, fontSize = 12.sp)
-                }
-                Spacer(Modifier.height(16.dp))
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Storage, null) }, label = { Text("Armazenamento") }, selected = false,
-                    onClick = { showStorage = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização Auto") }, selected = false,
-                    onClick = { showSync = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
-                )
-            }
-        }
+        drawerState = drawerState, drawerContent = { ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) { Column(modifier = Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) { Box(modifier = Modifier.size(64.dp).border(2.dp, Gold, CircleShape), contentAlignment = Alignment.Center) { Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(32.dp)) }; Spacer(Modifier.height(16.dp)); Text("Admin SSD", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp); Text(phoneNumber, color = TextGrey, fontSize = 12.sp) }; Spacer(Modifier.height(16.dp)); NavigationDrawerItem(icon = { Icon(Icons.Default.Storage, null) }, label = { Text("Armazenamento") }, selected = false, onClick = { showStorage = true; scope.launch { drawerState.close() } }, colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)); NavigationDrawerItem(icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização Auto") }, selected = false, onClick = { showSync = true; scope.launch { drawerState.close() } }, colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)) } }
     ) {
         Scaffold(
             topBar = {
                 Column(Modifier.background(BgBlack)) {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
-                            Text(
-                                text = if (transferProgress != null) transferLabel else cloudBannerText,
-                                color = if (transferProgress != null) Gold else TextGrey,
-                                fontSize = 10.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        if (transferProgress != null || isUploading) {
-                            Text(
-                                text = "${transferProgress ?: 0}%",
-                                color = Gold,
-                                fontWeight = FontWeight.Black,
-                                fontSize = 14.sp,
-                                modifier = Modifier.padding(end = 8.dp)
-                            )
-                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
-                        } else {
-                            Icon(Icons.Default.CloudDone, null, tint = Gold)
-                        }
-                    }
-
-                    // Barra de progresso em tempo real (0% a 100%) no topo do ecrã
-                    if (transferProgress != null || isUploading) {
-                        LinearProgressIndicator(
-                            progress = ((transferProgress ?: 5).coerceIn(0, 100)) / 100f,
-                            modifier = Modifier.fillMaxWidth().height(4.dp),
-                            color = Gold,
-                            trackColor = SurfaceDark
-                        )
-                    }
-
-                    TabRow(
-                        selectedTabIndex = selectedTab, containerColor = BgBlack,
-                        indicator = { TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(it[selectedTab]), color = Gold) },
-                        divider = { Divider(color = Color.Transparent) }
-                    ) {
-                        listOf("GALERIA", "PASTAS", "FOTOS", "DOCS").forEachIndexed { i, title ->
-                            Tab(
-                                selected = selectedTab == i,
-                                onClick = {
-                                    selectedTab = i
-                                    if (i != 1) pastaAberta = null
-                                }
-                            ) {
-                                Text(title, color = if (selectedTab == i) Gold else TextGrey, modifier = Modifier.padding(12.dp), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                        }
-                    }
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }; Column(modifier = Modifier.weight(1f)) { Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp); Text(text = if (transferProgress != null) transferLabel else cloudBannerText, color = if (transferProgress != null) Gold else TextGrey, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }; if (transferProgress != null || isUploading) { Text(text = "${transferProgress ?: 0}%", color = Gold, fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.padding(end = 8.dp)); CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp)) } else { Icon(Icons.Default.CloudDone, null, tint = Gold) } }
+                    if (transferProgress != null || isUploading) LinearProgressIndicator(progress = ((transferProgress ?: 5).coerceIn(0, 100)) / 100f, modifier = Modifier.fillMaxWidth().height(4.dp), color = Gold, trackColor = SurfaceDark)
+                    TabRow(selectedTabIndex = selectedTab, containerColor = BgBlack, indicator = { TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(it[selectedTab]), color = Gold) }, divider = { Divider(color = Color.Transparent) }) { listOf("GALERIA", "PASTAS", "FOTOS", "DOCS").forEachIndexed { i, title -> Tab(selected = selectedTab == i, onClick = { selectedTab = i; if (i != 1) pastaAberta = null }) { Text(title, color = if (selectedTab == i) Gold else TextGrey, modifier = Modifier.padding(12.dp), fontWeight = FontWeight.Bold, fontSize = 12.sp) } } }
                 }
             },
-            floatingActionButton = {
-                FloatingActionButton(
-                    onClick = { filePicker.launch(arrayOf("*/*")) },
-                    containerColor = DangerRed, contentColor = Color.White, shape = CircleShape,
-                    modifier = Modifier.shadow(elevation = 16.dp, shape = CircleShape, spotColor = DangerRed, ambientColor = DangerRed)
-                ) { Icon(Icons.Default.CloudUpload, null) }
-            },
+            floatingActionButton = { FloatingActionButton(onClick = { filePicker.launch(arrayOf("*/*")) }, containerColor = DangerRed, contentColor = Color.White, shape = CircleShape, modifier = Modifier.shadow(elevation = 16.dp, shape = CircleShape, spotColor = DangerRed, ambientColor = DangerRed)) { Icon(Icons.Default.CloudUpload, null) } },
             containerColor = BgBlack
         ) { innerPadding ->
             Box(Modifier.padding(innerPadding).fillMaxSize()) {
                 if (selectedTab == 1) {
                     if (pastaAberta != null) {
-                        // Visualização de dentro da pasta selecionada
-                        val arquivosDaPasta = remember(arquivos, mapaPastas, pastaAberta) {
-                            arquivos.filter { mapaPastas[it.dataUpload] == pastaAberta }
-                        }
+                        val arquivosDaPasta = remember(arquivos, mapaPastas, pastaAberta) { arquivos.filter { mapaPastas[it.dataUpload] == pastaAberta } }
                         Column(Modifier.fillMaxSize()) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth().background(SurfaceDarker).padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                IconButton(onClick = { pastaAberta = null }) {
-                                    Icon(Icons.Default.ArrowBack, null, tint = Gold)
-                                }
-                                Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(24.dp))
-                                Spacer(Modifier.width(8.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(pastaAberta!!, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                                    Text("${arquivosDaPasta.size} ficheiro(s) nesta pasta", color = TextGrey, fontSize = 11.sp)
-                                }
-                            }
-
-                            if (arquivosDaPasta.isEmpty()) {
-                                Column(
-                                    modifier = Modifier.fillMaxSize().padding(32.dp),
-                                    horizontalAlignment = Alignment.CenterHorizontally,
-                                    verticalArrangement = Arrangement.Center
-                                ) {
-                                    Icon(Icons.Default.Folder, null, tint = TextGrey, modifier = Modifier.size(56.dp))
-                                    Spacer(Modifier.height(12.dp))
-                                    Text("Pasta '$pastaAberta' vazia", color = Color.White, fontWeight = FontWeight.Bold)
-                                    Text("Toque no botão vermelho (+) para enviar ficheiros diretamente para esta pasta.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-                                }
-                            } else {
-                                GrelhaArquivos(arquivosDaPasta, mapaPastas) { selectedFile = it }
-                            }
+                            Row(modifier = Modifier.fillMaxWidth().background(SurfaceDarker).padding(horizontal = 12.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) { IconButton(onClick = { pastaAberta = null }) { Icon(Icons.Default.ArrowBack, null, tint = Gold) }; Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(24.dp)); Spacer(Modifier.width(8.dp)); Column(Modifier.weight(1f)) { Text(pastaAberta!!, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp); Text("${arquivosDaPasta.size} ficheiro(s) nesta pasta", color = TextGrey, fontSize = 11.sp) } }
+                            if (arquivosDaPasta.isEmpty()) { Column(modifier = Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Icon(Icons.Default.Folder, null, tint = TextGrey, modifier = Modifier.size(56.dp)); Spacer(Modifier.height(12.dp)); Text("Pasta '$pastaAberta' vazia", color = Color.White, fontWeight = FontWeight.Bold); Text("Toque no botão vermelho (+) para enviar.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center) } } else { GrelhaArquivos(arquivosDaPasta, mapaPastas) { selectedFile = it } }
                         }
                     } else {
-                        // Lista de pastas criadas
                         Column(Modifier.fillMaxSize().padding(16.dp)) {
-                            OutlinedButton(
-                                onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(56.dp)
-                            ) { Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold) }
-                            Spacer(Modifier.height(16.dp))
-                            LazyVerticalGrid(
-                                columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                items(pastas) { pasta ->
-                                    val qtd = arquivos.count { mapaPastas[it.dataUpload] == pasta.nomePasta }
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .background(SurfaceDark, RoundedCornerShape(12.dp))
-                                            .border(1.dp, SurfaceDarker, RoundedCornerShape(12.dp))
-                                            .clickable { pastaAberta = pasta.nomePasta }
-                                            .padding(16.dp),
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(32.dp))
-                                        Spacer(Modifier.width(12.dp))
-                                        Column {
-                                            Text(pasta.nomePasta, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Text("$qtd item(ns)", color = TextGrey, fontSize = 10.sp)
-                                        }
-                                    }
-                                }
-                            }
+                            OutlinedButton(onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold) }
+                            Spacer(Modifier.height(16.dp)); LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) { items(pastas) { pasta -> val qtd = arquivos.count { mapaPastas[it.dataUpload] == pasta.nomePasta }; Row(modifier = Modifier.fillMaxWidth().background(SurfaceDark, RoundedCornerShape(12.dp)).border(1.dp, SurfaceDarker, RoundedCornerShape(12.dp)).clickable { pastaAberta = pasta.nomePasta }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(32.dp)); Spacer(Modifier.width(12.dp)); Column { Text(pasta.nomePasta, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Text("$qtd item(ns)", color = TextGrey, fontSize = 10.sp) } } } }
                         }
                     }
                 } else {
-                    val listaFiltrada = remember(arquivos, selectedTab) {
-                        when (selectedTab) {
-                            2 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", ignoreCase = true) }
-                            3 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK") }
-                            else -> arquivos
-                        }
-                    }
-
-                    if (listaFiltrada.isEmpty()) {
-                        Column(modifier = Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                            Icon(Icons.Default.CloudUpload, null, tint = TextGrey, modifier = Modifier.size(56.dp))
-                            Spacer(Modifier.height(12.dp))
-                            Text("Nenhum ficheiro nesta aba", color = Color.White, fontWeight = FontWeight.Bold)
-                            Text("Toque no botão vermelho para enviar para a nuvem do Telegram.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-                        }
-                    } else {
-                        GrelhaArquivos(listaFiltrada, mapaPastas) { selectedFile = it }
-                    }
+                    val listaFiltrada = remember(arquivos, selectedTab) { when (selectedTab) { 2 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", ignoreCase = true) }; 3 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK") }; else -> arquivos } }
+                    if (listaFiltrada.isEmpty()) { Column(modifier = Modifier.fillMaxSize().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) { Icon(Icons.Default.CloudUpload, null, tint = TextGrey, modifier = Modifier.size(56.dp)); Spacer(Modifier.height(12.dp)); Text("Nenhum ficheiro", color = Color.White, fontWeight = FontWeight.Bold) } } else { GrelhaArquivos(listaFiltrada, mapaPastas) { selectedFile = it } }
                 }
             }
 
@@ -893,148 +489,19 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 val pastaAtual = mapaPastas[selectedFile!!.dataUpload] ?: "Galeria Geral"
                 ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
                     Column(Modifier.padding(bottom = 24.dp)) {
-                        Text(selectedFile!!.nomeArquivo, color = Gold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), fontWeight = FontWeight.Bold)
-                        Text(
-                            "Tamanho: ${formatarTamanhoNuvem(selectedFile!!.tamanhoBytes)} • Pasta: $pastaAtual",
-                            color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-                        )
-                        Spacer(Modifier.height(8.dp))
-
-                        ListItem(
-                            headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) },
-                            leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) },
-                            modifier = Modifier.clickable {
-                                viewerFile = selectedFile
-                                selectedFile = null
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                        )
-
-                        ListItem(
-                            headlineContent = { Text("Mover para Pasta...", color = Gold) },
-                            leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) },
-                            modifier = Modifier.clickable {
-                                fileToMove = selectedFile
-                                selectedFile = null
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                        )
-
-                        ListItem(
-                            headlineContent = { Text("Compartilhar...", color = Color.White) },
-                            leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) },
-                            modifier = Modifier.clickable {
-                                try {
-                                    val uri = Uri.parse(selectedFile!!.caminhoMiniatura)
-                                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                        type = context.contentResolver.getType(uri) ?: "*/*"
-                                        putExtra(Intent.EXTRA_STREAM, uri)
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ficheiro"))
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Baixe o ficheiro da nuvem primeiro.", Toast.LENGTH_SHORT).show()
-                                }
-                                selectedFile = null
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                        )
-
-                        ListItem(
-                            headlineContent = { Text("Baixar da Nuvem", color = Gold) },
-                            leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) },
-                            modifier = Modifier.clickable {
-                                val arqAtual = selectedFile!!
-                                selectedFile = null
-                                baixarFicheiroDaNuvem(client, arqAtual.fileId) { msg ->
-                                    scope.launch(Dispatchers.Main) {
-                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                                    }
-                                }
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                        )
-
-                        ListItem(
-                            headlineContent = { Text("Remover do registo", color = DangerRed) },
-                            leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
-                            modifier = Modifier.clickable {
-                                salvarVinculoPasta(context, selectedFile!!.dataUpload, "")
-                                mapaPastas = carregarVinculosPastas(context)
-                                vm.apagar(selectedFile!!.id)
-                                selectedFile = null
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
-                        )
+                        Text(selectedFile!!.nomeArquivo, color = Gold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), fontWeight = FontWeight.Bold); Text("Tamanho: ${formatarTamanhoNuvem(selectedFile!!.tamanhoBytes)} • Pasta: $pastaAtual", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)); Spacer(Modifier.height(8.dp))
+                        ListItem(headlineContent = { Text("Abrir no Nexus", color = Color.White) }, leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) }, modifier = Modifier.clickable { viewerFile = selectedFile; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Mover para...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { fileToMove = selectedFile; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Compartilhar...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) }, modifier = Modifier.clickable { partilharFicheiroSeguro(context, selectedFile!!.caminhoMiniatura); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { val arq = selectedFile!!; selectedFile = null; baixarFicheiroDaNuvem(client, arq.fileId) { msg -> scope.launch(Dispatchers.Main) { Toast.makeText(context, msg, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Apagar", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, selectedFile!!.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); vm.apagar(selectedFile!!.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                     }
                 }
             }
 
-            if (showNewFolder) {
-                Dialog(onDismissRequest = { showNewFolder = false }) {
-                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
-                        Column(modifier = Modifier.padding(24.dp)) {
-                            Text("NOVA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
-                            Spacer(Modifier.height(16.dp))
-                            OutlinedTextField(
-                                value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome da Pasta", color = TextGrey) }, singleLine = true,
-                                colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()
-                            )
-                            Spacer(Modifier.height(24.dp))
-                            Button(onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("CRIAR", color = Color.White, fontWeight = FontWeight.Bold) }
-                        }
-                    }
-                }
-            }
-
-            if (showStorage) {
-                Dialog(onDismissRequest = { showStorage = false }) {
-                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                            Box(modifier = Modifier.size(72.dp), contentAlignment = Alignment.Center) {
-                                Canvas(modifier = Modifier.matchParentSize()) { drawCircle(color = Gold, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))) }
-                                Text("∞", color = Gold, fontSize = 36.sp)
-                            }
-                            Spacer(Modifier.height(24.dp))
-                            Text("TOTAL ENVIADO PELO NEXUS", color = TextGrey, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp)
-                            Text(formatarTamanhoNuvem(armazenamento), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Black)
-                            Spacer(Modifier.height(16.dp))
-                            Box(modifier = Modifier.fillMaxWidth().height(6.dp).background(Brush.horizontalGradient(listOf(Gold, DangerRed)), RoundedCornerShape(3.dp)))
-                            Spacer(Modifier.height(8.dp))
-                            Text("${arquivos.size} ficheiro(s) sincronizados via TDLib", color = TextGrey, fontSize = 10.sp)
-                            Spacer(Modifier.height(32.dp))
-                            Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) }
-                        }
-                    }
-                }
-            }
-
-            if (showSync) {
-                Dialog(onDismissRequest = { showSync = false }) {
-                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                            Icon(Icons.Default.CloudSync, null, tint = Gold, modifier = Modifier.size(56.dp))
-                            Spacer(Modifier.height(16.dp))
-                            Text("BACKUP AUTOMÁTICO", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp, letterSpacing = 1.sp)
-                            Spacer(Modifier.height(8.dp))
-                            Text("Escolha as pastas locais que deseja enviar automaticamente para a nuvem.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-                            Spacer(Modifier.height(24.dp))
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                LinhaSincronizacao("Câmera (Fotos e Vídeos)", syncCamera) { syncCamera = it }
-                                LinhaSincronizacao("WhatsApp Images", syncWhatsApp) { syncWhatsApp = it }
-                                LinhaSincronizacao("Downloads", syncDownloads) { syncDownloads = it }
-                                LinhaSincronizacao("Documentos / PDFs", syncDocumentos) { syncDocumentos = it }
-                            }
-                            Spacer(Modifier.height(24.dp))
-                            Button(
-                                onClick = { showSync = false; cloudBannerText = "Sincronização em segundo plano ativada!" },
-                                colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                                shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)
-                            ) { Text("SALVAR PREFERÊNCIAS", color = Color.White, fontWeight = FontWeight.Bold) }
-                        }
-                    }
-                }
-            }
+            if (showNewFolder) { Dialog(onDismissRequest = { showNewFolder = false }) { Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) { Column(modifier = Modifier.padding(24.dp)) { Text("NOVA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp); Spacer(Modifier.height(16.dp)); OutlinedTextField(value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome", color = TextGrey) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth()); Spacer(Modifier.height(24.dp)); Button(onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("CRIAR", color = Color.White, fontWeight = FontWeight.Bold) } } } } }
+            if (showStorage) { Dialog(onDismissRequest = { showStorage = false }) { Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) { Box(modifier = Modifier.size(72.dp), contentAlignment = Alignment.Center) { Canvas(modifier = Modifier.matchParentSize()) { drawCircle(color = Gold, style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f, pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(10f, 10f), 0f))) }; Text("∞", color = Gold, fontSize = 36.sp) }; Spacer(Modifier.height(24.dp)); Text("TOTAL ENVIADO", color = TextGrey, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp); Text(formatarTamanhoNuvem(armazenamento), color = Color.White, fontSize = 36.sp, fontWeight = FontWeight.Black); Spacer(Modifier.height(16.dp)); Box(modifier = Modifier.fillMaxWidth().height(6.dp).background(Brush.horizontalGradient(listOf(Gold, DangerRed)), RoundedCornerShape(3.dp))); Spacer(Modifier.height(8.dp)); Text("${arquivos.size} ficheiros", color = TextGrey, fontSize = 10.sp); Spacer(Modifier.height(32.dp)); Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold) } } } } }
+            if (showSync) { Dialog(onDismissRequest = { showSync = false }) { Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) { Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) { Icon(Icons.Default.CloudSync, null, tint = Gold, modifier = Modifier.size(56.dp)); Spacer(Modifier.height(16.dp)); Text("BACKUP", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp, letterSpacing = 1.sp); Spacer(Modifier.height(8.dp)); Text("Escolha pastas.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center); Spacer(Modifier.height(24.dp)); Column(modifier = Modifier.fillMaxWidth()) { LinhaSincronizacao("Câmera", syncCamera) { syncCamera = it }; LinhaSincronizacao("WhatsApp", syncWhatsApp) { syncWhatsApp = it }; LinhaSincronizacao("Downloads", syncDownloads) { syncDownloads = it }; LinhaSincronizacao("Documentos", syncDocumentos) { syncDocumentos = it } }; Spacer(Modifier.height(24.dp)); Button(onClick = { showSync = false; cloudBannerText = "Sincronização ativada!" }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth().height(48.dp)) { Text("SALVAR", color = Color.White, fontWeight = FontWeight.Bold) } } } } }
         }
     }
 }
