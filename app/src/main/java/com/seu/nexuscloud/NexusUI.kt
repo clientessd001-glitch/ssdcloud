@@ -40,6 +40,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,6 +57,11 @@ val SurfaceDarker = Color(0xFF10131B)
 val Gold = Color(0xFFFFD700)
 val DangerRed = Color(0xFFE53935)
 val TextGrey = Color(0xFFA0AABF)
+
+object NexusTransfer {
+    val progress = MutableStateFlow<Int?>(null)
+    val label = MutableStateFlow("")
+}
 
 class UIViewModel(private val dao: NexusDao) : ViewModel() {
     val arquivos = dao.buscarTodos().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -265,8 +271,8 @@ fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) 
         onResult("ID do ficheiro ausente na nuvem.")
         return
     }
-    TelegramAuth.transferProgress.value = 1
-    TelegramAuth.transferLabel.value = "Iniciando download da nuvem..."
+    NexusTransfer.progress.value = 15
+    NexusTransfer.label.value = "Iniciando download da nuvem..."
 
     val req = TdApi.DownloadFile().apply {
         fileId = targetFileId
@@ -278,17 +284,21 @@ fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) 
             is TdApi.File -> {
                 val caminho = result.local?.path
                 if (result.local?.isDownloadingCompleted == true && !caminho.isNullOrBlank()) {
-                    TelegramAuth.transferProgress.value = null
+                    NexusTransfer.progress.value = null
                     onResult("Ficheiro descarregado em: $caminho")
                 } else {
-                    onResult("A transferir da nuvem (acompanhe a % no topo)...")
+                    NexusTransfer.progress.value = null
+                    onResult("Download da nuvem iniciado em segundo plano!")
                 }
             }
             is TdApi.Error -> {
-                TelegramAuth.transferProgress.value = null
+                NexusTransfer.progress.value = null
                 onResult("Erro no download (${result.code}): ${result.message}")
             }
-            else -> onResult("A processar download na TDLib...")
+            else -> {
+                NexusTransfer.progress.value = null
+                onResult("A processar download na TDLib...")
+            }
         }
     }
 }
@@ -419,8 +429,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val loginStep by TelegramAuth.step.collectAsState()
     val statusText by TelegramAuth.statusText.collectAsState()
     val errorText by TelegramAuth.errorText.collectAsState()
-    val transferProgress by TelegramAuth.transferProgress.collectAsState()
-    val transferLabel by TelegramAuth.transferLabel.collectAsState()
+    val transferProgress by NexusTransfer.progress.collectAsState()
+    val transferLabel by NexusTransfer.label.collectAsState()
 
     var phoneNumber by remember { mutableStateOf("+5585") }
     var smsCode by remember { mutableStateOf("") }
@@ -453,6 +463,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var isUploading by remember { mutableStateOf(false) }
     var cloudBannerText by remember { mutableStateOf("Nuvem TDLib Ativa • Mensagens Salvas") }
 
+    LaunchedEffect(isUploading) {
+        while (isUploading) {
+            delay(350)
+            val atual = NexusTransfer.progress.value ?: 10
+            if (atual < 92) {
+                val novo = (atual + 12).coerceAtMost(92)
+                NexusTransfer.progress.value = novo
+            }
+        }
+    }
+
     val responseHandler = remember {
         Client.ResultHandler { obj ->
             if (obj is TdApi.Error) {
@@ -464,9 +485,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
     fun executarUpload(uri: Uri, pastaEscolhida: String) {
         scope.launch {
             isUploading = true
-            TelegramAuth.transferProgress.value = 1
+            NexusTransfer.progress.value = 10
             val (nome, tamanho) = obterDetalhesFicheiro(context, uri)
-            TelegramAuth.transferLabel.value = "Preparando '$nome'..."
+            NexusTransfer.label.value = "Enviando '$nome'..."
             cloudBannerText = "Enviando '$nome' para o Telegram..."
 
             val arquivoTemp = withContext(Dispatchers.IO) {
@@ -479,7 +500,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
             if (arquivoTemp != null) {
                 enviarParaMensagensSalvas(client, arquivoTemp.absolutePath, nome, pastaEscolhida) { sucesso, remoteId, detalhe ->
                     isUploading = false
-                    TelegramAuth.transferProgress.value = null
+                    NexusTransfer.progress.value = null
                     cloudBannerText = detalhe
                     if (sucesso) {
                         val timestamp = System.currentTimeMillis()
@@ -500,7 +521,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             } else {
                 isUploading = false
-                TelegramAuth.transferProgress.value = null
+                NexusTransfer.progress.value = null
                 cloudBannerText = "Erro ao ler o ficheiro selecionado."
             }
         }
@@ -655,7 +676,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Spacer(Modifier.height(16.dp))
                         Text(currentFile.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(8.dp))
-                        Text("Use o botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                        Text("Toque no botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
                     }
                 }
 
@@ -808,7 +829,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                         if (transferProgress != null || isUploading) {
                             Text(
-                                text = "${transferProgress ?: 0}%",
+                                text = "${transferProgress ?: 10}%",
                                 color = Gold,
                                 fontWeight = FontWeight.Black,
                                 fontSize = 14.sp,
@@ -821,12 +842,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
 
                     if (transferProgress != null || isUploading) {
-                        LinearProgressIndicator(
-                            progress = ((transferProgress ?: 5).coerceIn(0, 100)) / 100f,
-                            modifier = Modifier.fillMaxWidth().height(4.dp),
-                            color = Gold,
-                            trackColor = SurfaceDark
-                        )
+                        val fra = ((transferProgress ?: 10).coerceIn(5, 100)) / 100f
+                        Box(modifier = Modifier.fillMaxWidth().height(4.dp).background(SurfaceDark)) {
+                            Box(modifier = Modifier.fillMaxWidth(fra).height(4.dp).background(Gold))
+                        }
                     }
 
                     TabRow(
