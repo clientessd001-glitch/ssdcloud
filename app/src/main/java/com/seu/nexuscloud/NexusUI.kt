@@ -4,7 +4,6 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -40,6 +39,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -56,6 +56,11 @@ val SurfaceDarker = Color(0xFF10131B)
 val Gold = Color(0xFFFFD700)
 val DangerRed = Color(0xFFE53935)
 val TextGrey = Color(0xFFA0AABF)
+
+object NexusTransfer {
+    val progress = MutableStateFlow<Int?>(null)
+    val label = MutableStateFlow("")
+}
 
 class UIViewModel(private val dao: NexusDao) : ViewModel() {
     val arquivos = dao.buscarTodos().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -152,7 +157,6 @@ fun descobrirMimeType(nomeArquivo: String): String {
     }
 }
 
-// Partilha qualquer ficheiro (mesmo da pasta privada da app) usando o MediaStore nativo do Android
 fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String, nomeArquivo: String) {
     try {
         val mimeType = descobrirMimeType(nomeArquivo)
@@ -183,7 +187,6 @@ fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String, nomeA
         val colecao = when {
             mimeType.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             mimeType.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            Build.VERSION.SDK_INT >= 29 -> MediaStore.Downloads.EXTERNAL_CONTENT_URI
             else -> MediaStore.Files.getContentUri("external")
         }
 
@@ -210,6 +213,34 @@ fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String, nomeA
         }
     } catch (e: Exception) {
         Toast.makeText(context, "Erro ao partilhar: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+    }
+}
+
+fun monitorizarProgressoTDLib(client: Client, targetFileId: Int, isDownload: Boolean) {
+    if (targetFileId == 0) return
+    client.send(TdApi.GetFile(targetFileId)) { obj ->
+        if (obj is TdApi.File) {
+            val total = if (obj.expectedSize.toLong() > 0L) obj.expectedSize.toLong() else obj.size.toLong()
+            if (isDownload) {
+                val local = obj.local
+                if (local != null && local.isDownloadingActive) {
+                    val pct = if (total > 0L) ((local.downloadedSize.toLong() * 100L) / total).toInt().coerceIn(1, 99) else 50
+                    NexusTransfer.progress.value = pct
+                    NexusTransfer.label.value = "Baixando da nuvem: $pct%"
+                } else if (local != null && local.isDownloadingCompleted) {
+                    NexusTransfer.progress.value = null
+                }
+            } else {
+                val remote = obj.remote
+                if (remote != null && remote.isUploadingActive) {
+                    val pct = if (total > 0L) ((remote.uploadedSize.toLong() * 100L) / total).toInt().coerceIn(1, 99) else 50
+                    NexusTransfer.progress.value = pct
+                    NexusTransfer.label.value = "Enviando para a nuvem: $pct%"
+                } else if (remote != null && remote.isUploadingCompleted) {
+                    NexusTransfer.progress.value = null
+                }
+            }
+        }
     }
 }
 
@@ -265,8 +296,8 @@ fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) 
         onResult("ID do ficheiro ausente na nuvem.")
         return
     }
-    TelegramAuth.transferProgress.value = 1
-    TelegramAuth.transferLabel.value = "Iniciando download da nuvem..."
+    NexusTransfer.progress.value = 10
+    NexusTransfer.label.value = "Iniciando download da nuvem..."
 
     val req = TdApi.DownloadFile().apply {
         fileId = targetFileId
@@ -278,14 +309,14 @@ fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) 
             is TdApi.File -> {
                 val caminho = result.local?.path
                 if (result.local?.isDownloadingCompleted == true && !caminho.isNullOrBlank()) {
-                    TelegramAuth.transferProgress.value = null
+                    NexusTransfer.progress.value = null
                     onResult("Ficheiro descarregado em: $caminho")
                 } else {
-                    onResult("A transferir da nuvem (acompanhe a % no topo)...")
+                    onResult("A transferir da nuvem...")
                 }
             }
             is TdApi.Error -> {
-                TelegramAuth.transferProgress.value = null
+                NexusTransfer.progress.value = null
                 onResult("Erro no download (${result.code}): ${result.message}")
             }
             else -> onResult("A processar download na TDLib...")
@@ -419,8 +450,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val loginStep by TelegramAuth.step.collectAsState()
     val statusText by TelegramAuth.statusText.collectAsState()
     val errorText by TelegramAuth.errorText.collectAsState()
-    val transferProgress by TelegramAuth.transferProgress.collectAsState()
-    val transferLabel by TelegramAuth.transferLabel.collectAsState()
+    val transferProgress by NexusTransfer.progress.collectAsState()
+    val transferLabel by NexusTransfer.label.collectAsState()
 
     var phoneNumber by remember { mutableStateOf("+5585") }
     var smsCode by remember { mutableStateOf("") }
@@ -451,7 +482,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var syncDocumentos by remember { mutableStateOf(false) }
 
     var isUploading by remember { mutableStateOf(false) }
+    var activeFileId by remember { mutableIntStateOf(0) }
+    var isDownloadingMode by remember { mutableStateOf(false) }
     var cloudBannerText by remember { mutableStateOf("Nuvem TDLib Ativa • Mensagens Salvas") }
+
+    LaunchedEffect(activeFileId, isUploading, transferProgress) {
+        while (activeFileId != 0 && (isUploading || transferProgress != null)) {
+            monitorizarProgressoTDLib(client, activeFileId, isDownloadingMode)
+            delay(400)
+        }
+    }
 
     val responseHandler = remember {
         Client.ResultHandler { obj ->
@@ -464,9 +504,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
     fun executarUpload(uri: Uri, pastaEscolhida: String) {
         scope.launch {
             isUploading = true
-            TelegramAuth.transferProgress.value = 1
+            isDownloadingMode = false
+            NexusTransfer.progress.value = 15
             val (nome, tamanho) = obterDetalhesFicheiro(context, uri)
-            TelegramAuth.transferLabel.value = "Preparando '$nome'..."
+            NexusTransfer.label.value = "Enviando '$nome'..."
             cloudBannerText = "Enviando '$nome' para o Telegram..."
 
             val arquivoTemp = withContext(Dispatchers.IO) {
@@ -477,9 +518,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
 
             if (arquivoTemp != null) {
+                NexusTransfer.progress.value = 45
                 enviarParaMensagensSalvas(client, arquivoTemp.absolutePath, nome, pastaEscolhida) { sucesso, remoteId, detalhe ->
+                    activeFileId = remoteId
                     isUploading = false
-                    TelegramAuth.transferProgress.value = null
+                    NexusTransfer.progress.value = null
                     cloudBannerText = detalhe
                     if (sucesso) {
                         val timestamp = System.currentTimeMillis()
@@ -500,7 +543,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             } else {
                 isUploading = false
-                TelegramAuth.transferProgress.value = null
+                NexusTransfer.progress.value = null
                 cloudBannerText = "Erro ao ler o ficheiro selecionado."
             }
         }
@@ -655,7 +698,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Spacer(Modifier.height(16.dp))
                         Text(currentFile.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
                         Spacer(Modifier.height(8.dp))
-                        Text("Use o botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                        Text("Toque no botão de partilha no topo para enviar ou abrir noutro leitor.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
                     }
                 }
 
@@ -808,7 +851,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                         if (transferProgress != null || isUploading) {
                             Text(
-                                text = "${transferProgress ?: 0}%",
+                                text = "${transferProgress ?: 15}%",
                                 color = Gold,
                                 fontWeight = FontWeight.Black,
                                 fontSize = 14.sp,
@@ -821,12 +864,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
 
                     if (transferProgress != null || isUploading) {
-                        LinearProgressIndicator(
-                            progress = ((transferProgress ?: 5).coerceIn(0, 100)) / 100f,
-                            modifier = Modifier.fillMaxWidth().height(4.dp),
-                            color = Gold,
-                            trackColor = SurfaceDark
-                        )
+                        val fra = ((transferProgress ?: 15).coerceIn(5, 100)) / 100f
+                        Box(modifier = Modifier.fillMaxWidth().height(4.dp).background(SurfaceDark)) {
+                            Box(modifier = Modifier.fillMaxWidth(fra).height(4.dp).background(Gold))
+                        }
                     }
 
                     TabRow(
@@ -995,6 +1036,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             modifier = Modifier.clickable {
                                 val arqAtual = selectedFile!!
                                 selectedFile = null
+                                activeFileId = arqAtual.fileId
+                                isDownloadingMode = true
                                 baixarFicheiroDaNuvem(client, arqAtual.fileId) { msg ->
                                     scope.launch(Dispatchers.Main) {
                                         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
