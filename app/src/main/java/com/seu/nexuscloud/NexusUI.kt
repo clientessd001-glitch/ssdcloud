@@ -134,12 +134,18 @@ fun descobrirMimeType(nome: String): String {
     }
 }
 
-fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String, nomeArquivo: String) {
+fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String?, nomeArquivo: String) {
     try {
+        val caminho = caminhoMiniatura ?: ""
+        if (caminho.isBlank()) {
+            Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem'.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
         val mime = descobrirMimeType(nomeArquivo)
-        if (caminhoMiniatura.startsWith("content://")) {
-            val u = Uri.parse(caminhoMiniatura)
+        if (caminho.startsWith("content://")) {
+            val u = Uri.parse(caminho)
             val i = Intent(Intent.ACTION_SEND).apply {
                 type = context.contentResolver.getType(u) ?: mime
                 putExtra(Intent.EXTRA_STREAM, u)
@@ -148,12 +154,14 @@ fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String, nomeA
             context.startActivity(Intent.createChooser(i, "Compartilhar $nomeArquivo"))
             return
         }
-        val limpo = if (caminhoMiniatura.startsWith("file://")) Uri.parse(caminhoMiniatura).path ?: caminhoMiniatura.removePrefix("file://") else caminhoMiniatura
+
+        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
         val arq = File(limpo)
         if (!arq.exists()) {
             Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem'.", Toast.LENGTH_SHORT).show()
             return
         }
+
         val col = when {
             mime.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
             mime.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
@@ -214,7 +222,10 @@ fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) 
     client.send(req) { res ->
         NexusTransfer.progress.value = null
         when (res) {
-            is TdApi.File -> onResult(if (!res.local?.path.isNullOrBlank()) "Salvo em: ${res.local.path}" else "Transferência iniciada!")
+            is TdApi.File -> {
+                val caminho = res.local?.path
+                onResult(if (!caminho.isNullOrBlank()) "Salvo em: $caminho" else "Transferência iniciada!")
+            }
             is TdApi.Error -> onResult("Erro (${res.code}): ${res.message}")
             else -> onResult("Download em andamento...")
         }
@@ -246,10 +257,11 @@ fun GrelhaArquivos(lista: List<ArquivoNuvem>, mapaPastas: Map<Long, String>, onF
         items(lista) { arq ->
             val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
             val pasta = mapaPastas[arq.dataUpload]
+            val thumbSafe = arq.caminhoMiniatura ?: ""
             Box(Modifier.aspectRatio(1f).background(SurfaceDark).clickable { onFileClick(arq) }, contentAlignment = Alignment.Center) {
                 when {
                     ext in listOf("JPG", "JPEG", "PNG", "WEBP") || arq.nomeArquivo.contains("IMG", true) ->
-                        AsyncImage(model = Uri.parse(arq.caminhoMiniatura), contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                        AsyncImage(model = Uri.parse(thumbSafe), contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                     ext == "PDF" -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
                         Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
                         Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -424,13 +436,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     if (viewerFile != null) {
         val cur = viewerFile!!
+        val curThumb = cur.caminhoMiniatura ?: ""
         Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Box(Modifier.fillMaxSize().background(Color.Black)) {
                 val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase()
                 if (ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || cur.nomeArquivo.contains("IMG", true)) {
-                    AsyncImage(model = Uri.parse(cur.caminhoMiniatura), contentDescription = cur.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                    AsyncImage(model = Uri.parse(curThumb), contentDescription = cur.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
                 } else if (ext in listOf("MP4", "MKV", "MOV")) {
-                    AndroidView(factory = { ctx -> android.widget.VideoView(ctx).apply { setVideoURI(Uri.parse(cur.caminhoMiniatura)); start() } }, modifier = Modifier.fillMaxSize().align(Alignment.Center))
+                    AndroidView(factory = { ctx -> android.widget.VideoView(ctx).apply { setVideoURI(Uri.parse(curThumb)); start() } }, modifier = Modifier.fillMaxSize().align(Alignment.Center))
                 } else {
                     Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(64.dp))
@@ -641,4 +654,3 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 }
-// === FIM DO FICHEIRO ===
