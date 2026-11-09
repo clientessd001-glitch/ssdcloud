@@ -4,9 +4,11 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
+import android.os.ParcelFileDescriptor
 import android.os.StrictMode
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -27,6 +29,7 @@ import androidx.compose.ui.*
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -78,6 +81,12 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
     fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch { dao.salvarArquivo(arq) }
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
+    fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
+        if (novoNome.isNotBlank()) {
+            dao.apagarArquivo(arq.id)
+            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = novoNome.trim()))
+        }
+    }
 }
 
 fun formatarDataNuvem(timestamp: Long): String {
@@ -155,11 +164,86 @@ fun descobrirMimeType(nome: String): String {
         "jpg", "jpeg" -> "image/jpeg"
         "png" -> "image/png"
         "webp" -> "image/webp"
+        "heic" -> "image/heic"
         "mp4", "mov", "mkv", "avi" -> "video/mp4"
         "pdf" -> "application/pdf"
-        "zip", "rar" -> "application/zip"
+        "doc" -> "application/msword"
+        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "xls" -> "application/vnd.ms-excel"
+        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "ppt" -> "application/vnd.ms-powerpoint"
+        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        "txt", "csv", "log", "json", "xml", "md" -> "text/plain"
+        "zip" -> "application/zip"
+        "rar" -> "application/x-rar-compressed"
         "apk" -> "application/vnd.android.package-archive"
         else -> "*/*"
+    }
+}
+
+fun gerarCapaPdf(arquivoPdf: File): File? {
+    return try {
+        val frameFile = File("${arquivoPdf.absolutePath}_frame.jpg")
+        if (frameFile.exists()) return frameFile
+        ParcelFileDescriptor.open(arquivoPdf, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
+            PdfRenderer(pfd).use { renderer ->
+                if (renderer.pageCount > 0) {
+                    renderer.openPage(0).use { page ->
+                        val largura = (page.width * 2).coerceIn(300, 1200)
+                        val altura = (page.height * 2).coerceIn(400, 1600)
+                        val bmp = Bitmap.createBitmap(largura, altura, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        FileOutputStream(frameFile).use { out ->
+                            bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                        }
+                        return frameFile
+                    }
+                }
+            }
+        }
+        null
+    } catch (_: Exception) {
+        null
+    }
+}
+
+fun renderizarPaginasPdf(caminhoMiniatura: String?): List<Bitmap> {
+    val lista = mutableListOf<Bitmap>()
+    try {
+        val caminho = caminhoMiniatura ?: return emptyList()
+        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+        val arq = File(limpo)
+        if (!arq.exists()) return emptyList()
+
+        ParcelFileDescriptor.open(arq, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
+            PdfRenderer(pfd).use { renderer ->
+                val total = renderer.pageCount.coerceAtMost(20)
+                for (i in 0 until total) {
+                    renderer.openPage(i).use { page ->
+                        val largura = (page.width * 2).coerceIn(400, 1400)
+                        val altura = (page.height * 2).coerceIn(500, 1800)
+                        val bmp = Bitmap.createBitmap(largura, altura, Bitmap.Config.ARGB_8888)
+                        bmp.eraseColor(android.graphics.Color.WHITE)
+                        page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        lista.add(bmp)
+                    }
+                }
+            }
+        }
+    } catch (_: Exception) {}
+    return lista
+}
+
+fun lerTextoDocumento(caminhoMiniatura: String?): String? {
+    return try {
+        val caminho = caminhoMiniatura ?: return null
+        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+        val arq = File(limpo)
+        if (!arq.exists()) return null
+        arq.bufferedReader().use { it.readText().take(40000) }
+    } catch (_: Exception) {
+        null
     }
 }
 
@@ -170,7 +254,8 @@ fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String): Str
         context.contentResolver.openInputStream(uri)?.use { inp ->
             FileOutputStream(f).use { out -> inp.copyTo(out) }
         }
-        if (descobrirMimeType(nomeArquivo).startsWith("video/")) {
+        val mime = descobrirMimeType(nomeArquivo)
+        if (mime.startsWith("video/")) {
             try {
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(f.absolutePath)
@@ -183,6 +268,8 @@ fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String): Str
                     }
                 }
             } catch (_: Exception) {}
+        } else if (mime == "application/pdf") {
+            gerarCapaPdf(f)
         }
         Uri.fromFile(f).toString()
     } catch (_: Exception) {
@@ -190,14 +277,31 @@ fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String): Str
     }
 }
 
-fun obterUriCapaVideo(caminhoMiniatura: String?): Uri {
+fun obterUriCapaMidia(caminhoMiniatura: String?): Uri {
     val caminho = caminhoMiniatura ?: ""
     if (caminho.startsWith("file://")) {
         val limpo = Uri.parse(caminho).path ?: caminho.removePrefix("file://")
         val frameFile = File("${limpo}_frame.jpg")
         if (frameFile.exists()) return Uri.fromFile(frameFile)
+        val arqOriginal = File(limpo)
+        if (arqOriginal.exists() && limpo.endsWith(".pdf", ignoreCase = true)) {
+            val gerado = gerarCapaPdf(arqOriginal)
+            if (gerado != null) return Uri.fromFile(gerado)
+        }
     }
     return Uri.parse(caminho)
+}
+
+fun temCapaPdfLocal(caminhoMiniatura: String?): Boolean {
+    val caminho = caminhoMiniatura ?: return false
+    if (caminho.startsWith("file://")) {
+        val limpo = Uri.parse(caminho).path ?: caminho.removePrefix("file://")
+        val frameFile = File("${limpo}_frame.jpg")
+        if (frameFile.exists()) return true
+        val arqOriginal = File(limpo)
+        if (arqOriginal.exists()) return gerarCapaPdf(arqOriginal) != null
+    }
+    return false
 }
 
 fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nomeArquivo: String): File? {
@@ -209,52 +313,68 @@ fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nomeArquivo: String): Fi
     } catch (_: Exception) { null }
 }
 
+fun prepararUriPublica(context: Context, caminhoMiniatura: String?, nomeArquivo: String): Pair<Uri, String>? {
+    val caminho = caminhoMiniatura ?: ""
+    if (caminho.isBlank()) return null
+
+    StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+    val mime = descobrirMimeType(nomeArquivo)
+    if (caminho.startsWith("content://")) {
+        val u = Uri.parse(caminho)
+        return Pair(u, context.contentResolver.getType(u) ?: mime)
+    }
+
+    val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+    val arq = File(limpo)
+    if (!arq.exists()) return null
+
+    val col = when {
+        mime.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        mime.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        else -> MediaStore.Files.getContentUri("external")
+    }
+    val vals = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
+        put(MediaStore.MediaColumns.MIME_TYPE, if (mime == "*/*") "application/octet-stream" else mime)
+    }
+    val uriMedia = try {
+        context.contentResolver.insert(col, vals)?.also { d ->
+            context.contentResolver.openOutputStream(d)?.use { o -> arq.inputStream().use { it.copyTo(o) } }
+        }
+    } catch (_: Exception) { null }
+
+    return Pair(uriMedia ?: Uri.fromFile(arq), mime)
+}
+
+fun abrirFicheiroExterno(context: Context, caminhoMiniatura: String?, nomeArquivo: String) {
+    try {
+        val preparado = prepararUriPublica(context, caminhoMiniatura, nomeArquivo)
+        if (preparado == null) {
+            Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem' primeiro.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (uri, mime) = preparado
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, if (mime == "*/*") "application/octet-stream" else mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(Intent.createChooser(viewIntent, "Abrir $nomeArquivo com..."))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Nenhuma app encontrada para abrir este formato.", Toast.LENGTH_SHORT).show()
+    }
+}
+
 fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String?, nomeArquivo: String) {
     try {
-        val caminho = caminhoMiniatura ?: ""
-        if (caminho.isBlank()) {
+        val preparado = prepararUriPublica(context, caminhoMiniatura, nomeArquivo)
+        if (preparado == null) {
             Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem'.", Toast.LENGTH_SHORT).show()
             return
         }
-
-        StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
-        val mime = descobrirMimeType(nomeArquivo)
-        if (caminho.startsWith("content://")) {
-            val u = Uri.parse(caminho)
-            val i = Intent(Intent.ACTION_SEND).apply {
-                type = context.contentResolver.getType(u) ?: mime
-                putExtra(Intent.EXTRA_STREAM, u)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-            context.startActivity(Intent.createChooser(i, "Compartilhar $nomeArquivo"))
-            return
-        }
-
-        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
-        val arq = File(limpo)
-        if (!arq.exists()) {
-            Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem'.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val col = when {
-            mime.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-            mime.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            else -> MediaStore.Files.getContentUri("external")
-        }
-        val vals = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
-            put(MediaStore.MediaColumns.MIME_TYPE, if (mime == "*/*") "application/octet-stream" else mime)
-        }
-        val uriMedia = try {
-            context.contentResolver.insert(col, vals)?.also { d ->
-                context.contentResolver.openOutputStream(d)?.use { o -> arq.inputStream().use { it.copyTo(o) } }
-            }
-        } catch (_: Exception) { null }
-
+        val (uri, mime) = preparado
         val shareIntent = Intent(Intent.ACTION_SEND).apply {
             type = mime
-            putExtra(Intent.EXTRA_STREAM, uriMedia ?: Uri.fromFile(arq))
+            putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         context.startActivity(Intent.createChooser(shareIntent, "Compartilhar $nomeArquivo"))
@@ -309,7 +429,6 @@ fun baixarFicheiroDaNuvem(context: Context, client: Client, targetFileId: Int, n
                 val caminhoRemoto = res.local?.path
                 if (!caminhoRemoto.isNullOrBlank() && File(caminhoRemoto).exists()) {
                     try {
-                        val mime = descobrirMimeType(nomeArquivo)
                         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                         if (!downloadsDir.exists()) downloadsDir.mkdirs()
                         val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
@@ -366,13 +485,25 @@ fun GrelhaArquivos(lista: List<ArquivoNuvem>, mapaPastas: Map<Long, String>, onF
                     }
                     ext in listOf("MP4", "MKV", "MOV", "AVI") || arq.nomeArquivo.contains("VID", true) || arq.nomeArquivo.contains("Video", true) -> {
                         Box(Modifier.fillMaxSize()) {
-                            AsyncImage(model = obterUriCapaVideo(arq.caminhoMiniatura), contentDescription = "Video Preview", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                            AsyncImage(model = obterUriCapaMidia(arq.caminhoMiniatura), contentDescription = "Video Preview", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                             Icon(Icons.Default.PlayCircleOutline, null, tint = Color.White.copy(alpha = 0.85f), modifier = Modifier.size(44.dp).align(Alignment.Center))
                         }
                     }
-                    ext == "PDF" -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                        Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
-                        Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    ext == "PDF" -> {
+                        val possuiCapa = remember(arq.caminhoMiniatura) { temCapaPdfLocal(arq.caminhoMiniatura) }
+                        if (possuiCapa) {
+                            Box(Modifier.fillMaxSize()) {
+                                AsyncImage(model = obterUriCapaMidia(arq.caminhoMiniatura), contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                                Box(Modifier.align(Alignment.BottomEnd).padding(4.dp).background(DangerRed, RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 2.dp)) {
+                                    Text("PDF", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        } else {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
+                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
                     }
                     ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
                         Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
@@ -420,6 +551,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
+
+    var fileToRename by remember { mutableStateOf<ArquivoNuvem?>(null) }
+    var novoNomeInput by remember { mutableStateOf("") }
 
     var searchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
@@ -536,6 +670,68 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
+    if (fileToRename != null) {
+        val arqR = fileToRename!!
+        val extOriginal = arqR.nomeArquivo.substringAfterLast('.', "")
+        Dialog(onDismissRequest = { fileToRename = null }) {
+            Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(24.dp)) {
+                    Text("RENOMEAR FICHEIRO", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(8.dp))
+                    if (extOriginal.isNotBlank()) {
+                        Text("Formato mantido automaticamente: .$extOriginal", color = TextGrey, fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    OutlinedTextField(
+                        value = novoNomeInput,
+                        onValueChange = { novoNomeInput = it },
+                        label = { Text("Novo nome", color = TextGrey) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { fileToRename = null },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CANCELAR", color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                val limpo = novoNomeInput.trim()
+                                if (limpo.isNotBlank()) {
+                                    val nomeFinal = if (extOriginal.isNotBlank() && !limpo.endsWith(".$extOriginal", ignoreCase = true)) {
+                                        "$limpo.$extOriginal"
+                                    } else {
+                                        limpo
+                                    }
+                                    vm.renomearArquivo(arqR, nomeFinal)
+                                    if (viewerFile?.dataUpload == arqR.dataUpload) {
+                                        viewerFile = arqR.copy(nomeArquivo = nomeFinal)
+                                    }
+                                    Toast.makeText(context, "Renomeado para $nomeFinal", Toast.LENGTH_SHORT).show()
+                                }
+                                fileToRename = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("SALVAR", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if (pendingUploadUris.isNotEmpty()) {
         val listaAtual = pendingUploadUris
         Dialog(onDismissRequest = { pendingUploadUris = emptyList() }) {
@@ -586,12 +782,31 @@ fun NexusUI(dao: NexusDao, client: Client) {
         val cur = viewerFile!!
         val curThumb = cur.caminhoMiniatura ?: ""
         val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase()
+        val isImage = ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || cur.nomeArquivo.contains("IMG", true)
         val isVideo = ext in listOf("MP4", "MKV", "MOV", "AVI") || cur.nomeArquivo.contains("VID", true) || cur.nomeArquivo.contains("Video", true)
+        val isPdf = ext == "PDF"
+        val isText = ext in listOf("TXT", "CSV", "LOG", "JSON", "XML", "MD")
 
         var videoViewRef by remember { mutableStateOf<android.widget.VideoView?>(null) }
         var isPlaying by remember { mutableStateOf(true) }
         var currentPos by remember { mutableIntStateOf(0) }
         var duration by remember { mutableIntStateOf(0) }
+
+        var pdfPages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
+        var isLoadingDoc by remember { mutableStateOf(false) }
+        var textContent by remember { mutableStateOf<String?>(null) }
+
+        LaunchedEffect(cur.caminhoMiniatura, ext) {
+            if (isPdf) {
+                isLoadingDoc = true
+                pdfPages = withContext(Dispatchers.IO) { renderizarPaginasPdf(cur.caminhoMiniatura) }
+                isLoadingDoc = false
+            } else if (isText) {
+                isLoadingDoc = true
+                textContent = withContext(Dispatchers.IO) { lerTextoDocumento(cur.caminhoMiniatura) }
+                isLoadingDoc = false
+            }
+        }
 
         LaunchedEffect(videoViewRef, isPlaying) {
             while (videoViewRef != null) {
@@ -610,42 +825,151 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
         Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Box(Modifier.fillMaxSize().background(Color.Black)) {
-                if (ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || cur.nomeArquivo.contains("IMG", true)) {
-                    AsyncImage(model = Uri.parse(curThumb), contentDescription = cur.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                } else if (isVideo) {
-                    AndroidView(
-                        factory = { ctx ->
-                            android.widget.VideoView(ctx).apply {
-                                setVideoURI(Uri.parse(curThumb))
-                                setOnPreparedListener { mp ->
-                                    duration = mp.duration.coerceAtLeast(0)
-                                    start()
-                                    isPlaying = true
+                when {
+                    isImage -> {
+                        AsyncImage(model = Uri.parse(curThumb), contentDescription = cur.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
+                    }
+                    isVideo -> {
+                        AndroidView(
+                            factory = { ctx ->
+                                android.widget.VideoView(ctx).apply {
+                                    setVideoURI(Uri.parse(curThumb))
+                                    setOnPreparedListener { mp ->
+                                        duration = mp.duration.coerceAtLeast(0)
+                                        start()
+                                        isPlaying = true
+                                    }
+                                    setOnCompletionListener {
+                                        isPlaying = false
+                                        currentPos = duration
+                                    }
+                                    videoViewRef = this
                                 }
-                                setOnCompletionListener {
-                                    isPlaying = false
-                                    currentPos = duration
-                                }
-                                videoViewRef = this
+                            },
+                            modifier = Modifier.fillMaxSize().align(Alignment.Center)
+                        )
+                    }
+                    isPdf -> {
+                        if (isLoadingDoc) {
+                            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(color = Gold)
+                                Spacer(Modifier.height(12.dp))
+                                Text("A renderizar páginas do PDF...", color = Color.White, fontSize = 13.sp)
                             }
-                        },
-                        modifier = Modifier.fillMaxSize().align(Alignment.Center)
-                    )
-                } else {
-                    Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(64.dp))
-                        Spacer(Modifier.height(16.dp))
-                        Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold)
+                        } else if (pdfPages.isNotEmpty()) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(top = 72.dp, bottom = 72.dp)
+                                    .verticalScroll(rememberScrollState())
+                                    .padding(horizontal = 12.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                pdfPages.forEachIndexed { idx, paginaBmp ->
+                                    Text(
+                                        "Página ${idx + 1} de ${pdfPages.size}",
+                                        color = Gold,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                    )
+                                    Image(
+                                        bitmap = paginaBmp.asImageBitmap(),
+                                        contentDescription = "Página ${idx + 1}",
+                                        contentScale = ContentScale.FillWidth,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(Color.White, RoundedCornerShape(6.dp))
+                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                            }
+                        } else {
+                            Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(64.dp))
+                                Spacer(Modifier.height(16.dp))
+                                Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                                Spacer(Modifier.height(20.dp))
+                                Button(
+                                    onClick = { abrirFicheiroExterno(context, cur.caminhoMiniatura, cur.nomeArquivo) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Gold)
+                                ) {
+                                    Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("ABRIR NO LEITOR DE PDF", color = BgBlack, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                    isText && !textContent.isNullOrBlank() -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = 76.dp, bottom = 76.dp, start = 16.dp, end = 16.dp)
+                                .background(SurfaceDark, RoundedCornerShape(12.dp))
+                                .padding(16.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(textContent!!, color = Color.White, fontSize = 13.sp)
+                        }
+                    }
+                    else -> {
+                        Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(72.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Tamanho: ${formatarTamanhoNuvem(cur.tamanhoBytes)}", color = TextGrey, fontSize = 12.sp)
+                            Spacer(Modifier.height(24.dp))
+                            Button(
+                                onClick = { abrirFicheiroExterno(context, cur.caminhoMiniatura, cur.nomeArquivo) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                                modifier = Modifier.fillMaxWidth(0.8f).height(50.dp)
+                            ) {
+                                Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
+                                Spacer(Modifier.width(8.dp))
+                                Text("ABRIR DOCUMENTO", color = BgBlack, fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                 }
 
-                Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.75f)).padding(16.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.85f)).padding(16.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
                     Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
                         Text(cur.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
                     }
-                    IconButton(onClick = { compartilharFicheiroNativo(context, cur.caminhoMiniatura, cur.nomeArquivo) }) { Icon(Icons.Default.Share, null, tint = Gold) }
+                    IconButton(onClick = {
+                        novoNomeInput = cur.nomeArquivo.substringBeforeLast('.')
+                        fileToRename = cur
+                    }) {
+                        Icon(Icons.Default.Edit, contentDescription = "Renomear", tint = Color.White)
+                    }
+                    IconButton(onClick = { compartilharFicheiroNativo(context, cur.caminhoMiniatura, cur.nomeArquivo) }) {
+                        Icon(Icons.Default.Share, contentDescription = "Compartilhar", tint = Gold)
+                    }
+                }
+
+                if (!isImage && !isVideo) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(BgBlack.copy(alpha = 0.9f))
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .align(Alignment.BottomCenter),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        OutlinedButton(
+                            onClick = { abrirFicheiroExterno(context, cur.caminhoMiniatura, cur.nomeArquivo) },
+                            border = BorderStroke(1.dp, Gold),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.OpenInNew, null, tint = Gold)
+                            Spacer(Modifier.width(8.dp))
+                            Text("ABRIR EM APP EXTERNA", color = Gold, fontWeight = FontWeight.Bold)
+                        }
+                    }
                 }
 
                 if (isVideo) {
@@ -912,7 +1236,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         val base = when (selectedTab) {
                             2 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", true) }
                             3 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("MP4", "MKV", "MOV", "AVI") || it.nomeArquivo.contains("VID", true) || it.nomeArquivo.contains("Video", true) }
-                            4 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK") }
+                            4 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "PPT", "PPTX", "TXT", "CSV", "JSON", "XML", "MD", "APK") }
                             else -> arquivos
                         }
                         if (searchQuery.isBlank()) base
@@ -929,6 +1253,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Text(arq.nomeArquivo, color = Gold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp), fontWeight = FontWeight.Bold)
                         Text("Tamanho: ${formatarTamanhoNuvem(arq.tamanhoBytes)} • Pasta: ${mapaPastas[arq.dataUpload] ?: "Geral"}\nAdicionado em: ${formatarDataNuvem(arq.dataUpload)}", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp))
                         ListItem(headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) }, leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) }, modifier = Modifier.clickable { viewerFile = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Abrir em App Externa...", color = Gold) }, leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; abrirFicheiroExterno(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Renomear ficheiro...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Edit, null, tint = Color.White) }, modifier = Modifier.clickable { novoNomeInput = arq.nomeArquivo.substringBeforeLast('.'); fileToRename = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Mover para Pasta...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { fileToMove = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Compartilhar...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) }, modifier = Modifier.clickable { selectedFile = null; compartilharFicheiroNativo(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(context, client, arq.fileId, arq.nomeArquivo) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
