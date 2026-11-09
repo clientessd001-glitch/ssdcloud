@@ -6,6 +6,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Environment
 import android.os.StrictMode
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -47,6 +48,7 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -86,6 +88,13 @@ fun formatarDataNuvem(timestamp: Long): String {
 fun formatarDataCurta(timestamp: Long): String {
     if (timestamp <= 0L) return ""
     return SimpleDateFormat("dd/MM/yy", Locale.getDefault()).format(Date(timestamp))
+}
+
+fun formatarTempoVideo(ms: Int): String {
+    val totalSegundos = (ms / 1000).coerceAtLeast(0)
+    val minutos = totalSegundos / 60
+    val segundos = totalSegundos % 60
+    return String.format(Locale.getDefault(), "%02d:%02d", minutos, segundos)
 }
 
 fun carregarVinculosPastas(context: Context): Map<Long, String> {
@@ -280,20 +289,56 @@ fun enviarParaMensagensSalvas(client: Client, caminhoLocal: String, nomeOriginal
     }
 }
 
-fun baixarFicheiroDaNuvem(client: Client, targetFileId: Int, onResult: (String) -> Unit) {
-    if (targetFileId == 0) { onResult("ID ausente na nuvem."); return }
-    NexusTransfer.progress.value = 20
-    NexusTransfer.label.value = "Baixando da nuvem..."
-    val req = TdApi.DownloadFile().apply { fileId = targetFileId; priority = 1; synchronous = false }
+fun baixarFicheiroDaNuvem(context: Context, client: Client, targetFileId: Int, nomeArquivo: String, onResult: (String) -> Unit) {
+    if (targetFileId == 0) {
+        onResult("ID ausente na nuvem.")
+        return
+    }
+    NexusTransfer.progress.value = 30
+    NexusTransfer.label.value = "A descarregar da nuvem..."
+
+    val req = TdApi.DownloadFile().apply {
+        fileId = targetFileId
+        priority = 1
+        synchronous = false
+    }
+
     client.send(req) { res ->
-        NexusTransfer.progress.value = null
         when (res) {
             is TdApi.File -> {
-                val caminho = res.local?.path
-                onResult(if (!caminho.isNullOrBlank()) "Salvo em: $caminho" else "Transferência iniciada!")
+                val caminhoRemoto = res.local?.path
+                if (!caminhoRemoto.isNullOrBlank() && File(caminhoRemoto).exists()) {
+                    try {
+                        val mime = descobrirMimeType(nomeArquivo)
+                        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                        if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                        val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
+
+                        FileInputStream(File(caminhoRemoto)).use { input ->
+                            FileOutputStream(destino).use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+
+                        NexusTransfer.progress.value = null
+                        onResult("Salvo em Downloads: ${destino.name}")
+                    } catch (e: Exception) {
+                        NexusTransfer.progress.value = null
+                        onResult("Erro ao gravar ficheiro: ${e.localizedMessage}")
+                    }
+                } else {
+                    NexusTransfer.progress.value = null
+                    onResult("Transferência concluída na nuvem.")
+                }
             }
-            is TdApi.Error -> onResult("Erro (${res.code}): ${res.message}")
-            else -> onResult("Download em andamento...")
+            is TdApi.Error -> {
+                NexusTransfer.progress.value = null
+                onResult("Erro (${res.code}): ${res.message}")
+            }
+            else -> {
+                NexusTransfer.progress.value = null
+                onResult("Download em andamento...")
+            }
         }
     }
 }
@@ -375,6 +420,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
+
+    var searchQuery by remember { mutableStateOf("") }
+    var showSearchBar by remember { mutableStateOf(false) }
 
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
@@ -537,13 +585,52 @@ fun NexusUI(dao: NexusDao, client: Client) {
     if (viewerFile != null) {
         val cur = viewerFile!!
         val curThumb = cur.caminhoMiniatura ?: ""
+        val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase()
+        val isVideo = ext in listOf("MP4", "MKV", "MOV", "AVI") || cur.nomeArquivo.contains("VID", true) || cur.nomeArquivo.contains("Video", true)
+
+        var videoViewRef by remember { mutableStateOf<android.widget.VideoView?>(null) }
+        var isPlaying by remember { mutableStateOf(true) }
+        var currentPos by remember { mutableIntStateOf(0) }
+        var duration by remember { mutableIntStateOf(0) }
+
+        LaunchedEffect(videoViewRef, isPlaying) {
+            while (videoViewRef != null) {
+                try {
+                    val vv = videoViewRef!!
+                    if (vv.isPlaying) {
+                        currentPos = vv.currentPosition
+                        val dur = vv.duration
+                        if (dur > 0) duration = dur
+                    }
+                    isPlaying = vv.isPlaying
+                } catch (_: Exception) {}
+                delay(250)
+            }
+        }
+
         Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Box(Modifier.fillMaxSize().background(Color.Black)) {
-                val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase()
                 if (ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || cur.nomeArquivo.contains("IMG", true)) {
                     AsyncImage(model = Uri.parse(curThumb), contentDescription = cur.nomeArquivo, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Fit)
-                } else if (ext in listOf("MP4", "MKV", "MOV", "AVI") || cur.nomeArquivo.contains("VID", true) || cur.nomeArquivo.contains("Video", true)) {
-                    AndroidView(factory = { ctx -> android.widget.VideoView(ctx).apply { setVideoURI(Uri.parse(curThumb)); start() } }, modifier = Modifier.fillMaxSize().align(Alignment.Center))
+                } else if (isVideo) {
+                    AndroidView(
+                        factory = { ctx ->
+                            android.widget.VideoView(ctx).apply {
+                                setVideoURI(Uri.parse(curThumb))
+                                setOnPreparedListener { mp ->
+                                    duration = mp.duration.coerceAtLeast(0)
+                                    start()
+                                    isPlaying = true
+                                }
+                                setOnCompletionListener {
+                                    isPlaying = false
+                                    currentPos = duration
+                                }
+                                videoViewRef = this
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize().align(Alignment.Center)
+                    )
                 } else {
                     Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(64.dp))
@@ -551,6 +638,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold)
                     }
                 }
+
                 Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.75f)).padding(16.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
                     Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
@@ -558,6 +646,101 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
                     }
                     IconButton(onClick = { compartilharFicheiroNativo(context, cur.caminhoMiniatura, cur.nomeArquivo) }) { Icon(Icons.Default.Share, null, tint = Gold) }
+                }
+
+                if (isVideo) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(BgBlack.copy(alpha = 0.85f))
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .align(Alignment.BottomCenter)
+                    ) {
+                        Slider(
+                            value = currentPos.toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat()),
+                            onValueChange = { novoValor ->
+                                val pos = novoValor.toInt()
+                                currentPos = pos
+                                videoViewRef?.seekTo(pos)
+                            },
+                            valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
+                            colors = SliderDefaults.colors(
+                                thumbColor = Gold,
+                                activeTrackColor = Gold,
+                                inactiveTrackColor = SurfaceDark
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(formatarTempoVideo(currentPos), color = TextGrey, fontSize = 11.sp)
+                            Text(formatarTempoVideo(duration), color = TextGrey, fontSize = 11.sp)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        val novo = (vv.currentPosition - 10000).coerceAtLeast(0)
+                                        vv.seekTo(novo)
+                                        currentPos = novo
+                                    }
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Default.FastRewind, null, tint = Gold, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("-10s", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            FloatingActionButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        if (vv.isPlaying) {
+                                            vv.pause()
+                                            isPlaying = false
+                                        } else {
+                                            vv.start()
+                                            isPlaying = true
+                                        }
+                                    }
+                                },
+                                containerColor = Gold,
+                                contentColor = BgBlack,
+                                shape = CircleShape,
+                                modifier = Modifier.size(52.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pausar" else "Reproduzir",
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        val maxDur = if (duration > 0) duration else vv.duration.coerceAtLeast(0)
+                                        val novo = (vv.currentPosition + 10000).coerceAtMost(maxDur)
+                                        vv.seekTo(novo)
+                                        currentPos = novo
+                                    }
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text("+10s", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(4.dp))
+                                Icon(Icons.Default.FastForward, null, tint = Gold, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -622,12 +805,44 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
                             Text(if (transferProgress != null) transferLabel else cloudBannerText, color = if (transferProgress != null) Gold else TextGrey, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
+                        IconButton(onClick = {
+                            showSearchBar = !showSearchBar
+                            if (!showSearchBar) searchQuery = ""
+                        }) {
+                            Icon(if (showSearchBar) Icons.Default.Close else Icons.Default.Search, contentDescription = "Pesquisar", tint = Gold)
+                        }
                         if (transferProgress != null || isUploading) {
                             Text("${transferProgress ?: 10}%", color = Gold, fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.padding(end = 8.dp))
                             CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
                         } else {
                             Icon(Icons.Default.CloudDone, null, tint = Gold)
                         }
+                    }
+                    if (showSearchBar) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Pesquisar ficheiro ou pasta...", color = TextGrey, fontSize = 13.sp) },
+                            leadingIcon = { Icon(Icons.Default.Search, null, tint = Gold) },
+                            trailingIcon = {
+                                if (searchQuery.isNotBlank()) {
+                                    IconButton(onClick = { searchQuery = "" }) {
+                                        Icon(Icons.Default.Close, null, tint = TextGrey)
+                                    }
+                                }
+                            },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = SurfaceDark,
+                                focusedContainerColor = SurfaceDarker,
+                                unfocusedContainerColor = SurfaceDarker
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp)
+                        )
                     }
                     if (transferProgress != null || isUploading) {
                         val fra = ((transferProgress ?: 10).coerceIn(5, 100)) / 100f
@@ -654,7 +869,12 @@ fun NexusUI(dao: NexusDao, client: Client) {
             Box(Modifier.padding(innerPadding).fillMaxSize()) {
                 if (selectedTab == 1) {
                     if (pastaAberta != null) {
-                        val daPasta = remember(arquivos, mapaPastas, pastaAberta) { arquivos.filter { mapaPastas[it.dataUpload] == pastaAberta } }
+                        val daPasta = remember(arquivos, mapaPastas, pastaAberta, searchQuery) {
+                            arquivos.filter {
+                                mapaPastas[it.dataUpload] == pastaAberta &&
+                                    (searchQuery.isBlank() || it.nomeArquivo.contains(searchQuery, ignoreCase = true))
+                            }
+                        }
                         Column(Modifier.fillMaxSize()) {
                             Row(Modifier.fillMaxWidth().background(SurfaceDarker).padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(onClick = { pastaAberta = null }) { Icon(Icons.Default.ArrowBack, null, tint = Gold) }
@@ -663,13 +883,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             GrelhaArquivos(daPasta, mapaPastas) { selectedFile = it }
                         }
                     } else {
+                        val pastasFiltradas = remember(pastas, searchQuery) {
+                            if (searchQuery.isBlank()) pastas
+                            else pastas.filter { it.nomePasta.contains(searchQuery, ignoreCase = true) }
+                        }
                         Column(Modifier.fillMaxSize().padding(16.dp)) {
                             OutlinedButton(onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(52.dp)) {
                                 Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold)
                             }
                             Spacer(Modifier.height(16.dp))
                             LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                items(pastas) { p ->
+                                items(pastasFiltradas) { p ->
                                     val qtd = arquivos.count { mapaPastas[it.dataUpload] == p.nomePasta }
                                     Row(Modifier.fillMaxWidth().background(SurfaceDark, RoundedCornerShape(12.dp)).clickable { pastaAberta = p.nomePasta }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(32.dp))
@@ -684,13 +908,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
                 } else {
-                    val filtrada = remember(arquivos, selectedTab) {
-                        when (selectedTab) {
+                    val filtrada = remember(arquivos, selectedTab, searchQuery) {
+                        val base = when (selectedTab) {
                             2 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || it.nomeArquivo.contains("IMG", true) }
                             3 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("MP4", "MKV", "MOV", "AVI") || it.nomeArquivo.contains("VID", true) || it.nomeArquivo.contains("Video", true) }
                             4 -> arquivos.filter { it.nomeArquivo.substringAfterLast('.', "").uppercase() in listOf("PDF", "ZIP", "RAR", "DOC", "DOCX", "XLS", "XLSX", "TXT", "APK") }
                             else -> arquivos
                         }
+                        if (searchQuery.isBlank()) base
+                        else base.filter { it.nomeArquivo.contains(searchQuery, ignoreCase = true) }
                     }
                     GrelhaArquivos(filtrada, mapaPastas) { selectedFile = it }
                 }
@@ -705,7 +931,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         ListItem(headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) }, leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) }, modifier = Modifier.clickable { viewerFile = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Mover para Pasta...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { fileToMove = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Compartilhar...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) }, modifier = Modifier.clickable { selectedFile = null; compartilharFicheiroNativo(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
-                        ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(client, arq.fileId) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(context, client, arq.fileId, arq.nomeArquivo) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Remover do registo", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, arq.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); vm.apagar(arq.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                     }
                 }
