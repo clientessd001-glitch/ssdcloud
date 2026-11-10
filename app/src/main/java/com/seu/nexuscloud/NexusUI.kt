@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -33,6 +34,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
@@ -58,6 +61,8 @@ import java.util.Date
 import java.util.Locale
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
+
+const val NEXUS_VERSION = "v1.2"
 
 val BgBlack = Color(0xFF05070A)
 val SurfaceDark = Color(0xFF161A25)
@@ -88,6 +93,229 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         }
     }
 }
+
+// === GESTÃO DE COFRES MULTIUTILIZADOR (v1.2) ===
+fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
+
+fun obterUltimoUsuarioCofre(context: Context): String {
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    return prefs.getString("last_active_user", "") ?: ""
+}
+
+fun salvarCredenciaisCofreLocal(context: Context, nomeOriginal: String, pin: String) {
+    val chave = normalizarUsuario(nomeOriginal)
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    prefs.edit()
+        .putString("pin_$chave", pin.trim())
+        .putString("display_$chave", nomeOriginal.trim())
+        .putString("last_active_user", nomeOriginal.trim())
+        .apply()
+}
+
+fun obterPinCofreLocal(context: Context, nome: String): String? {
+    val chave = normalizarUsuario(nome)
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    return prefs.getString("pin_$chave", null)
+}
+
+fun obterNomeExibicaoCofreLocal(context: Context, nome: String): String {
+    val chave = normalizarUsuario(nome)
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    return prefs.getString("display_$chave", nome.trim()) ?: nome.trim()
+}
+
+fun carregarDonosFicheiros(context: Context): Map<Long, String> {
+    val prefs = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+    val mapa = mutableMapOf<Long, String>()
+    for ((k, v) in prefs.all) {
+        val ts = k.toLongOrNull()
+        if (ts != null && v is String && v.isNotBlank()) mapa[ts] = v
+    }
+    return mapa
+}
+
+fun salvarDonoFicheiro(context: Context, dataUpload: Long, usuario: String) {
+    val prefs = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+    if (usuario.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
+    else prefs.edit().putString(dataUpload.toString(), normalizarUsuario(usuario)).apply()
+}
+
+fun carregarPastasDoUsuario(context: Context, usuario: String): Set<String> {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+    return prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()
+}
+
+fun associarPastaAoUsuario(context: Context, usuario: String, nomePasta: String) {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+    val atuais = (prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()).toMutableSet()
+    atuais.add(nomePasta.trim())
+    prefs.edit().putStringSet("folders_$chave", atuais).apply()
+}
+
+fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List<ArquivoNuvem>, pastas: List<PastaNuvem>) {
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    if (!prefs.getBoolean("migrated_v11_data", false)) {
+        val donosAtuais = carregarDonosFicheiros(context)
+        arquivos.forEach { arq ->
+            if (!donosAtuais.containsKey(arq.dataUpload)) {
+                salvarDonoFicheiro(context, arq.dataUpload, usuario)
+            }
+        }
+        pastas.forEach { p ->
+            associarPastaAoUsuario(context, usuario, p.nomePasta)
+        }
+        prefs.edit().putBoolean("migrated_v11_data", true).apply()
+    }
+}
+
+fun verificarOuRegistarCofreNuvem(
+    client: Client,
+    nomeUsuario: String,
+    pin: String,
+    modoCriarNovo: Boolean,
+    onResult: (Boolean, String, String) -> Unit
+) {
+    val chaveDesejada = normalizarUsuario(nomeUsuario)
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    val reqHist = TdApi.GetChatHistory().apply {
+                        chatId = chatObj.id
+                        fromMessageId = 0
+                        offset = 0
+                        limit = 100
+                        onlyLocal = false
+                    }
+                    client.send(reqHist) { histObj ->
+                        var pinEncontrado: String? = null
+                        var nomeOriginalEncontrado = nomeUsuario.trim()
+
+                        if (histObj is TdApi.Messages) {
+                            for (msg in histObj.messages) {
+                                val texto = when (val c = msg.content) {
+                                    is TdApi.MessageText -> c.text?.text ?: ""
+                                    is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                    else -> ""
+                                }
+                                if (texto.contains("🔒 [REGISTO_COFRE]")) {
+                                    val partes = texto.split("|").map { it.trim() }
+                                    val userPart = partes.firstOrNull { it.startsWith("USER:") }?.removePrefix("USER:")?.trim()
+                                    val nomePart = partes.firstOrNull { it.startsWith("NOME:") }?.removePrefix("NOME:")?.trim()
+                                    val pinPart = partes.firstOrNull { it.startsWith("PIN:") }?.removePrefix("PIN:")?.trim()
+                                    if (userPart != null && userPart == chaveDesejada && pinPart != null) {
+                                        pinEncontrado = pinPart
+                                        if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
+                                        break
+                                    }
+                                }
+                            }
+                        }
+
+                        if (modoCriarNovo) {
+                            if (pinEncontrado != null) {
+                                onResult(false, "", "Este nome já está em uso! Escolha outro (ex: ${nomeUsuario.trim()}85).")
+                            } else {
+                                val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeUsuario.trim()} | PIN:${pin.trim()}"
+                                val msgContent = TdApi.InputMessageText().apply {
+                                    text = TdApi.FormattedText(regTexto, emptyArray())
+                                }
+                                val sendReq = TdApi.SendMessage().apply {
+                                    chatId = chatObj.id
+                                    inputMessageContent = msgContent
+                                }
+                                client.send(sendReq) {
+                                    onResult(true, nomeUsuario.trim(), "Cofre criado com sucesso!")
+                                }
+                            }
+                        } else {
+                            if (pinEncontrado == null) {
+                                onResult(false, "", "Cofre '${nomeUsuario.trim()}' não encontrado. Use a aba 'CRIAR NOVO COFRE'.")
+                            } else if (pinEncontrado == pin.trim()) {
+                                onResult(true, nomeOriginalEncontrado, "Cofre desbloqueado!")
+                            } else {
+                                onResult(false, "", "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
+                            }
+                        }
+                    }
+                } else {
+                    onResult(false, "", "Erro ao aceder ao cofre na nuvem.")
+                }
+            }
+        } else {
+            onResult(false, "", "Sessão TDLib indisponível.")
+        }
+    }
+}
+
+fun sincronizarCofreDaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arquivosExistentes: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onComplete: (Int) -> Unit
+) {
+    val tagPerfil = "👤 [${normalizarUsuario(usuarioAtivo)}]"
+    val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    val reqHist = TdApi.GetChatHistory().apply {
+                        chatId = chatObj.id
+                        fromMessageId = 0
+                        offset = 0
+                        limit = 100
+                        onlyLocal = false
+                    }
+                    client.send(reqHist) { histObj ->
+                        var importados = 0
+                        if (histObj is TdApi.Messages) {
+                            val idsLocais = arquivosExistentes.map { it.fileId }.toSet()
+                            histObj.messages.forEachIndexed { index, msg ->
+                                val docContent = msg.content as? TdApi.MessageDocument
+                                val legenda = docContent?.caption?.text ?: ""
+                                if (docContent != null && (legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true))) {
+                                    val rId = docContent.document?.document?.id ?: 0
+                                    if (rId != 0 && !idsLocais.contains(rId)) {
+                                        val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                        val tam = docContent.document?.document?.size ?: 0L
+                                        val ts = (msg.date.toLong() * 1000L) + index
+                                        val pastaExtraida = if (legenda.contains("📁 [")) {
+                                            legenda.substringAfter("📁 [").substringBefore("]")
+                                        } else ""
+
+                                        salvarDonoFicheiro(context, ts, usuarioAtivo)
+                                        if (pastaExtraida.isNotBlank()) {
+                                            vm.criarPasta(pastaExtraida)
+                                            associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
+                                            salvarVinculoPasta(context, ts, pastaExtraida)
+                                        }
+                                        vm.salvarArquivo(
+                                            ArquivoNuvem(
+                                                fileId = rId,
+                                                nomeArquivo = nomeDoc,
+                                                tamanhoBytes = tam,
+                                                dataUpload = ts,
+                                                caminhoMiniatura = docContent.document?.document?.local?.path ?: ""
+                                            )
+                                        )
+                                        importados++
+                                    }
+                                }
+                            }
+                        }
+                        onComplete(importados)
+                    }
+                } else onComplete(0)
+            }
+        } else onComplete(0)
+    }
+}
+// ===============================================
 
 fun formatarDataNuvem(timestamp: Long): String {
     if (timestamp <= 0L) return "Data desconhecida"
@@ -124,8 +352,9 @@ fun salvarVinculoPasta(context: Context, dataUpload: Long, nomePasta: String) {
 
 data class PastaSync(val uri: String, val nome: String, var ativa: Boolean)
 
-fun carregarPastasSync(context: Context): List<PastaSync> {
-    val prefs = context.getSharedPreferences("nexus_sync_prefs", Context.MODE_PRIVATE)
+fun carregarPastasSync(context: Context, usuario: String): List<PastaSync> {
+    val sufixo = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE)
     val lista = mutableListOf<PastaSync>()
     prefs.all.forEach { (uriStr, ativo) ->
         if (ativo is Boolean) {
@@ -137,12 +366,14 @@ fun carregarPastasSync(context: Context): List<PastaSync> {
     return lista
 }
 
-fun salvarPastaSync(context: Context, uri: String, ativa: Boolean) {
-    context.getSharedPreferences("nexus_sync_prefs", Context.MODE_PRIVATE).edit().putBoolean(uri, ativa).apply()
+fun salvarPastaSync(context: Context, usuario: String, uri: String, ativa: Boolean) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().putBoolean(uri, ativa).apply()
 }
 
-fun removerPastaSync(context: Context, uri: String) {
-    context.getSharedPreferences("nexus_sync_prefs", Context.MODE_PRIVATE).edit().remove(uri).apply()
+fun removerPastaSync(context: Context, usuario: String, uri: String) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().remove(uri).apply()
 }
 
 fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
@@ -383,20 +614,28 @@ fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String?, nome
     }
 }
 
-fun enviarParaMensagensSalvas(client: Client, caminhoLocal: String, nomeOriginal: String, pastaDestino: String, onResult: (Boolean, Int, String) -> Unit) {
+fun enviarParaMensagensSalvas(
+    client: Client,
+    usuarioAtivo: String,
+    caminhoLocal: String,
+    nomeOriginal: String,
+    pastaDestino: String,
+    onResult: (Boolean, Int, String) -> Unit
+) {
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    val tag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
-                    val leg = TdApi.FormattedText("☁️ Nexus Cloud • $tag$nomeOriginal", emptyArray())
+                    val userTag = "👤 [$usuarioAtivo] • "
+                    val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
+                    val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeOriginal", emptyArray())
                     val doc = TdApi.InputMessageDocument(TdApi.InputFileLocal(caminhoLocal), null, false, leg)
                     val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
                                 val rId = (msgObj.content as? TdApi.MessageDocument)?.document?.document?.id ?: 0
-                                val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Enviado para a nuvem!"
+                                val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Guardado no cofre de $usuarioAtivo!"
                                 onResult(true, rId, txt)
                             }
                             is TdApi.Error -> onResult(false, 0, "Erro TDLib (${msgObj.code}): ${msgObj.message}")
@@ -536,18 +775,60 @@ fun NexusUI(dao: NexusDao, client: Client) {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(mClass: Class<T>) = UIViewModel(dao) as T
     })
-    val arquivos by vm.arquivos.collectAsState()
-    val pastas by vm.pastas.collectAsState()
-    val armazenamento by vm.armazenamento.collectAsState()
+    val todosArquivos by vm.arquivos.collectAsState()
+    val todasPastas by vm.pastas.collectAsState()
     val loginStep by TelegramAuth.step.collectAsState()
     val statusText by TelegramAuth.statusText.collectAsState()
     val errorText by TelegramAuth.errorText.collectAsState()
     val transferProgress by NexusTransfer.progress.collectAsState()
     val transferLabel by NexusTransfer.label.collectAsState()
 
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val sheetState = rememberModalBottomSheetState()
+
     var phoneNumber by remember { mutableStateOf("+5585") }
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
+
+    // === ESTADOS DO COFRE MULTIUTILIZADOR (v1.2) ===
+    var activeVaultUser by remember { mutableStateOf(obterUltimoUsuarioCofre(context)) }
+    var vaultUnlocked by remember { mutableStateOf(false) }
+    var isSwitchingUser by remember { mutableStateOf(activeVaultUser.isBlank()) }
+    var isCreatingNewVault by remember { mutableStateOf(activeVaultUser.isBlank()) }
+    var vaultNameInput by remember { mutableStateOf(activeVaultUser) }
+    var vaultPinInput by remember { mutableStateOf("") }
+    var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
+    var isCheckingVault by remember { mutableStateOf(false) }
+
+    var mapaDonos by remember { mutableStateOf(carregarDonosFicheiros(context)) }
+    var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
+
+    LaunchedEffect(vaultUnlocked, activeVaultUser, todosArquivos.size, todasPastas.size) {
+        if (vaultUnlocked && activeVaultUser.isNotBlank()) {
+            migrarDadosV11SeNecessario(context, activeVaultUser, todosArquivos, todasPastas)
+            mapaDonos = carregarDonosFicheiros(context)
+            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+        }
+    }
+
+    val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
+        val chaveAtiva = normalizarUsuario(activeVaultUser)
+        if (chaveAtiva.isBlank()) emptyList()
+        else todosArquivos.filter { mapaDonos[it.dataUpload] == chaveAtiva }
+    }
+
+    val pastas = remember(todasPastas, pastasDoUsuarioSet, activeVaultUser) {
+        if (activeVaultUser.isBlank()) emptyList()
+        else todasPastas.filter { pastasDoUsuarioSet.contains(it.nomePasta) }
+    }
+
+    val armazenamentoUsuario = remember(arquivos) {
+        arquivos.sumOf { it.tamanhoBytes }
+    }
+    // ===============================================
+
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
@@ -557,11 +838,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     var searchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
-
-    val scope = rememberCoroutineScope()
-    val drawerState = rememberDrawerState(DrawerValue.Closed)
-    val sheetState = rememberModalBottomSheetState()
-    val context = LocalContext.current
 
     var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastaAberta by remember { mutableStateOf<String?>(null) }
@@ -573,10 +849,12 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showNewFolder by remember { mutableStateOf(false) }
     var nomeNovaPasta by remember { mutableStateOf("") }
 
-    var pastasSync by remember { mutableStateOf(carregarPastasSync(context)) }
+    var pastasSync by remember(activeVaultUser) { mutableStateOf(carregarPastasSync(context, activeVaultUser)) }
 
     var isUploading by remember { mutableStateOf(false) }
-    var cloudBannerText by remember { mutableStateOf("Nuvem TDLib Ativa • Mensagens Salvas") }
+    var cloudBannerText by remember(activeVaultUser) {
+        mutableStateOf(if (activeVaultUser.isNotBlank()) "Cofre: $activeVaultUser • Nuvem Ativa" else "Nuvem TDLib Ativa")
+    }
 
     LaunchedEffect(isUploading) {
         while (isUploading) {
@@ -593,7 +871,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     }
 
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
-        if (uris.isEmpty()) return
+        if (uris.isEmpty() || activeVaultUser.isBlank()) return
         scope.launch {
             isUploading = true
             val total = uris.size
@@ -611,7 +889,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                 if (arqTemp != null) {
                     val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                    enviarParaMensagensSalvas(client, arqTemp.absolutePath, nome, pastaEscolhida) { ok, rId, msg ->
+                    enviarParaMensagensSalvas(client, activeVaultUser, arqTemp.absolutePath, nome, pastaEscolhida) { ok, rId, msg ->
                         deferred.complete(Triple(ok, rId, msg))
                     }
                     val (ok, rId, msg) = deferred.await()
@@ -619,6 +897,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     if (ok) {
                         enviados++
                         val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        mapaDonos = carregarDonosFicheiros(context)
                         if (pastaEscolhida.isNotBlank()) {
                             salvarVinculoPasta(context, ts, pastaEscolhida)
                             mapaPastas = carregarVinculosPastas(context)
@@ -642,7 +922,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
             isUploading = false
             NexusTransfer.progress.value = null
             if (total > 1) {
-                cloudBannerText = "$enviados de $total ficheiros enviados com sucesso!"
+                cloudBannerText = "$enviados de $total ficheiros guardados no cofre de $activeVaultUser!"
             }
         }
     }
@@ -662,12 +942,321 @@ fun NexusUI(dao: NexusDao, client: Client) {
         uri?.let {
             try {
                 context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                salvarPastaSync(context, it.toString(), true)
-                pastasSync = carregarPastasSync(context)
+                salvarPastaSync(context, activeVaultUser, it.toString(), true)
+                pastasSync = carregarPastasSync(context, activeVaultUser)
             } catch (e: Exception) {
                 Toast.makeText(context, "Erro ao guardar permissão da pasta.", Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    // 1. ECRÃ DE AUTENTICAÇÃO DO NÚMERO TELEGRAM (TDLIB)
+    if (loginStep < 3) {
+        Column(Modifier.fillMaxSize().background(BgBlack).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp))
+            Spacer(Modifier.height(16.dp))
+            Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 26.sp, fontWeight = FontWeight.Black)
+            Spacer(Modifier.height(8.dp))
+            Text(statusText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+            if (errorText != null) Text(errorText!!, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp))
+            Spacer(Modifier.height(32.dp))
+            when (loginStep) {
+                0 -> {
+                    OutlinedTextField(value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (+5585...)", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = {
+                        TelegramAuth.errorText.value = null
+                        val clean = phoneNumber.replace(" ", "").replace("-", "")
+                        val cfg = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
+                        client.send(TdApi.SetAuthenticationPhoneNumber(clean, cfg), responseHandler)
+                    }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENVIAR CÓDIGO", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+                1 -> {
+                    OutlinedTextField(value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código SMS/Telegram", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = { client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("CONFIRMAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+                2 -> {
+                    OutlinedTextField(value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha 2FA", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = { client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENTRAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+        return
+    }
+
+    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (v1.2)
+    if (!vaultUnlocked) {
+        Column(
+            modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(Icons.Default.Lock, null, tint = Gold, modifier = Modifier.size(56.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 20.sp, fontWeight = FontWeight.Black)
+
+                    if (!isSwitchingUser && activeVaultUser.isNotBlank()) {
+                        // MODO RÁPIDO: SÓ PEDE O PIN DO UTILIZADOR ATIVO
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "COFRE DE ${activeVaultUser.uppercase(Locale.getDefault())}",
+                            color = Color.White,
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            "Digite o seu PIN para desbloquear os seus ficheiros",
+                            color = TextGrey,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                        Spacer(Modifier.height(20.dp))
+
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN de Acesso", color = TextGrey) },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (vaultErrorMsg != null) {
+                            Text(
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
+
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val pinDigitado = vaultPinInput.trim()
+                                if (pinDigitado.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
+                                val pinLocal = obterPinCofreLocal(context, activeVaultUser)
+                                if (pinLocal != null) {
+                                    if (pinLocal == pinDigitado) {
+                                        vaultPinInput = ""
+                                        vaultUnlocked = true
+                                    } else {
+                                        vaultErrorMsg = "PIN incorreto!"
+                                    }
+                                } else {
+                                    isCheckingVault = true
+                                    verificarOuRegistarCofreNuvem(client, activeVaultUser, pinDigitado, false) { ok, nomeReal, msg ->
+                                        scope.launch(Dispatchers.Main) {
+                                            isCheckingVault = false
+                                            if (ok) {
+                                                salvarCredenciaisCofreLocal(context, nomeReal, pinDigitado)
+                                                activeVaultUser = nomeReal
+                                                vaultPinInput = ""
+                                                vaultUnlocked = true
+                                            } else {
+                                                vaultErrorMsg = msg
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text("DESBLOQUEAR COFRE", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(onClick = {
+                            vaultErrorMsg = null
+                            vaultPinInput = ""
+                            vaultNameInput = ""
+                            isSwitchingUser = true
+                            isCreatingNewVault = false
+                        }) {
+                            Text("Trocar de utilizador / Criar novo cofre", color = Gold, fontSize = 12.sp)
+                        }
+                    } else {
+                        // 1.º ACESSO OU TROCA DE CONTA: CRIAR NOVO COFRE OU ENTRAR EM COFRE EXISTENTE
+                        Spacer(Modifier.height(12.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros."
+                            else "Digite o seu Nome de utilizador e PIN para aceder ao seu cofre.",
+                            color = TextGrey,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = vaultNameInput,
+                            onValueChange = { vaultNameInput = it },
+                            label = { Text("Nome do Utilizador (ex: Carlos_85)", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (vaultErrorMsg != null) {
+                            Text(
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
+
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val nomeLimpo = vaultNameInput.trim()
+                                val pinLimpo = vaultPinInput.trim()
+
+                                if (nomeLimpo.length < 3) {
+                                    vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
+                                    return@Button
+                                }
+                                if (pinLimpo.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
+
+                                val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
+                                if (isCreatingNewVault && pinLocalExistente != null) {
+                                    vaultErrorMsg = "Este nome já está registado neste aparelho! Escolha outro nome."
+                                    return@Button
+                                }
+
+                                isCheckingVault = true
+                                verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        isCheckingVault = false
+                                        if (ok) {
+                                            salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
+                                            activeVaultUser = nomeConfirmado
+                                            isSwitchingUser = false
+                                            vaultPinInput = ""
+                                            vaultUnlocked = true
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                            sincronizarCofreDaNuvem(context, client, nomeConfirmado, todosArquivos, vm) { qtd ->
+                                                if (qtd > 0) {
+                                                    mapaDonos = carregarDonosFicheiros(context)
+                                                    mapaPastas = carregarVinculosPastas(context)
+                                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, nomeConfirmado)
+                                                }
+                                            }
+                                        } else {
+                                            vaultErrorMsg = msg
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text(
+                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR NO COFRE",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        if (activeVaultUser.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(onClick = {
+                                vaultErrorMsg = null
+                                vaultPinInput = ""
+                                isSwitchingUser = false
+                            }) {
+                                Text("Voltar para o cofre de $activeVaultUser", color = TextGrey, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return
     }
 
     if (fileToRename != null) {
@@ -1070,41 +1659,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    if (loginStep < 3) {
-        Column(Modifier.fillMaxSize().background(BgBlack).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp))
-            Spacer(Modifier.height(16.dp))
-            Text("NEXUS CLOUD", color = Gold, fontSize = 28.sp, fontWeight = FontWeight.Black)
-            Spacer(Modifier.height(8.dp))
-            Text(statusText, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
-            if (errorText != null) Text(errorText!!, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp))
-            Spacer(Modifier.height(32.dp))
-            when (loginStep) {
-                0 -> {
-                    OutlinedTextField(value = phoneNumber, onValueChange = { phoneNumber = it }, label = { Text("Número (+5585...)", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(24.dp))
-                    Button(onClick = {
-                        TelegramAuth.errorText.value = null
-                        val clean = phoneNumber.replace(" ", "").replace("-", "")
-                        val cfg = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
-                        client.send(TdApi.SetAuthenticationPhoneNumber(clean, cfg), responseHandler)
-                    }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENVIAR CÓDIGO", color = Color.White, fontWeight = FontWeight.Bold) }
-                }
-                1 -> {
-                    OutlinedTextField(value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código SMS/Telegram", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(24.dp))
-                    Button(onClick = { client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("CONFIRMAR", color = Color.White, fontWeight = FontWeight.Bold) }
-                }
-                2 -> {
-                    OutlinedTextField(value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha 2FA", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
-                    Spacer(Modifier.height(24.dp))
-                    Button(onClick = { client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENTRAR", color = Color.White, fontWeight = FontWeight.Bold) }
-                }
-            }
-        }
-        return
-    }
-
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
@@ -1112,11 +1666,56 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 Column(Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
                     Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(48.dp))
                     Spacer(Modifier.height(12.dp))
-                    Text("Admin SSD", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                    Text(phoneNumber, color = TextGrey, fontSize = 12.sp)
+                    Text("Cofre: $activeVaultUser", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    Text("Nexus Cloud $NEXUS_VERSION • $phoneNumber", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
-                NavigationDrawerItem(icon = { Icon(Icons.Default.Storage, null) }, label = { Text("Armazenamento") }, selected = false, onClick = { showStorage = true; scope.launch { drawerState.close() } }, colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey))
-                NavigationDrawerItem(icon = { Icon(Icons.Default.Sync, null) }, label = { Text("Sincronização Auto") }, selected = false, onClick = { showSync = true; scope.launch { drawerState.close() } }, colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey))
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Storage, null) },
+                    label = { Text("Armazenamento do Cofre") },
+                    selected = false,
+                    onClick = { showStorage = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Sync, null) },
+                    label = { Text("Sincronização Auto") },
+                    selected = false,
+                    onClick = { showSync = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.CloudDownload, null) },
+                    label = { Text("Restaurar Cofre da Nuvem") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem..."
+                        sincronizarCofreDaNuvem(context, client, activeVaultUser, todosArquivos, vm) { qtd ->
+                            scope.launch(Dispatchers.Main) {
+                                mapaDonos = carregarDonosFicheiros(context)
+                                mapaPastas = carregarVinculosPastas(context)
+                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem!" else "Cofre de $activeVaultUser sincronizado!"
+                                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Lock, null) },
+                    label = { Text("Trancar / Trocar Cofre") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        pastaAberta = null
+                        vaultPinInput = ""
+                        vaultErrorMsg = null
+                        isSwitchingUser = false
+                        vaultUnlocked = false
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
+                )
             }
         }
     ) {
@@ -1126,7 +1725,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }
                         Column(Modifier.weight(1f)) {
-                            Text("NEXUS CLOUD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                            Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
                             Text(if (transferProgress != null) transferLabel else cloudBannerText, color = if (transferProgress != null) Gold else TextGrey, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         IconButton(onClick = {
@@ -1139,14 +1738,21 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("${transferProgress ?: 10}%", color = Gold, fontWeight = FontWeight.Black, fontSize = 14.sp, modifier = Modifier.padding(end = 8.dp))
                             CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
                         } else {
-                            Icon(Icons.Default.CloudDone, null, tint = Gold)
+                            IconButton(onClick = {
+                                vaultPinInput = ""
+                                vaultErrorMsg = null
+                                isSwitchingUser = false
+                                vaultUnlocked = false
+                            }) {
+                                Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
+                            }
                         }
                     }
                     if (showSearchBar) {
                         OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
-                            placeholder = { Text("Pesquisar ficheiro ou pasta...", color = TextGrey, fontSize = 13.sp) },
+                            placeholder = { Text("Pesquisar no cofre de $activeVaultUser...", color = TextGrey, fontSize = 13.sp) },
                             leadingIcon = { Icon(Icons.Default.Search, null, tint = Gold) },
                             trailingIcon = {
                                 if (searchQuery.isNotBlank()) {
@@ -1251,14 +1857,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
                     Column(Modifier.padding(bottom = 24.dp)) {
                         Text(arq.nomeArquivo, color = Gold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp), fontWeight = FontWeight.Bold)
-                        Text("Tamanho: ${formatarTamanhoNuvem(arq.tamanhoBytes)} • Pasta: ${mapaPastas[arq.dataUpload] ?: "Geral"}\nAdicionado em: ${formatarDataNuvem(arq.dataUpload)}", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp))
+                        Text("Cofre: $activeVaultUser • Tamanho: ${formatarTamanhoNuvem(arq.tamanhoBytes)} • Pasta: ${mapaPastas[arq.dataUpload] ?: "Geral"}\nAdicionado em: ${formatarDataNuvem(arq.dataUpload)}", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp))
                         ListItem(headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) }, leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) }, modifier = Modifier.clickable { viewerFile = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Abrir em App Externa...", color = Gold) }, leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; abrirFicheiroExterno(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Renomear ficheiro...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Edit, null, tint = Color.White) }, modifier = Modifier.clickable { novoNomeInput = arq.nomeArquivo.substringBeforeLast('.'); fileToRename = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Mover para Pasta...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { fileToMove = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Compartilhar...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) }, modifier = Modifier.clickable { selectedFile = null; compartilharFicheiroNativo(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(context, client, arq.fileId, arq.nomeArquivo) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
-                        ListItem(headlineContent = { Text("Remover do registo", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, arq.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); vm.apagar(arq.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Remover do registo", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, arq.dataUpload, ""); salvarDonoFicheiro(context, arq.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); mapaDonos = carregarDonosFicheiros(context); vm.apagar(arq.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                     }
                 }
             }
@@ -1271,7 +1877,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Spacer(Modifier.height(16.dp))
                             OutlinedTextField(value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome", color = TextGrey) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
                             Spacer(Modifier.height(16.dp))
-                            Button(onClick = { vm.criarPasta(nomeNovaPasta); nomeNovaPasta = ""; showNewFolder = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth()) { Text("CRIAR", color = Color.White) }
+                            Button(onClick = {
+                                val n = nomeNovaPasta.trim()
+                                if (n.isNotBlank()) {
+                                    vm.criarPasta(n)
+                                    associarPastaAoUsuario(context, activeVaultUser, n)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                }
+                                nomeNovaPasta = ""
+                                showNewFolder = false
+                            }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth()) { Text("CRIAR", color = Color.White) }
                         }
                     }
                 }
@@ -1281,8 +1896,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 Dialog(onDismissRequest = { showStorage = false }) {
                     Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                            Text("TOTAL ENVIADO", color = TextGrey, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                            Text(formatarTamanhoNuvem(armazenamento), color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Black)
+                            Text("USO DO COFRE: ${activeVaultUser.uppercase(Locale.getDefault())}", color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(formatarTamanhoNuvem(armazenamentoUsuario), color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Black)
+                            Text("${arquivos.size} ficheiro(s) neste perfil", color = TextGrey, fontSize = 12.sp)
                             Spacer(Modifier.height(16.dp))
                             Box(Modifier.fillMaxWidth().height(6.dp).background(Brush.horizontalGradient(listOf(Gold, DangerRed)), RoundedCornerShape(3.dp)))
                             Spacer(Modifier.height(24.dp))
@@ -1296,9 +1913,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 Dialog(onDismissRequest = { showSync = false }) {
                     Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().heightIn(max = 500.dp)) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
-                            Text("BACKUP AUTOMÁTICO", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                            Text("BACKUP AUTOMÁTICO ($activeVaultUser)", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(8.dp))
-                            Text("Selecione as pastas do dispositivo que deseja sincronizar com a nuvem.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Text("Selecione as pastas do dispositivo que deseja sincronizar com este cofre.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(16.dp))
 
                             if (pastasSync.isEmpty()) {
@@ -1307,7 +1924,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 Column(modifier = Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState())) {
                                     pastasSync.forEach { p ->
                                         Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                                            IconButton(onClick = { removerPastaSync(context, p.uri); pastasSync = carregarPastasSync(context) }) {
+                                            IconButton(onClick = { removerPastaSync(context, activeVaultUser, p.uri); pastasSync = carregarPastasSync(context, activeVaultUser) }) {
                                                 Icon(Icons.Default.Delete, null, tint = DangerRed, modifier = Modifier.size(20.dp))
                                             }
                                             Column(Modifier.weight(1f).padding(end = 8.dp)) {
@@ -1315,7 +1932,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                             }
                                             Switch(
                                                 checked = p.ativa,
-                                                onCheckedChange = { salvarPastaSync(context, p.uri, it); pastasSync = carregarPastasSync(context) },
+                                                onCheckedChange = { salvarPastaSync(context, activeVaultUser, p.uri, it); pastasSync = carregarPastasSync(context, activeVaultUser) },
                                                 colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = DangerRed, uncheckedThumbColor = TextGrey, uncheckedTrackColor = SurfaceDark)
                                             )
                                         }
