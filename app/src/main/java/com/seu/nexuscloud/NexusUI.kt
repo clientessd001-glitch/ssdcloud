@@ -82,16 +82,25 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     val armazenamento = dao.calcularUsoTotal().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
 
     fun criarPasta(nome: String) = viewModelScope.launch {
-        if (nome.isNotBlank()) dao.criarPasta(PastaNuvem(nomePasta = nome.trim()))
+        val limpo = nome.trim()
+        if (limpo.isNotBlank()) {
+            val jaExiste = pastas.value.any { it.nomePasta.trim().equals(limpo, ignoreCase = true) }
+            if (!jaExiste) {
+                dao.criarPasta(PastaNuvem(nomePasta = limpo))
+            }
+        }
     }
+
     fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch { dao.salvarArquivo(arq) }
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
+
     fun atualizarCaminhoMiniatura(arq: ArquivoNuvem, novoCaminho: String) = viewModelScope.launch {
-        if (novoCaminho.isNotBlank()) {
+        if (novoCaminho.isNotBlank() && arq.caminhoMiniatura != novoCaminho) {
             dao.apagarArquivo(arq.id)
             dao.salvarArquivo(arq.copy(id = 0, caminhoMiniatura = novoCaminho))
         }
     }
+
     fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
         if (novoNome.isNotBlank()) {
             dao.apagarArquivo(arq.id)
@@ -100,7 +109,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === GESTÃO DE COFRES MULTIUTILIZADOR E RESTAURAÇÃO (v1.2) ===
+// === GESTÃO DE COFRES MULTIUTILIZADOR E ANTI-DUPLICAÇÃO (v1.2) ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
 fun obterUltimoUsuarioCofre(context: Context): String {
@@ -150,8 +159,25 @@ fun associarPastaAoUsuario(context: Context, usuario: String, nomePasta: String)
     val chave = normalizarUsuario(usuario)
     val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
     val atuais = (prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()).toMutableSet()
-    atuais.add(nomePasta.trim())
-    prefs.edit().putStringSet("folders_$chave", atuais).apply()
+    val jaTem = atuais.any { it.equals(nomePasta.trim(), ignoreCase = true) }
+    if (!jaTem) {
+        atuais.add(nomePasta.trim())
+        prefs.edit().putStringSet("folders_$chave", atuais).apply()
+    }
+}
+
+fun registarMensagemSincronizada(context: Context, usuario: String, msgId: Long) {
+    if (msgId == 0L) return
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_synced_msgs_$chave", Context.MODE_PRIVATE)
+    prefs.edit().putBoolean(msgId.toString(), true).apply()
+}
+
+fun mensagemJaSincronizada(context: Context, usuario: String, msgId: Long): Boolean {
+    if (msgId == 0L) return false
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_synced_msgs_$chave", Context.MODE_PRIVATE)
+    return prefs.getBoolean(msgId.toString(), false)
 }
 
 fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List<ArquivoNuvem>, pastas: List<PastaNuvem>) {
@@ -167,6 +193,64 @@ fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List
             associarPastaAoUsuario(context, usuario, p.nomePasta)
         }
         prefs.edit().putBoolean("migrated_v11_data", true).apply()
+    }
+}
+
+fun miniaturaExisteLocalmente(caminhoMiniatura: String?): Boolean {
+    val c = caminhoMiniatura ?: return false
+    if (c.isBlank()) return false
+    if (c.startsWith("content://")) return true
+    val limpo = if (c.startsWith("file://")) Uri.parse(c).path ?: c.removePrefix("file://") else c
+    return limpo.isNotBlank() && File(limpo).exists()
+}
+
+fun limparDuplicadosExistentes(
+    context: Context,
+    todosArquivos: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onCleaned: () -> Unit
+) {
+    if (todosArquivos.size <= 1) return
+    val donos = carregarDonosFicheiros(context)
+    val pastas = carregarVinculosPastas(context)
+
+    // Agrupa por utilizador + nome do ficheiro + tamanho em bytes
+    val grupos = todosArquivos.groupBy { arq ->
+        val dono = donos[arq.dataUpload] ?: ""
+        "${dono}|${arq.nomeArquivo.trim().lowercase(Locale.ROOT)}|${arq.tamanhoBytes}"
+    }
+
+    var apagouAlgum = false
+    for ((_, listaGrupo) in grupos) {
+        if (listaGrupo.size > 1) {
+            // Escolhe o registo mais completo (que já tenha miniatura local válida e pasta associada)
+            val principal = listaGrupo.sortedWith(
+                compareByDescending<ArquivoNuvem> { miniaturaExisteLocalmente(it.caminhoMiniatura) }
+                    .thenByDescending { !pastas[it.dataUpload].isNullOrBlank() }
+                    .thenBy { it.id }
+            ).first()
+
+            val pastaEncontrada = listaGrupo.firstNotNullOfOrNull { pastas[it.dataUpload] }
+            if (!pastaEncontrada.isNullOrBlank() && pastas[principal.dataUpload].isNullOrBlank()) {
+                salvarVinculoPasta(context, principal.dataUpload, pastaEncontrada)
+            }
+
+            val donoEncontrado = listaGrupo.firstNotNullOfOrNull { donos[it.dataUpload] }
+            if (!donoEncontrado.isNullOrBlank() && donos[principal.dataUpload].isNullOrBlank()) {
+                salvarDonoFicheiro(context, principal.dataUpload, donoEncontrado)
+            }
+
+            listaGrupo.forEach { item ->
+                if (item.id != principal.id) {
+                    vm.apagar(item.id)
+                    apagouAlgum = true
+                }
+            }
+        }
+    }
+
+    if (apagouAlgum) {
+        onCleaned()
     }
 }
 
@@ -278,24 +362,29 @@ fun verificarOuRegistarCofreNuvem(
 fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, nomeArquivo: String): String {
     return try {
         val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
-        val f = File(dir, "thumb_${System.currentTimeMillis()}_${nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
-        FileInputStream(arquivoOrigem).use { inp ->
-            FileOutputStream(f).use { out -> inp.copyTo(out) }
+        val nomeSeguro = nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val f = File(dir, "thumb_${arquivoOrigem.length()}_$nomeSeguro")
+        if (!f.exists()) {
+            FileInputStream(arquivoOrigem).use { inp ->
+                FileOutputStream(f).use { out -> inp.copyTo(out) }
+            }
         }
         val mime = descobrirMimeType(nomeArquivo)
         if (mime.startsWith("video/")) {
-            try {
-                val retriever = MediaMetadataRetriever()
-                retriever.setDataSource(f.absolutePath)
-                val bitmap = retriever.getFrameAtTime(1000000) ?: retriever.getFrameAtTime(0)
-                retriever.release()
-                if (bitmap != null) {
-                    val frameFile = File("${f.absolutePath}_frame.jpg")
-                    FileOutputStream(frameFile).use { out ->
-                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            val frameFile = File("${f.absolutePath}_frame.jpg")
+            if (!frameFile.exists()) {
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    retriever.setDataSource(f.absolutePath)
+                    val bitmap = retriever.getFrameAtTime(1000000) ?: retriever.getFrameAtTime(0)
+                    retriever.release()
+                    if (bitmap != null) {
+                        FileOutputStream(frameFile).use { out ->
+                            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                        }
                     }
-                }
-            } catch (_: Exception) {}
+                } catch (_: Exception) {}
+            }
         } else if (mime == "application/pdf") {
             gerarCapaPdf(f)
         }
@@ -309,36 +398,60 @@ fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
     usuarioAtivo: String,
-    arquivosExistentes: List<ArquivoNuvem>,
     vm: UIViewModel,
     onComplete: (Int) -> Unit
 ) {
-    val tagPerfil = "👤 [${normalizarUsuario(usuarioAtivo)}]"
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+    val tagPerfil = "👤 [$chaveAtiva]"
     val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
                     buscarHistoricoPaginado(client, chatObj.id, 0L, 5, mutableListOf()) { todasMensagens ->
                         var importados = 0
-                        val idsLocais = arquivosExistentes.map { it.fileId }.toSet()
+                        val donosAtuais = carregarDonosFicheiros(context)
+                        val arquivosAtuais = vm.arquivos.value
+
+                        // Conjunto de chaves (nome + tamanho) que já existem para evitar qualquer duplicação
+                        val chavesExistentes = arquivosAtuais
+                            .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                            .map { "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                            .toMutableSet()
+
+                        val idsExistentes = arquivosAtuais.map { it.fileId }.filter { it != 0 }.toMutableSet()
+
                         todasMensagens.forEachIndexed { index, msg ->
                             val docContent = msg.content as? TdApi.MessageDocument
                             val legenda = docContent?.caption?.text ?: ""
                             if (docContent != null && (legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true))) {
                                 val rId = docContent.document?.document?.id ?: 0
-                                if (rId != 0 && !idsLocais.contains(rId)) {
-                                    val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                    val tam = docContent.document?.document?.size ?: 0L
-                                    val ts = (msg.date.toLong() * 1000L) + index
-                                    val pastaExtraida = if (legenda.contains("📁 [")) {
-                                        legenda.substringAfter("📁 [").substringBefore("]")
-                                    } else ""
+                                val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                val tam = docContent.document?.document?.size ?: 0L
+                                val chaveUnica = "${nomeDoc.trim().lowercase(Locale.ROOT)}|$tam"
 
+                                val pastaExtraida = if (legenda.contains("📁 [")) {
+                                    legenda.substringAfter("📁 [").substringBefore("]").trim()
+                                } else ""
+
+                                if (pastaExtraida.isNotBlank()) {
+                                    vm.criarPasta(pastaExtraida)
+                                    associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
+                                }
+
+                                val jaExiste = mensagemJaSincronizada(context, usuarioAtivo, msg.id) ||
+                                    chavesExistentes.contains(chaveUnica) ||
+                                    (rId != 0 && idsExistentes.contains(rId))
+
+                                if (!jaExiste) {
+                                    chavesExistentes.add(chaveUnica)
+                                    if (rId != 0) idsExistentes.add(rId)
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+
+                                    val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + index
                                     salvarDonoFicheiro(context, ts, usuarioAtivo)
                                     if (pastaExtraida.isNotBlank()) {
-                                        vm.criarPasta(pastaExtraida)
-                                        associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
                                         salvarVinculoPasta(context, ts, pastaExtraida)
                                     }
 
@@ -364,15 +477,18 @@ fun sincronizarCofreDaNuvem(
                                                 caminhoMiniatura = ""
                                             )
                                         )
-                                        // Baixa em segundo plano para recriar a miniatura automaticamente após reinstalar
-                                        val dlReq = TdApi.DownloadFile().apply {
-                                            fileId = rId
-                                            priority = 1
-                                            synchronous = false
+                                        if (rId != 0) {
+                                            val dlReq = TdApi.DownloadFile().apply {
+                                                fileId = rId
+                                                priority = 1
+                                                synchronous = false
+                                            }
+                                            client.send(dlReq) {}
                                         }
-                                        client.send(dlReq) {}
                                     }
                                     importados++
+                                } else {
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
                                 }
                             }
                         }
@@ -391,9 +507,7 @@ fun garantirFicheiroLocal(
     vm: UIViewModel,
     onReady: (ArquivoNuvem) -> Unit
 ) {
-    val caminho = arq.caminhoMiniatura ?: ""
-    val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
-    if (caminho.startsWith("content://") || (limpo.isNotBlank() && File(limpo).exists())) {
+    if (miniaturaExisteLocalmente(arq.caminhoMiniatura)) {
         onReady(arq)
         return
     }
@@ -725,6 +839,7 @@ fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String?, nome
 }
 
 fun enviarParaMensagensSalvas(
+    context: Context,
     client: Client,
     usuarioAtivo: String,
     caminhoLocal: String,
@@ -744,6 +859,7 @@ fun enviarParaMensagensSalvas(
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
+                                registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
                                 val rId = (msgObj.content as? TdApi.MessageDocument)?.document?.document?.id ?: 0
                                 val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Guardado no cofre de $usuarioAtivo!"
                                 onResult(true, rId, txt)
@@ -828,17 +944,14 @@ fun GrelhaArquivos(
     onFileClick: (ArquivoNuvem) -> Unit
 ) {
     LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(1.dp), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        items(lista) { arq ->
+        items(lista, key = { it.id }) { arq ->
             val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
             val pasta = mapaPastas[arq.dataUpload]
             val thumbSafe = arq.caminhoMiniatura ?: ""
             val dataCurta = formatarDataCurta(arq.dataUpload)
 
-            // Se o ficheiro foi restaurado da nuvem e a miniatura ainda não está local, recupera-a automaticamente
             LaunchedEffect(arq.id, arq.caminhoMiniatura) {
-                val limpo = if (thumbSafe.startsWith("file://")) Uri.parse(thumbSafe).path ?: thumbSafe.removePrefix("file://") else thumbSafe
-                val existeLocal = thumbSafe.startsWith("content://") || (limpo.isNotBlank() && File(limpo).exists())
-                if (!existeLocal && arq.fileId != 0) {
+                if (!miniaturaExisteLocalmente(thumbSafe) && arq.fileId != 0) {
                     val req = TdApi.DownloadFile().apply {
                         fileId = arq.fileId
                         priority = 1
@@ -937,7 +1050,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
 
-    // === ESTADOS DO COFRE MULTIUTILIZADOR (v1.2) ===
     var activeVaultUser by remember { mutableStateOf(obterUltimoUsuarioCofre(context)) }
     var vaultUnlocked by remember { mutableStateOf(false) }
     var isSwitchingUser by remember { mutableStateOf(activeVaultUser.isBlank()) }
@@ -951,40 +1063,58 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
 
+    // Remove automaticamente qualquer ficheiro duplicado na base de dados assim que os dados carregam
+    LaunchedEffect(todosArquivos.size, vaultUnlocked) {
+        if (todosArquivos.size > 1) {
+            limparDuplicadosExistentes(context, todosArquivos, vm) {
+                mapaDonos = carregarDonosFicheiros(context)
+                mapaPastas = carregarVinculosPastas(context)
+            }
+        }
+    }
+
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
-            migrarDadosV11SeNecessario(context, activeVaultUser, todosArquivos, todasPastas)
+            // Aguarda o Room Database carregar a lista local antes de sincronizar com a nuvem
+            delay(450)
+            migrarDadosV11SeNecessario(context, activeVaultUser, vm.arquivos.value, vm.pastas.value)
+            limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
             mapaDonos = carregarDonosFicheiros(context)
+            mapaPastas = carregarVinculosPastas(context)
             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-            // Sincroniza automaticamente da nuvem ao desbloquear o cofre
-            sincronizarCofreDaNuvem(context, client, activeVaultUser, todosArquivos, vm) { qtd ->
+
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
                 if (qtd > 0) {
                     scope.launch(Dispatchers.Main) {
                         mapaDonos = carregarDonosFicheiros(context)
                         mapaPastas = carregarVinculosPastas(context)
                         pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                        Toast.makeText(context, "$qtd ficheiro(s) recuperados da nuvem!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados!", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
         }
     }
 
+    // Filtro com proteção visual extra contra duplicados
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
         if (chaveAtiva.isBlank()) emptyList()
-        else todosArquivos.filter { mapaDonos[it.dataUpload] == chaveAtiva }
+        else todosArquivos
+            .filter { mapaDonos[it.dataUpload] == chaveAtiva }
+            .distinctBy { "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
     }
 
     val pastas = remember(todasPastas, pastasDoUsuarioSet, activeVaultUser) {
         if (activeVaultUser.isBlank()) emptyList()
-        else todasPastas.filter { pastasDoUsuarioSet.contains(it.nomePasta) }
+        else todasPastas
+            .filter { p -> pastasDoUsuarioSet.any { it.equals(p.nomePasta.trim(), ignoreCase = true) } }
+            .distinctBy { it.nomePasta.trim().lowercase(Locale.ROOT) }
     }
 
     val armazenamentoUsuario = remember(arquivos) {
         arquivos.sumOf { it.tamanhoBytes }
     }
-    // ===============================================
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
@@ -1045,7 +1175,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                 if (arqTemp != null) {
                     val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                    enviarParaMensagensSalvas(client, activeVaultUser, arqTemp.absolutePath, nome, pastaEscolhida) { ok, rId, msg ->
+                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, nome, pastaEscolhida) { ok, rId, msg ->
                         deferred.complete(Triple(ok, rId, msg))
                     }
                     val (ok, rId, msg) = deferred.await()
@@ -1837,8 +1967,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     onClick = {
                         scope.launch { drawerState.close() }
                         cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem..."
-                        sincronizarCofreDaNuvem(context, client, activeVaultUser, todosArquivos, vm) { qtd ->
+                        sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
                             scope.launch(Dispatchers.Main) {
+                                limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
                                 mapaDonos = carregarDonosFicheiros(context)
                                 mapaPastas = carregarVinculosPastas(context)
                                 pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
@@ -1948,7 +2079,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     if (pastaAberta != null) {
                         val daPasta = remember(arquivos, mapaPastas, pastaAberta, searchQuery) {
                             arquivos.filter {
-                                mapaPastas[it.dataUpload] == pastaAberta &&
+                                mapaPastas[it.dataUpload]?.equals(pastaAberta, ignoreCase = true) == true &&
                                     (searchQuery.isBlank() || it.nomeArquivo.contains(searchQuery, ignoreCase = true))
                             }
                         }
@@ -1970,8 +2101,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                             Spacer(Modifier.height(16.dp))
                             LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                items(pastasFiltradas) { p ->
-                                    val qtd = arquivos.count { mapaPastas[it.dataUpload] == p.nomePasta }
+                                items(pastasFiltradas, key = { it.nomePasta.trim().lowercase(Locale.ROOT) }) { p ->
+                                    val qtd = arquivos.count { mapaPastas[it.dataUpload]?.equals(p.nomePasta, ignoreCase = true) == true }
                                     Row(Modifier.fillMaxWidth().background(SurfaceDark, RoundedCornerShape(12.dp)).clickable { pastaAberta = p.nomePasta }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(32.dp))
                                         Spacer(Modifier.width(12.dp))
