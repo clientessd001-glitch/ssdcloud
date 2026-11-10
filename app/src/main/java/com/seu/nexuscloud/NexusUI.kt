@@ -86,6 +86,12 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
     fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch { dao.salvarArquivo(arq) }
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
+    fun atualizarCaminhoMiniatura(arq: ArquivoNuvem, novoCaminho: String) = viewModelScope.launch {
+        if (novoCaminho.isNotBlank()) {
+            dao.apagarArquivo(arq.id)
+            dao.salvarArquivo(arq.copy(id = 0, caminhoMiniatura = novoCaminho))
+        }
+    }
     fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
         if (novoNome.isNotBlank()) {
             dao.apagarArquivo(arq.id)
@@ -94,7 +100,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === GESTÃO DE COFRES MULTIUTILIZADOR (v1.2) ===
+// === GESTÃO DE COFRES MULTIUTILIZADOR E RESTAURAÇÃO (v1.2) ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
 fun obterUltimoUsuarioCofre(context: Context): String {
@@ -116,12 +122,6 @@ fun obterPinCofreLocal(context: Context, nome: String): String? {
     val chave = normalizarUsuario(nome)
     val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
     return prefs.getString("pin_$chave", null)
-}
-
-fun obterNomeExibicaoCofreLocal(context: Context, nome: String): String {
-    val chave = normalizarUsuario(nome)
-    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
-    return prefs.getString("display_$chave", nome.trim()) ?: nome.trim()
 }
 
 fun carregarDonosFicheiros(context: Context): Map<Long, String> {
@@ -170,6 +170,40 @@ fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List
     }
 }
 
+fun buscarHistoricoPaginado(
+    client: Client,
+    chatId: Long,
+    fromMsgId: Long,
+    lotesRestantes: Int,
+    acumulado: MutableList<TdApi.Message>,
+    onComplete: (List<TdApi.Message>) -> Unit
+) {
+    if (lotesRestantes <= 0) {
+        onComplete(acumulado)
+        return
+    }
+    val req = TdApi.GetChatHistory().apply {
+        this.chatId = chatId
+        this.fromMessageId = fromMsgId
+        this.offset = 0
+        this.limit = 100
+        this.onlyLocal = false
+    }
+    client.send(req) { obj ->
+        if (obj is TdApi.Messages && obj.messages.isNotEmpty()) {
+            acumulado.addAll(obj.messages)
+            val ultimoId = obj.messages.last().id
+            if (ultimoId != 0L && ultimoId != fromMsgId) {
+                buscarHistoricoPaginado(client, chatId, ultimoId, lotesRestantes - 1, acumulado, onComplete)
+            } else {
+                onComplete(acumulado)
+            }
+        } else {
+            onComplete(acumulado)
+        }
+    }
+}
+
 fun verificarOuRegistarCofreNuvem(
     client: Client,
     nomeUsuario: String,
@@ -182,34 +216,25 @@ fun verificarOuRegistarCofreNuvem(
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    val reqHist = TdApi.GetChatHistory().apply {
-                        chatId = chatObj.id
-                        fromMessageId = 0
-                        offset = 0
-                        limit = 100
-                        onlyLocal = false
-                    }
-                    client.send(reqHist) { histObj ->
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 5, mutableListOf()) { todasMensagens ->
                         var pinEncontrado: String? = null
                         var nomeOriginalEncontrado = nomeUsuario.trim()
 
-                        if (histObj is TdApi.Messages) {
-                            for (msg in histObj.messages) {
-                                val texto = when (val c = msg.content) {
-                                    is TdApi.MessageText -> c.text?.text ?: ""
-                                    is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                    else -> ""
-                                }
-                                if (texto.contains("🔒 [REGISTO_COFRE]")) {
-                                    val partes = texto.split("|").map { it.trim() }
-                                    val userPart = partes.firstOrNull { it.startsWith("USER:") }?.removePrefix("USER:")?.trim()
-                                    val nomePart = partes.firstOrNull { it.startsWith("NOME:") }?.removePrefix("NOME:")?.trim()
-                                    val pinPart = partes.firstOrNull { it.startsWith("PIN:") }?.removePrefix("PIN:")?.trim()
-                                    if (userPart != null && userPart == chaveDesejada && pinPart != null) {
-                                        pinEncontrado = pinPart
-                                        if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
-                                        break
-                                    }
+                        for (msg in todasMensagens) {
+                            val texto = when (val c = msg.content) {
+                                is TdApi.MessageText -> c.text?.text ?: ""
+                                is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                else -> ""
+                            }
+                            if (texto.contains("🔒 [REGISTO_COFRE]")) {
+                                val partes = texto.split("|").map { it.trim() }
+                                val userPart = partes.firstOrNull { it.startsWith("USER:") }?.removePrefix("USER:")?.trim()
+                                val nomePart = partes.firstOrNull { it.startsWith("NOME:") }?.removePrefix("NOME:")?.trim()
+                                val pinPart = partes.firstOrNull { it.startsWith("PIN:") }?.removePrefix("PIN:")?.trim()
+                                if (userPart != null && userPart == chaveDesejada && pinPart != null) {
+                                    pinEncontrado = pinPart
+                                    if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
+                                    break
                                 }
                             }
                         }
@@ -232,7 +257,7 @@ fun verificarOuRegistarCofreNuvem(
                             }
                         } else {
                             if (pinEncontrado == null) {
-                                onResult(false, "", "Cofre '${nomeUsuario.trim()}' não encontrado. Use a aba 'CRIAR NOVO COFRE'.")
+                                onResult(false, "", "Cofre '${nomeUsuario.trim()}' não encontrado. Use a aba 'CRIAR COFRE'.")
                             } else if (pinEncontrado == pin.trim()) {
                                 onResult(true, nomeOriginalEncontrado, "Cofre desbloqueado!")
                             } else {
@@ -250,6 +275,36 @@ fun verificarOuRegistarCofreNuvem(
     }
 }
 
+fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, nomeArquivo: String): String {
+    return try {
+        val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
+        val f = File(dir, "thumb_${System.currentTimeMillis()}_${nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+        FileInputStream(arquivoOrigem).use { inp ->
+            FileOutputStream(f).use { out -> inp.copyTo(out) }
+        }
+        val mime = descobrirMimeType(nomeArquivo)
+        if (mime.startsWith("video/")) {
+            try {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(f.absolutePath)
+                val bitmap = retriever.getFrameAtTime(1000000) ?: retriever.getFrameAtTime(0)
+                retriever.release()
+                if (bitmap != null) {
+                    val frameFile = File("${f.absolutePath}_frame.jpg")
+                    FileOutputStream(frameFile).use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                    }
+                }
+            } catch (_: Exception) {}
+        } else if (mime == "application/pdf") {
+            gerarCapaPdf(f)
+        }
+        Uri.fromFile(f).toString()
+    } catch (_: Exception) {
+        Uri.fromFile(arquivoOrigem).toString()
+    }
+}
+
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -264,47 +319,60 @@ fun sincronizarCofreDaNuvem(
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    val reqHist = TdApi.GetChatHistory().apply {
-                        chatId = chatObj.id
-                        fromMessageId = 0
-                        offset = 0
-                        limit = 100
-                        onlyLocal = false
-                    }
-                    client.send(reqHist) { histObj ->
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 5, mutableListOf()) { todasMensagens ->
                         var importados = 0
-                        if (histObj is TdApi.Messages) {
-                            val idsLocais = arquivosExistentes.map { it.fileId }.toSet()
-                            histObj.messages.forEachIndexed { index, msg ->
-                                val docContent = msg.content as? TdApi.MessageDocument
-                                val legenda = docContent?.caption?.text ?: ""
-                                if (docContent != null && (legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true))) {
-                                    val rId = docContent.document?.document?.id ?: 0
-                                    if (rId != 0 && !idsLocais.contains(rId)) {
-                                        val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                        val tam = docContent.document?.document?.size ?: 0L
-                                        val ts = (msg.date.toLong() * 1000L) + index
-                                        val pastaExtraida = if (legenda.contains("📁 [")) {
-                                            legenda.substringAfter("📁 [").substringBefore("]")
-                                        } else ""
+                        val idsLocais = arquivosExistentes.map { it.fileId }.toSet()
+                        todasMensagens.forEachIndexed { index, msg ->
+                            val docContent = msg.content as? TdApi.MessageDocument
+                            val legenda = docContent?.caption?.text ?: ""
+                            if (docContent != null && (legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true))) {
+                                val rId = docContent.document?.document?.id ?: 0
+                                if (rId != 0 && !idsLocais.contains(rId)) {
+                                    val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                    val tam = docContent.document?.document?.size ?: 0L
+                                    val ts = (msg.date.toLong() * 1000L) + index
+                                    val pastaExtraida = if (legenda.contains("📁 [")) {
+                                        legenda.substringAfter("📁 [").substringBefore("]")
+                                    } else ""
 
-                                        salvarDonoFicheiro(context, ts, usuarioAtivo)
-                                        if (pastaExtraida.isNotBlank()) {
-                                            vm.criarPasta(pastaExtraida)
-                                            associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
-                                            salvarVinculoPasta(context, ts, pastaExtraida)
-                                        }
+                                    salvarDonoFicheiro(context, ts, usuarioAtivo)
+                                    if (pastaExtraida.isNotBlank()) {
+                                        vm.criarPasta(pastaExtraida)
+                                        associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
+                                        salvarVinculoPasta(context, ts, pastaExtraida)
+                                    }
+
+                                    val caminhoLocalExistente = docContent.document?.document?.local?.path ?: ""
+                                    if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists()) {
+                                        val uriMiniatura = prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
                                         vm.salvarArquivo(
                                             ArquivoNuvem(
                                                 fileId = rId,
                                                 nomeArquivo = nomeDoc,
                                                 tamanhoBytes = tam,
                                                 dataUpload = ts,
-                                                caminhoMiniatura = docContent.document?.document?.local?.path ?: ""
+                                                caminhoMiniatura = uriMiniatura
                                             )
                                         )
-                                        importados++
+                                    } else {
+                                        vm.salvarArquivo(
+                                            ArquivoNuvem(
+                                                fileId = rId,
+                                                nomeArquivo = nomeDoc,
+                                                tamanhoBytes = tam,
+                                                dataUpload = ts,
+                                                caminhoMiniatura = ""
+                                            )
+                                        )
+                                        // Baixa em segundo plano para recriar a miniatura automaticamente após reinstalar
+                                        val dlReq = TdApi.DownloadFile().apply {
+                                            fileId = rId
+                                            priority = 1
+                                            synchronous = false
+                                        }
+                                        client.send(dlReq) {}
                                     }
+                                    importados++
                                 }
                             }
                         }
@@ -313,6 +381,48 @@ fun sincronizarCofreDaNuvem(
                 } else onComplete(0)
             }
         } else onComplete(0)
+    }
+}
+
+fun garantirFicheiroLocal(
+    context: Context,
+    client: Client,
+    arq: ArquivoNuvem,
+    vm: UIViewModel,
+    onReady: (ArquivoNuvem) -> Unit
+) {
+    val caminho = arq.caminhoMiniatura ?: ""
+    val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+    if (caminho.startsWith("content://") || (limpo.isNotBlank() && File(limpo).exists())) {
+        onReady(arq)
+        return
+    }
+    if (arq.fileId == 0) {
+        Toast.makeText(context, "Ficheiro indisponível localmente.", Toast.LENGTH_SHORT).show()
+        return
+    }
+    NexusTransfer.progress.value = 35
+    NexusTransfer.label.value = "A recuperar '${arq.nomeArquivo}' da nuvem..."
+    val req = TdApi.DownloadFile().apply {
+        fileId = arq.fileId
+        priority = 32
+        synchronous = true
+    }
+    client.send(req) { res ->
+        NexusTransfer.progress.value = null
+        if (res is TdApi.File) {
+            val pathRemoto = res.local?.path ?: ""
+            if (pathRemoto.isNotBlank() && File(pathRemoto).exists()) {
+                val novoThumb = prepararMiniaturaDeFicheiroBaixado(context, File(pathRemoto), arq.nomeArquivo)
+                val atualizado = arq.copy(caminhoMiniatura = novoThumb)
+                vm.atualizarCaminhoMiniatura(arq, novoThumb)
+                onReady(atualizado)
+            } else {
+                onReady(arq)
+            }
+        } else {
+            onReady(arq)
+        }
     }
 }
 // ===============================================
@@ -658,8 +768,8 @@ fun baixarFicheiroDaNuvem(context: Context, client: Client, targetFileId: Int, n
 
     val req = TdApi.DownloadFile().apply {
         fileId = targetFileId
-        priority = 1
-        synchronous = false
+        priority = 32
+        synchronous = true
     }
 
     client.send(req) { res ->
@@ -709,7 +819,14 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
 }
 
 @Composable
-fun GrelhaArquivos(lista: List<ArquivoNuvem>, mapaPastas: Map<Long, String>, onFileClick: (ArquivoNuvem) -> Unit) {
+fun GrelhaArquivos(
+    context: Context,
+    client: Client,
+    vm: UIViewModel,
+    lista: List<ArquivoNuvem>,
+    mapaPastas: Map<Long, String>,
+    onFileClick: (ArquivoNuvem) -> Unit
+) {
     LazyVerticalGrid(columns = GridCells.Fixed(3), modifier = Modifier.fillMaxSize().padding(1.dp), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
         items(lista) { arq ->
             val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase()
@@ -717,14 +834,42 @@ fun GrelhaArquivos(lista: List<ArquivoNuvem>, mapaPastas: Map<Long, String>, onF
             val thumbSafe = arq.caminhoMiniatura ?: ""
             val dataCurta = formatarDataCurta(arq.dataUpload)
 
+            // Se o ficheiro foi restaurado da nuvem e a miniatura ainda não está local, recupera-a automaticamente
+            LaunchedEffect(arq.id, arq.caminhoMiniatura) {
+                val limpo = if (thumbSafe.startsWith("file://")) Uri.parse(thumbSafe).path ?: thumbSafe.removePrefix("file://") else thumbSafe
+                val existeLocal = thumbSafe.startsWith("content://") || (limpo.isNotBlank() && File(limpo).exists())
+                if (!existeLocal && arq.fileId != 0) {
+                    val req = TdApi.DownloadFile().apply {
+                        fileId = arq.fileId
+                        priority = 1
+                        synchronous = true
+                    }
+                    client.send(req) { res ->
+                        if (res is TdApi.File) {
+                            val pathRemoto = res.local?.path ?: ""
+                            if (pathRemoto.isNotBlank() && File(pathRemoto).exists()) {
+                                val novoThumb = prepararMiniaturaDeFicheiroBaixado(context, File(pathRemoto), arq.nomeArquivo)
+                                vm.atualizarCaminhoMiniatura(arq, novoThumb)
+                            }
+                        }
+                    }
+                }
+            }
+
             Box(Modifier.aspectRatio(1f).background(SurfaceDark).clickable { onFileClick(arq) }, contentAlignment = Alignment.Center) {
                 when {
                     ext in listOf("JPG", "JPEG", "PNG", "WEBP", "HEIC") || arq.nomeArquivo.contains("IMG", true) -> {
-                        AsyncImage(model = Uri.parse(thumbSafe), contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                        if (thumbSafe.isNotBlank()) {
+                            AsyncImage(model = Uri.parse(thumbSafe), contentDescription = arq.nomeArquivo, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                        } else {
+                            Icon(Icons.Default.Image, null, tint = Gold, modifier = Modifier.size(32.dp))
+                        }
                     }
                     ext in listOf("MP4", "MKV", "MOV", "AVI") || arq.nomeArquivo.contains("VID", true) || arq.nomeArquivo.contains("Video", true) -> {
                         Box(Modifier.fillMaxSize()) {
-                            AsyncImage(model = obterUriCapaMidia(arq.caminhoMiniatura), contentDescription = "Video Preview", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                            if (thumbSafe.isNotBlank()) {
+                                AsyncImage(model = obterUriCapaMidia(arq.caminhoMiniatura), contentDescription = "Video Preview", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                            }
                             Icon(Icons.Default.PlayCircleOutline, null, tint = Color.White.copy(alpha = 0.85f), modifier = Modifier.size(44.dp).align(Alignment.Center))
                         }
                     }
@@ -803,13 +948,25 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var isCheckingVault by remember { mutableStateOf(false) }
 
     var mapaDonos by remember { mutableStateOf(carregarDonosFicheiros(context)) }
+    var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
 
-    LaunchedEffect(vaultUnlocked, activeVaultUser, todosArquivos.size, todasPastas.size) {
+    LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
             migrarDadosV11SeNecessario(context, activeVaultUser, todosArquivos, todasPastas)
             mapaDonos = carregarDonosFicheiros(context)
             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+            // Sincroniza automaticamente da nuvem ao desbloquear o cofre
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, todosArquivos, vm) { qtd ->
+                if (qtd > 0) {
+                    scope.launch(Dispatchers.Main) {
+                        mapaDonos = carregarDonosFicheiros(context)
+                        mapaPastas = carregarVinculosPastas(context)
+                        pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                        Toast.makeText(context, "$qtd ficheiro(s) recuperados da nuvem!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
         }
     }
 
@@ -839,7 +996,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var searchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
 
-    var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastaAberta by remember { mutableStateOf<String?>(null) }
     var pendingUploadUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var fileToMove by remember { mutableStateOf<ArquivoNuvem?>(null) }
@@ -1008,7 +1164,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 20.sp, fontWeight = FontWeight.Black)
 
                     if (!isSwitchingUser && activeVaultUser.isNotBlank()) {
-                        // MODO RÁPIDO: SÓ PEDE O PIN DO UTILIZADOR ATIVO
                         Spacer(Modifier.height(6.dp))
                         Text(
                             "COFRE DE ${activeVaultUser.uppercase(Locale.getDefault())}",
@@ -1108,7 +1263,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             Text("Trocar de utilizador / Criar novo cofre", color = Gold, fontSize = 12.sp)
                         }
                     } else {
-                        // 1.º ACESSO OU TROCA DE CONTA: CRIAR NOVO COFRE OU ENTRAR EM COFRE EXISTENTE
                         Spacer(Modifier.height(12.dp))
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             Button(
@@ -1130,7 +1284,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Spacer(Modifier.height(14.dp))
                         Text(
                             if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros."
-                            else "Digite o seu Nome de utilizador e PIN para aceder ao seu cofre.",
+                            else "Digite o seu Nome e PIN para carregar os seus ficheiros enviados anteriormente.",
                             color = TextGrey,
                             fontSize = 12.sp,
                             textAlign = TextAlign.Center
@@ -1214,13 +1368,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                             vaultPinInput = ""
                                             vaultUnlocked = true
                                             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                            sincronizarCofreDaNuvem(context, client, nomeConfirmado, todosArquivos, vm) { qtd ->
-                                                if (qtd > 0) {
-                                                    mapaDonos = carregarDonosFicheiros(context)
-                                                    mapaPastas = carregarVinculosPastas(context)
-                                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, nomeConfirmado)
-                                                }
-                                            }
                                         } else {
                                             vaultErrorMsg = msg
                                         }
@@ -1235,7 +1382,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
                             } else {
                                 Text(
-                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR NO COFRE",
+                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold
                                 )
@@ -1695,7 +1842,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 mapaDonos = carregarDonosFicheiros(context)
                                 mapaPastas = carregarVinculosPastas(context)
                                 pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem!" else "Cofre de $activeVaultUser sincronizado!"
+                                cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem!" else "Cofre de $activeVaultUser atualizado!"
                                 Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                             }
                         }
@@ -1810,7 +1957,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 IconButton(onClick = { pastaAberta = null }) { Icon(Icons.Default.ArrowBack, null, tint = Gold) }
                                 Text(pastaAberta!!, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                             }
-                            GrelhaArquivos(daPasta, mapaPastas) { selectedFile = it }
+                            GrelhaArquivos(context, client, vm, daPasta, mapaPastas) { selectedFile = it }
                         }
                     } else {
                         val pastasFiltradas = remember(pastas, searchQuery) {
@@ -1848,7 +1995,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         if (searchQuery.isBlank()) base
                         else base.filter { it.nomeArquivo.contains(searchQuery, ignoreCase = true) }
                     }
-                    GrelhaArquivos(filtrada, mapaPastas) { selectedFile = it }
+                    GrelhaArquivos(context, client, vm, filtrada, mapaPastas) { selectedFile = it }
                 }
             }
 
@@ -1858,11 +2005,41 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Column(Modifier.padding(bottom = 24.dp)) {
                         Text(arq.nomeArquivo, color = Gold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp), fontWeight = FontWeight.Bold)
                         Text("Cofre: $activeVaultUser • Tamanho: ${formatarTamanhoNuvem(arq.tamanhoBytes)} • Pasta: ${mapaPastas[arq.dataUpload] ?: "Geral"}\nAdicionado em: ${formatarDataNuvem(arq.dataUpload)}", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp))
-                        ListItem(headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) }, leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) }, modifier = Modifier.clickable { viewerFile = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
-                        ListItem(headlineContent = { Text("Abrir em App Externa...", color = Gold) }, leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; abrirFicheiroExterno(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(
+                            headlineContent = { Text("Abrir no Nexus Cloud", color = Color.White) },
+                            leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { viewerFile = arqPronto }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(
+                            headlineContent = { Text("Abrir em App Externa...", color = Gold) },
+                            leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Gold) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { abrirFicheiroExterno(context, arqPronto.caminhoMiniatura, arqPronto.nomeArquivo) }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
                         ListItem(headlineContent = { Text("Renomear ficheiro...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Edit, null, tint = Color.White) }, modifier = Modifier.clickable { novoNomeInput = arq.nomeArquivo.substringBeforeLast('.'); fileToRename = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Mover para Pasta...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { fileToMove = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
-                        ListItem(headlineContent = { Text("Compartilhar...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) }, modifier = Modifier.clickable { selectedFile = null; compartilharFicheiroNativo(context, arq.caminhoMiniatura, arq.nomeArquivo) }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(
+                            headlineContent = { Text("Compartilhar...", color = Color.White) },
+                            leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { compartilharFicheiroNativo(context, arqPronto.caminhoMiniatura, arqPronto.nomeArquivo) }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
                         ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(context, client, arq.fileId, arq.nomeArquivo) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                         ListItem(headlineContent = { Text("Remover do registo", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, arq.dataUpload, ""); salvarDonoFicheiro(context, arq.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); mapaDonos = carregarDonosFicheiros(context); vm.apagar(arq.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
                     }
