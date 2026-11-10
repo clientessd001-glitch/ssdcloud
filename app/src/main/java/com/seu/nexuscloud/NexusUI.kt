@@ -77,28 +77,69 @@ object NexusTransfer {
     val label = MutableStateFlow("")
 }
 
+fun limparPrefixoTimestamp(nome: String): String {
+    return nome.trim()
+        .replace(Regex("^thumb_\\d+_"), "")
+        .replace(Regex("^\\d{10,16}_"), "")
+        .trim()
+}
+
 class UIViewModel(private val dao: NexusDao) : ViewModel() {
     val arquivos = dao.buscarTodos().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val pastas = dao.buscarPastas().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val armazenamento = dao.calcularUsoTotal().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
 
+    suspend fun obterArquivosReais(): List<ArquivoNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarTodos().first()
+    }
+
+    suspend fun obterPastasReais(): List<PastaNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarPastas().first()
+    }
+
     fun criarPasta(nome: String) = viewModelScope.launch {
         val limpo = nome.trim()
         if (limpo.isNotBlank()) {
-            val jaExiste = pastas.value.any { it.nomePasta.trim().equals(limpo, ignoreCase = true) }
+            val atuais = obterPastasReais()
+            val jaExiste = atuais.any { it.nomePasta.trim().equals(limpo, ignoreCase = true) }
             if (!jaExiste) {
                 dao.criarPasta(PastaNuvem(nomePasta = limpo))
             }
         }
     }
 
-    fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch { dao.salvarArquivo(arq) }
+    fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch {
+        val atuais = obterArquivosReais()
+        val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
+        val existente = atuais.firstOrNull {
+            limparPrefixoTimestamp(it.nomeArquivo).equals(nomeLimpo, ignoreCase = true) &&
+                (it.tamanhoBytes == arq.tamanhoBytes || it.tamanhoBytes == 0L || arq.tamanhoBytes == 0L)
+        }
+        if (existente != null) {
+            val thumbAntigaOk = miniaturaExisteLocalmente(existente.caminhoMiniatura)
+            val thumbNovaOk = miniaturaExisteLocalmente(arq.caminhoMiniatura)
+            if (!thumbAntigaOk && thumbNovaOk) {
+                dao.apagarArquivo(existente.id)
+                dao.salvarArquivo(
+                    existente.copy(
+                        id = 0,
+                        nomeArquivo = nomeLimpo,
+                        caminhoMiniatura = arq.caminhoMiniatura,
+                        fileId = if (arq.fileId != 0) arq.fileId else existente.fileId
+                    )
+                )
+            }
+        } else {
+            dao.salvarArquivo(arq.copy(nomeArquivo = nomeLimpo))
+        }
+    }
+
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
 
     fun atualizarCaminhoMiniatura(arq: ArquivoNuvem, novoCaminho: String) = viewModelScope.launch {
         if (novoCaminho.isNotBlank() && arq.caminhoMiniatura != novoCaminho) {
             dao.apagarArquivo(arq.id)
-            dao.salvarArquivo(arq.copy(id = 0, caminhoMiniatura = novoCaminho))
+            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = limparPrefixoTimestamp(arq.nomeArquivo), caminhoMiniatura = novoCaminho))
         }
     }
 
@@ -110,7 +151,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === GESTÃO DE COFRES MULTIUTILIZADOR E ANTI-DUPLICAÇÃO ===
+// === GESTÃO DE COFRES MULTIUTILIZADOR, ANTI-DUPLICAÇÃO E EXCLUSÃO ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
 fun obterUltimoUsuarioCofre(context: Context): String {
@@ -181,6 +222,157 @@ fun mensagemJaSincronizada(context: Context, usuario: String, msgId: Long): Bool
     return prefs.getBoolean(msgId.toString(), false)
 }
 
+fun marcarFicheiroComoSincronizado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long, uriStr: String = "") {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    val editor = prefs.edit()
+    editor.putBoolean("name_$nomeLimpo", true)
+    editor.putBoolean("key_${nomeLimpo}|$tamanho", true)
+    if (uriStr.isNotBlank()) {
+        editor.putBoolean("uri_$uriStr", true)
+    }
+    editor.apply()
+}
+
+fun ficheiroJaSincronizadoAntes(context: Context, usuario: String, nomeArquivo: String, tamanho: Long, uriStr: String = ""): Boolean {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    if (uriStr.isNotBlank() && prefs.getBoolean("uri_$uriStr", false)) return true
+    if (prefs.getBoolean("key_${nomeLimpo}|$tamanho", false)) return true
+    if (prefs.getBoolean("name_$nomeLimpo", false)) return true
+    return false
+}
+
+fun marcarFicheiroComoDeletado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long) {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    prefs.edit()
+        .putBoolean("del_name_$nomeLimpo", true)
+        .putBoolean("del_key_${nomeLimpo}|$tamanho", true)
+        .apply()
+}
+
+fun desmarcarFicheiroDeletado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long) {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    prefs.edit()
+        .remove("del_name_$nomeLimpo")
+        .remove("del_key_${nomeLimpo}|$tamanho")
+        .apply()
+}
+
+fun ficheiroFoiDeletadoPeloUsuario(context: Context, usuario: String, nomeArquivo: String, tamanho: Long): Boolean {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    return prefs.getBoolean("del_key_${nomeLimpo}|$tamanho", false) ||
+        prefs.getBoolean("del_name_$nomeLimpo", false)
+}
+
+fun eliminarFicheiroCompleto(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arq: ArquivoNuvem,
+    apagarNaNuvemTelegram: Boolean,
+    vm: UIViewModel,
+    onComplete: (String) -> Unit
+) {
+    val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
+
+    // 1. Marca como deletado e sincronizado para não voltar a ser importado nem pedido no auto-sync
+    marcarFicheiroComoDeletado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+    marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+
+    // 2. Apaga a miniatura local e o frame de vídeo/PDF da memória do telemóvel
+    try {
+        val thumb = arq.caminhoMiniatura ?: ""
+        if (thumb.startsWith("file://") || thumb.startsWith("/")) {
+            val limpo = if (thumb.startsWith("file://")) Uri.parse(thumb).path ?: thumb.removePrefix("file://") else thumb
+            if (limpo.isNotBlank()) {
+                val f = File(limpo)
+                if (f.exists()) f.delete()
+                val fFrame = File("${limpo}_frame.jpg")
+                if (fFrame.exists()) fFrame.delete()
+            }
+        }
+    } catch (_: Exception) {}
+
+    // 3. Remove vínculos de pasta, dono e registo no Room Database
+    salvarVinculoPasta(context, arq.dataUpload, "")
+    salvarDonoFicheiro(context, arq.dataUpload, "")
+    vm.apagar(arq.id)
+
+    if (!apagarNaNuvemTelegram) {
+        onComplete("'$nomeLimpo' removido do aplicativo.")
+        return
+    }
+
+    // 4. Apaga o cache da TDLib e elimina a mensagem nas Mensagens Salvas do Telegram
+    if (arq.fileId != 0) {
+        client.send(TdApi.DeleteFile().apply { fileId = arq.fileId }) {}
+    }
+
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+    val tagPerfil = "👤 [$chaveAtiva]"
+    val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 5, mutableListOf()) { todasMensagens ->
+                        val idsParaApagar = mutableListOf<Long>()
+                        for (msg in todasMensagens) {
+                            val docContent = msg.content as? TdApi.MessageDocument ?: continue
+                            val legenda = docContent.caption?.text ?: ""
+                            val pertenceAoUsuario = legenda.contains(tagPerfil, ignoreCase = true) ||
+                                legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                legenda.contains("☁️ Nexus Cloud")
+
+                            if (pertenceAoUsuario) {
+                                val rId = docContent.document?.document?.id ?: 0
+                                val nomeBruto = docContent.document?.fileName ?: ""
+                                val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                                val tamMsg = docContent.document?.document?.size ?: 0L
+
+                                val mesmoId = arq.fileId != 0 && rId == arq.fileId
+                                val mesmoNome = nomeMsg.equals(nomeLimpo, ignoreCase = true) &&
+                                    (tamMsg == arq.tamanhoBytes || tamMsg == 0L || arq.tamanhoBytes == 0L)
+
+                                if (mesmoId || mesmoNome) {
+                                    idsParaApagar.add(msg.id)
+                                }
+                            }
+                        }
+
+                        if (idsParaApagar.isNotEmpty()) {
+                            val delReq = TdApi.DeleteMessages().apply {
+                                this.chatId = chatObj.id
+                                this.messageIds = idsParaApagar.toLongArray()
+                                this.revoke = true
+                            }
+                            client.send(delReq) {
+                                onComplete("'$nomeLimpo' deletado do app e da nuvem!")
+                            }
+                        } else {
+                            onComplete("'$nomeLimpo' deletado!")
+                        }
+                    }
+                } else {
+                    onComplete("'$nomeLimpo' deletado localmente.")
+                }
+            }
+        } else {
+            onComplete("'$nomeLimpo' deletado localmente.")
+        }
+    }
+}
+
 fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List<ArquivoNuvem>, pastas: List<PastaNuvem>) {
     val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
     if (!prefs.getBoolean("migrated_v11_data", false)) {
@@ -211,21 +403,23 @@ fun limparDuplicadosExistentes(
     vm: UIViewModel,
     onCleaned: () -> Unit
 ) {
-    if (todosArquivos.size <= 1) return
+    if (todosArquivos.isEmpty()) return
     val donos = carregarDonosFicheiros(context)
     val pastas = carregarVinculosPastas(context)
 
     val grupos = todosArquivos.groupBy { arq ->
         val dono = donos[arq.dataUpload] ?: ""
-        "${dono}|${arq.nomeArquivo.trim().lowercase(Locale.ROOT)}|${arq.tamanhoBytes}"
+        val nomeBase = limparPrefixoTimestamp(arq.nomeArquivo).lowercase(Locale.ROOT)
+        "${dono}|${nomeBase}|${arq.tamanhoBytes}"
     }
 
-    var apagouAlgum = false
+    var alterouAlgum = false
     for ((_, listaGrupo) in grupos) {
         if (listaGrupo.size > 1) {
             val principal = listaGrupo.sortedWith(
                 compareByDescending<ArquivoNuvem> { miniaturaExisteLocalmente(it.caminhoMiniatura) }
                     .thenByDescending { !pastas[it.dataUpload].isNullOrBlank() }
+                    .thenBy { it.nomeArquivo.length }
                     .thenBy { it.id }
             ).first()
 
@@ -235,20 +429,39 @@ fun limparDuplicadosExistentes(
             }
 
             val donoEncontrado = listaGrupo.firstNotNullOfOrNull { donos[it.dataUpload] }
-            if (!donoEncontrado.isNullOrBlank() && donos[principal.dataUpload].isNullOrBlank()) {
-                salvarDonoFicheiro(context, principal.dataUpload, donoEncontrado)
+            if (!donoEncontrado.isNullOrBlank()) {
+                if (donos[principal.dataUpload].isNullOrBlank()) {
+                    salvarDonoFicheiro(context, principal.dataUpload, donoEncontrado)
+                }
+                marcarFicheiroComoSincronizado(context, donoEncontrado, principal.nomeArquivo, principal.tamanhoBytes)
             }
 
             listaGrupo.forEach { item ->
                 if (item.id != principal.id) {
                     vm.apagar(item.id)
-                    apagouAlgum = true
+                    alterouAlgum = true
                 }
+            }
+            val nomeLimpoPrincipal = limparPrefixoTimestamp(principal.nomeArquivo)
+            if (principal.nomeArquivo != nomeLimpoPrincipal) {
+                vm.renomearArquivo(principal, nomeLimpoPrincipal)
+                alterouAlgum = true
+            }
+        } else {
+            val unico = listaGrupo.first()
+            val donoUnico = donos[unico.dataUpload] ?: ""
+            if (donoUnico.isNotBlank()) {
+                marcarFicheiroComoSincronizado(context, donoUnico, unico.nomeArquivo, unico.tamanhoBytes)
+            }
+            val nomeLimpo = limparPrefixoTimestamp(unico.nomeArquivo)
+            if (unico.nomeArquivo != nomeLimpo) {
+                vm.renomearArquivo(unico, nomeLimpo)
+                alterouAlgum = true
             }
         }
     }
 
-    if (apagouAlgum) {
+    if (alterouAlgum) {
         onCleaned()
     }
 }
@@ -361,14 +574,14 @@ fun verificarOuRegistarCofreNuvem(
 fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, nomeArquivo: String): String {
     return try {
         val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
-        val nomeSeguro = nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
         val f = File(dir, "thumb_${arquivoOrigem.length()}_$nomeSeguro")
         if (!f.exists()) {
             FileInputStream(arquivoOrigem).use { inp ->
                 FileOutputStream(f).use { out -> inp.copyTo(out) }
             }
         }
-        val mime = descobrirMimeType(nomeArquivo)
+        val mime = descobrirMimeType(nomeSeguro)
         if (mime.startsWith("video/")) {
             val frameFile = File("${f.absolutePath}_frame.jpg")
             if (!frameFile.exists()) {
@@ -393,10 +606,19 @@ fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, no
     }
 }
 
+fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
+    val daLegenda = if (legenda.contains("• ")) {
+        legenda.substringAfterLast("• ").trim()
+    } else ""
+    val candidato = if (daLegenda.isNotBlank() && daLegenda.contains(".")) daLegenda else nomeDocumento
+    return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
+}
+
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
     usuarioAtivo: String,
+    arquivosAtuaisReais: List<ArquivoNuvem>,
     vm: UIViewModel,
     onComplete: (Int) -> Unit
 ) {
@@ -411,23 +633,35 @@ fun sincronizarCofreDaNuvem(
                     buscarHistoricoPaginado(client, chatObj.id, 0L, 5, mutableListOf()) { todasMensagens ->
                         var importados = 0
                         val donosAtuais = carregarDonosFicheiros(context)
-                        val arquivosAtuais = vm.arquivos.value
 
-                        val chavesExistentes = arquivosAtuais
+                        val chavesExistentes = arquivosAtuaisReais
                             .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
-                            .map { "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                            .map { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
                             .toMutableSet()
 
-                        val idsExistentes = arquivosAtuais.map { it.fileId }.filter { it != 0 }.toMutableSet()
+                        val nomesExistentes = arquivosAtuaisReais
+                            .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                            .map { limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT) }
+                            .toMutableSet()
+
+                        val idsExistentes = arquivosAtuaisReais.map { it.fileId }.filter { it != 0 }.toMutableSet()
 
                         todasMensagens.forEachIndexed { index, msg ->
                             val docContent = msg.content as? TdApi.MessageDocument
                             val legenda = docContent?.caption?.text ?: ""
                             if (docContent != null && (legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true))) {
                                 val rId = docContent.document?.document?.id ?: 0
-                                val nomeDoc = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                val nomeBruto = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                                val nomeLower = nomeDoc.lowercase(Locale.ROOT)
                                 val tam = docContent.document?.document?.size ?: 0L
-                                val chaveUnica = "${nomeDoc.trim().lowercase(Locale.ROOT)}|$tam"
+                                val chaveUnica = "$nomeLower|$tam"
+
+                                // Se o ficheiro foi deletado pelo utilizador, ignora-o na sincronização
+                                if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+                                    return@forEachIndexed
+                                }
 
                                 val pastaExtraida = if (legenda.contains("📁 [")) {
                                     legenda.substringAfter("📁 [").substringBefore("]").trim()
@@ -438,12 +672,16 @@ fun sincronizarCofreDaNuvem(
                                     associarPastaAoUsuario(context, usuarioAtivo, pastaExtraida)
                                 }
 
+                                marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeDoc, tam)
+
                                 val jaExiste = mensagemJaSincronizada(context, usuarioAtivo, msg.id) ||
                                     chavesExistentes.contains(chaveUnica) ||
+                                    nomesExistentes.contains(nomeLower) ||
                                     (rId != 0 && idsExistentes.contains(rId))
 
                                 if (!jaExiste) {
                                     chavesExistentes.add(chaveUnica)
+                                    nomesExistentes.add(nomeLower)
                                     if (rId != 0) idsExistentes.add(rId)
                                     registarMensagemSincronizada(context, usuarioAtivo, msg.id)
 
@@ -559,7 +797,7 @@ fun carregarPastasSync(context: Context, usuario: String): List<PastaSync> {
             lista.add(PastaSync(uriStr, nome.ifBlank { "Pasta Selecionada" }, ativo))
         }
     }
-    return lista
+    return lista.distinctBy { it.uri }
 }
 
 fun salvarPastaSync(context: Context, usuario: String, uri: String, ativa: Boolean) {
@@ -582,10 +820,10 @@ fun procurarNovosFicheirosNasPastas(
     if (pastasAtivas.isEmpty()) return emptyList()
 
     val chavesNoCofre = arquivosNoCofre.map {
-        "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}"
+        "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}"
     }.toSet()
     val nomesNoCofre = arquivosNoCofre.map {
-        it.nomeArquivo.trim().lowercase(Locale.ROOT)
+        limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)
     }.toSet()
 
     val encontrados = mutableListOf<NovoArquivoSync>()
@@ -612,19 +850,27 @@ fun procurarNovosFicheirosNasPastas(
 
                 while (cursor.moveToNext()) {
                     val docId = if (idxId != -1 && !cursor.isNull(idxId)) cursor.getString(idxId) else continue
-                    val nome = if (idxName != -1 && !cursor.isNull(idxName)) cursor.getString(idxName) else continue
+                    val nomeBruto = if (idxName != -1 && !cursor.isNull(idxName)) cursor.getString(idxName) else continue
                     val tamanho = if (idxSize != -1 && !cursor.isNull(idxSize)) cursor.getLong(idxSize) else 0L
                     val mime = if (idxMime != -1 && !cursor.isNull(idxMime)) cursor.getString(idxMime) else ""
 
                     if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                    val nome = limparPrefixoTimestamp(nomeBruto)
                     if (nome.startsWith(".") || tamanho <= 0L) continue
 
-                    val nomeLower = nome.trim().lowercase(Locale.ROOT)
+                    val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    val uriStr = fileUri.toString()
+                    val nomeLower = nome.lowercase(Locale.ROOT)
                     val chave = "$nomeLower|$tamanho"
 
-                    if (!chavesNoCofre.contains(chave) && !nomesNoCofre.contains(nomeLower) && !chavesJaAdicionadas.contains(chave)) {
+                    val jaSincronizado = chavesNoCofre.contains(chave) ||
+                        nomesNoCofre.contains(nomeLower) ||
+                        chavesJaAdicionadas.contains(chave) ||
+                        ficheiroJaSincronizadoAntes(context, usuarioAtivo, nome, tamanho, uriStr) ||
+                        ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nome, tamanho)
+
+                    if (!jaSincronizado) {
                         chavesJaAdicionadas.add(chave)
-                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
                         encontrados.add(
                             NovoArquivoSync(
                                 uri = fileUri,
@@ -686,7 +932,7 @@ fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
             if (iT != -1 && !c.isNull(iT)) tamanho = c.getLong(iT)
         }
     }
-    return Pair(nome, tamanho)
+    return Pair(limparPrefixoTimestamp(nome), tamanho)
 }
 
 fun descobrirMimeType(nome: String): String {
@@ -780,11 +1026,12 @@ fun lerTextoDocumento(caminhoMiniatura: String?): String? {
 fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String): String {
     return try {
         val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
-        val f = File(dir, "thumb_${System.currentTimeMillis()}_${nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+        val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val f = File(dir, "thumb_${System.currentTimeMillis()}_$nomeSeguro")
         context.contentResolver.openInputStream(uri)?.use { inp ->
             FileOutputStream(f).use { out -> inp.copyTo(out) }
         }
-        val mime = descobrirMimeType(nomeArquivo)
+        val mime = descobrirMimeType(nomeSeguro)
         if (mime.startsWith("video/")) {
             try {
                 val retriever = MediaMetadataRetriever()
@@ -836,8 +1083,9 @@ fun temCapaPdfLocal(caminhoMiniatura: String?): Boolean {
 
 fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nomeArquivo: String): File? {
     return try {
-        val dir = File(context.filesDir, "tdlib_upload_cache").apply { if (!exists()) mkdirs() }
-        val f = File(dir, "${System.currentTimeMillis()}_${nomeArquivo.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+        val subDir = File(context.filesDir, "tdlib_upload_cache/${System.currentTimeMillis()}").apply { if (!exists()) mkdirs() }
+        val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val f = File(subDir, nomeLimpo)
         context.contentResolver.openInputStream(uri)?.use { inp -> FileOutputStream(f).use { out -> inp.copyTo(out) } }
         f
     } catch (_: Exception) { null }
@@ -922,13 +1170,14 @@ fun enviarParaMensagensSalvas(
     pastaDestino: String,
     onResult: (Boolean, Int, String) -> Unit
 ) {
+    val nomeLimpo = limparPrefixoTimestamp(nomeOriginal)
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
                     val userTag = "👤 [$usuarioAtivo] • "
                     val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
-                    val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeOriginal", emptyArray())
+                    val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
                     val doc = TdApi.InputMessageDocument(TdApi.InputFileLocal(caminhoLocal), null, false, leg)
                     val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
                     client.send(req) { msgObj ->
@@ -971,7 +1220,7 @@ fun baixarFicheiroDaNuvem(context: Context, client: Client, targetFileId: Int, n
                     try {
                         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                         if (!downloadsDir.exists()) downloadsDir.mkdirs()
-                        val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
+                        val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_${limparPrefixoTimestamp(nomeArquivo)}")
 
                         FileInputStream(File(caminhoRemoto)).use { input ->
                             FileOutputStream(destino).use { output ->
@@ -1138,7 +1387,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
 
-    // Estados do Detetor de Novos Ficheiros nas Pastas de Sincronização (v1.3)
     var novosFicheirosSync by remember { mutableStateOf<List<NovoArquivoSync>>(emptyList()) }
     var selecionadosSync by remember { mutableStateOf<Set<String>>(emptySet()) }
     var showNovosSyncDialog by remember { mutableStateOf(false) }
@@ -1149,7 +1397,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         if (chaveAtiva.isBlank()) emptyList()
         else todosArquivos
             .filter { mapaDonos[it.dataUpload] == chaveAtiva }
-            .distinctBy { "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+            .distinctBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
     }
 
     val pastas = remember(todasPastas, pastasDoUsuarioSet, activeVaultUser) {
@@ -1166,8 +1414,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
     fun verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio: Boolean) {
         scope.launch {
             val chaveAtiva = normalizarUsuario(activeVaultUser)
+            val listaReal = vm.obterArquivosReais()
             val donosAtuais = carregarDonosFicheiros(context)
-            val arquivosAtuaisDoCofre = vm.arquivos.value.filter { donosAtuais[it.dataUpload] == chaveAtiva }
+            val arquivosAtuaisDoCofre = listaReal.filter { donosAtuais[it.dataUpload] == chaveAtiva }
+
+            arquivosAtuaisDoCofre.forEach { arq ->
+                marcarFicheiroComoSincronizado(context, activeVaultUser, arq.nomeArquivo, arq.tamanhoBytes)
+            }
+
             val encontrados = withContext(Dispatchers.IO) {
                 procurarNovosFicheirosNasPastas(context, activeVaultUser, arquivosAtuaisDoCofre)
             }
@@ -1182,7 +1436,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     }
 
     LaunchedEffect(todosArquivos.size, vaultUnlocked) {
-        if (todosArquivos.size > 1) {
+        if (todosArquivos.isNotEmpty()) {
             limparDuplicadosExistentes(context, todosArquivos, vm) {
                 mapaDonos = carregarDonosFicheiros(context)
                 mapaPastas = carregarVinculosPastas(context)
@@ -1192,23 +1446,26 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
-            delay(450)
-            migrarDadosV11SeNecessario(context, activeVaultUser, vm.arquivos.value, vm.pastas.value)
-            limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
+            val arquivosIniciais = vm.obterArquivosReais()
+            val pastasIniciais = vm.obterPastasReais()
+            migrarDadosV11SeNecessario(context, activeVaultUser, arquivosIniciais, pastasIniciais)
+            limparDuplicadosExistentes(context, arquivosIniciais, vm) {}
             mapaDonos = carregarDonosFicheiros(context)
             mapaPastas = carregarVinculosPastas(context)
             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
 
-            sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
+            val aposLimpeza = vm.obterArquivosReais()
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, aposLimpeza, vm) { qtd ->
                 scope.launch(Dispatchers.Main) {
                     if (qtd > 0) {
+                        val atualizados = vm.obterArquivosReais()
+                        limparDuplicadosExistentes(context, atualizados, vm) {}
                         mapaDonos = carregarDonosFicheiros(context)
                         mapaPastas = carregarVinculosPastas(context)
                         pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                         Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados!", Toast.LENGTH_SHORT).show()
                     }
-                    delay(300)
-                    // Verifica automaticamente se existem ficheiros novos nas pastas selecionadas do telemóvel
+                    delay(350)
                     verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
                 }
             }
@@ -1221,6 +1478,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     var fileToRename by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var novoNomeInput by remember { mutableStateOf("") }
+
+    var fileToDelete by remember { mutableStateOf<ArquivoNuvem?>(null) }
+    var isDeletingFile by remember { mutableStateOf(false) }
 
     var searchQuery by remember { mutableStateOf("") }
     var showSearchBar by remember { mutableStateOf(false) }
@@ -1264,7 +1524,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
             for ((index, uri) in uris.withIndex()) {
                 NexusTransfer.progress.value = 10
-                val (nome, tamanho) = obterDetalhesFicheiro(context, uri)
+                val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
+                val nome = limparPrefixoTimestamp(nomeBruto)
                 val loteTag = if (total > 1) "(${index + 1}/$total) " else ""
                 NexusTransfer.label.value = "Enviando $loteTag'$nome'..."
                 cloudBannerText = "Enviando $loteTag'$nome'..."
@@ -1273,6 +1534,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 val miniatura = withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome) }
 
                 if (arqTemp != null) {
+                    val tamFinal = if (tamanho > 0) tamanho else arqTemp.length()
+                    desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
+                    marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
+
                     val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
                     enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, nome, pastaEscolhida) { ok, rId, msg ->
                         deferred.complete(Triple(ok, rId, msg))
@@ -1295,7 +1560,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             ArquivoNuvem(
                                 fileId = rId,
                                 nomeArquivo = nome,
-                                tamanhoBytes = if (tamanho > 0) tamanho else arqTemp.length(),
+                                tamanhoBytes = tamFinal,
                                 dataUpload = ts,
                                 caminhoMiniatura = miniatura
                             )
@@ -1323,18 +1588,25 @@ fun NexusUI(dao: NexusDao, client: Client) {
             var enviados = 0
 
             for ((index, item) in itensParaEnviar.withIndex()) {
+                val nomeLimpo = limparPrefixoTimestamp(item.nome)
+                desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
+                marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
+
                 NexusTransfer.progress.value = 10
                 val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
                 val loteTag = if (total > 1) "(${index + 1}/$total) " else ""
-                NexusTransfer.label.value = "Sincronizando $loteTag'${item.nome}'..."
-                cloudBannerText = "Sincronizando $loteTag'${item.nome}'..."
+                NexusTransfer.label.value = "Sincronizando $loteTag'$nomeLimpo'..."
+                cloudBannerText = "Sincronizando $loteTag'$nomeLimpo'..."
 
-                val arqTemp = withContext(Dispatchers.IO) { copiarUriParaCacheTDLib(context, item.uri, item.nome) }
-                val miniatura = withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, item.nome) }
+                val arqTemp = withContext(Dispatchers.IO) { copiarUriParaCacheTDLib(context, item.uri, nomeLimpo) }
+                val miniatura = withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, nomeLimpo) }
 
                 if (arqTemp != null) {
+                    val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
+                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
+
                     val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, item.nome, pastaAlvo) { ok, rId, msg ->
+                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, nomeLimpo, pastaAlvo) { ok, rId, msg ->
                         deferred.complete(Triple(ok, rId, msg))
                     }
                     val (ok, rId, msg) = deferred.await()
@@ -1354,8 +1626,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         vm.salvarArquivo(
                             ArquivoNuvem(
                                 fileId = rId,
-                                nomeArquivo = item.nome,
-                                tamanhoBytes = if (item.tamanho > 0) item.tamanho else arqTemp.length(),
+                                nomeArquivo = nomeLimpo,
+                                tamanhoBytes = tamFinal,
                                 dataUpload = ts,
                                 caminhoMiniatura = miniatura
                             )
@@ -1696,6 +1968,102 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
+    // JANELA DE CONFIRMAÇÃO PARA DELETAR / REMOVER FICHEIRO (v1.3)
+    if (fileToDelete != null) {
+        val arqD = fileToDelete!!
+        Dialog(onDismissRequest = { if (!isDeletingFile) fileToDelete = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, DangerRed),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.DeleteForever, null, tint = DangerRed, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("REMOVER OU DELETAR?", color = Color.White, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        arqD.nomeArquivo,
+                        color = Gold,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Escolha se deseja apagar também das Mensagens Salvas do Telegram ou remover apenas da galeria do aplicativo.",
+                        color = TextGrey,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(20.dp))
+
+                    Button(
+                        onClick = {
+                            isDeletingFile = true
+                            eliminarFicheiroCompleto(context, client, activeVaultUser, arqD, true, vm) { msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isDeletingFile = false
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    if (viewerFile?.id == arqD.id) viewerFile = null
+                                    fileToDelete = null
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isDeletingFile,
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(50.dp)
+                    ) {
+                        if (isDeletingFile) {
+                            CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                        } else {
+                            Icon(Icons.Default.DeleteForever, null, tint = Color.White)
+                            Spacer(Modifier.width(8.dp))
+                            Text("DELETAR TUDO (APP + NUVEM)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            isDeletingFile = true
+                            eliminarFicheiroCompleto(context, client, activeVaultUser, arqD, false, vm) { msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isDeletingFile = false
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    if (viewerFile?.id == arqD.id) viewerFile = null
+                                    fileToDelete = null
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isDeletingFile,
+                        border = BorderStroke(1.dp, Gold),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Text("REMOVER SÓ DO APP", color = Gold, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { if (!isDeletingFile) fileToDelete = null },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("CANCELAR", color = TextGrey, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
     // JANELA AUTOMÁTICA DE NOVOS FICHEIROS NAS PASTAS DE SINCRONIZAÇÃO (v1.3)
     if (showNovosSyncDialog && novosFicheirosSync.isNotEmpty()) {
         Dialog(onDismissRequest = { showNovosSyncDialog = false }) {
@@ -1872,6 +2240,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                         limpo
                                     }
                                     vm.renomearArquivo(arqR, nomeFinal)
+                                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeFinal, arqR.tamanhoBytes)
                                     if (viewerFile?.dataUpload == arqR.dataUpload) {
                                         viewerFile = arqR.copy(nomeArquivo = nomeFinal)
                                     }
@@ -2092,9 +2461,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                 }
 
-                Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.85f)).padding(16.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.85f)).padding(12.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
-                    Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
                         Text(cur.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
                     }
@@ -2106,6 +2475,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                     IconButton(onClick = { compartilharFicheiroNativo(context, cur.caminhoMiniatura, cur.nomeArquivo) }) {
                         Icon(Icons.Default.Share, contentDescription = "Compartilhar", tint = Gold)
+                    }
+                    IconButton(onClick = { fileToDelete = cur }) {
+                        Icon(Icons.Default.Delete, contentDescription = "Deletar", tint = DangerRed)
                     }
                 }
 
@@ -2257,16 +2629,20 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     label = { Text("Restaurar Cofre da Nuvem") },
                     selected = false,
                     onClick = {
-                        scope.launch { drawerState.close() }
-                        cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem..."
-                        sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
-                            scope.launch(Dispatchers.Main) {
-                                limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
-                                mapaDonos = carregarDonosFicheiros(context)
-                                mapaPastas = carregarVinculosPastas(context)
-                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem!" else "Cofre de $activeVaultUser atualizado!"
-                                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                        scope.launch {
+                            drawerState.close()
+                            cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem..."
+                            val atuaisReais = vm.obterArquivosReais()
+                            sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, vm) { qtd ->
+                                scope.launch(Dispatchers.Main) {
+                                    val aposSync = vm.obterArquivosReais()
+                                    limparDuplicadosExistentes(context, aposSync, vm) {}
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                    cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem!" else "Cofre de $activeVaultUser atualizado!"
+                                    Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                                }
                             }
                         }
                     },
@@ -2464,7 +2840,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent)
                         )
                         ListItem(headlineContent = { Text("Baixar da Nuvem", color = Gold) }, leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) }, modifier = Modifier.clickable { selectedFile = null; baixarFicheiroDaNuvem(context, client, arq.fileId, arq.nomeArquivo) { m -> scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() } } }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
-                        ListItem(headlineContent = { Text("Remover do registo", color = DangerRed) }, leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) }, modifier = Modifier.clickable { salvarVinculoPasta(context, arq.dataUpload, ""); salvarDonoFicheiro(context, arq.dataUpload, ""); mapaPastas = carregarVinculosPastas(context); mapaDonos = carregarDonosFicheiros(context); vm.apagar(arq.id); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(
+                            headlineContent = { Text("Deletar / Remover ficheiro...", color = DangerRed, fontWeight = FontWeight.Bold) },
+                            leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
+                            modifier = Modifier.clickable {
+                                fileToDelete = arq
+                                selectedFile = null
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
                     }
                 }
             }
