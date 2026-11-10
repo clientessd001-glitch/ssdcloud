@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.StrictMode
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.widget.Toast
@@ -62,7 +63,7 @@ import java.util.Locale
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
-const val NEXUS_VERSION = "v1.2"
+const val NEXUS_VERSION = "v1.3"
 
 val BgBlack = Color(0xFF05070A)
 val SurfaceDark = Color(0xFF161A25)
@@ -109,7 +110,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === GESTÃO DE COFRES MULTIUTILIZADOR E ANTI-DUPLICAÇÃO (v1.2) ===
+// === GESTÃO DE COFRES MULTIUTILIZADOR E ANTI-DUPLICAÇÃO ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
 fun obterUltimoUsuarioCofre(context: Context): String {
@@ -214,7 +215,6 @@ fun limparDuplicadosExistentes(
     val donos = carregarDonosFicheiros(context)
     val pastas = carregarVinculosPastas(context)
 
-    // Agrupa por utilizador + nome do ficheiro + tamanho em bytes
     val grupos = todosArquivos.groupBy { arq ->
         val dono = donos[arq.dataUpload] ?: ""
         "${dono}|${arq.nomeArquivo.trim().lowercase(Locale.ROOT)}|${arq.tamanhoBytes}"
@@ -223,7 +223,6 @@ fun limparDuplicadosExistentes(
     var apagouAlgum = false
     for ((_, listaGrupo) in grupos) {
         if (listaGrupo.size > 1) {
-            // Escolhe o registo mais completo (que já tenha miniatura local válida e pasta associada)
             val principal = listaGrupo.sortedWith(
                 compareByDescending<ArquivoNuvem> { miniaturaExisteLocalmente(it.caminhoMiniatura) }
                     .thenByDescending { !pastas[it.dataUpload].isNullOrBlank() }
@@ -414,7 +413,6 @@ fun sincronizarCofreDaNuvem(
                         val donosAtuais = carregarDonosFicheiros(context)
                         val arquivosAtuais = vm.arquivos.value
 
-                        // Conjunto de chaves (nome + tamanho) que já existem para evitar qualquer duplicação
                         val chavesExistentes = arquivosAtuais
                             .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
                             .map { "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
@@ -539,7 +537,110 @@ fun garantirFicheiroLocal(
         }
     }
 }
-// ===============================================
+
+// === DETETOR DE NOVOS FICHEIROS NAS PASTAS SELECIONADAS (v1.3) ===
+data class PastaSync(val uri: String, val nome: String, var ativa: Boolean)
+
+data class NovoArquivoSync(
+    val uri: Uri,
+    val nome: String,
+    val tamanho: Long,
+    val nomePastaOrigem: String
+)
+
+fun carregarPastasSync(context: Context, usuario: String): List<PastaSync> {
+    val sufixo = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE)
+    val lista = mutableListOf<PastaSync>()
+    prefs.all.forEach { (uriStr, ativo) ->
+        if (ativo is Boolean) {
+            val decodedPath = Uri.decode(uriStr)
+            val nome = decodedPath.substringAfterLast(":", "Pasta").substringAfterLast("/")
+            lista.add(PastaSync(uriStr, nome.ifBlank { "Pasta Selecionada" }, ativo))
+        }
+    }
+    return lista
+}
+
+fun salvarPastaSync(context: Context, usuario: String, uri: String, ativa: Boolean) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().putBoolean(uri, ativa).apply()
+}
+
+fun removerPastaSync(context: Context, usuario: String, uri: String) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().remove(uri).apply()
+}
+
+fun procurarNovosFicheirosNasPastas(
+    context: Context,
+    usuarioAtivo: String,
+    arquivosNoCofre: List<ArquivoNuvem>
+): List<NovoArquivoSync> {
+    if (usuarioAtivo.isBlank()) return emptyList()
+    val pastasAtivas = carregarPastasSync(context, usuarioAtivo).filter { it.ativa }
+    if (pastasAtivas.isEmpty()) return emptyList()
+
+    val chavesNoCofre = arquivosNoCofre.map {
+        "${it.nomeArquivo.trim().lowercase(Locale.ROOT)}|${it.tamanhoBytes}"
+    }.toSet()
+    val nomesNoCofre = arquivosNoCofre.map {
+        it.nomeArquivo.trim().lowercase(Locale.ROOT)
+    }.toSet()
+
+    val encontrados = mutableListOf<NovoArquivoSync>()
+    val chavesJaAdicionadas = mutableSetOf<String>()
+
+    for (pasta in pastasAtivas) {
+        try {
+            val treeUri = Uri.parse(pasta.uri)
+            val parentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            )
+
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idxId = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val idxName = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val idxSize = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val idxMime = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+
+                while (cursor.moveToNext()) {
+                    val docId = if (idxId != -1 && !cursor.isNull(idxId)) cursor.getString(idxId) else continue
+                    val nome = if (idxName != -1 && !cursor.isNull(idxName)) cursor.getString(idxName) else continue
+                    val tamanho = if (idxSize != -1 && !cursor.isNull(idxSize)) cursor.getLong(idxSize) else 0L
+                    val mime = if (idxMime != -1 && !cursor.isNull(idxMime)) cursor.getString(idxMime) else ""
+
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                    if (nome.startsWith(".") || tamanho <= 0L) continue
+
+                    val nomeLower = nome.trim().lowercase(Locale.ROOT)
+                    val chave = "$nomeLower|$tamanho"
+
+                    if (!chavesNoCofre.contains(chave) && !nomesNoCofre.contains(nomeLower) && !chavesJaAdicionadas.contains(chave)) {
+                        chavesJaAdicionadas.add(chave)
+                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                        encontrados.add(
+                            NovoArquivoSync(
+                                uri = fileUri,
+                                nome = nome,
+                                tamanho = tamanho,
+                                nomePastaOrigem = pasta.nome
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+    return encontrados
+}
+// =================================================================
 
 fun formatarDataNuvem(timestamp: Long): String {
     if (timestamp <= 0L) return "Data desconhecida"
@@ -572,32 +673,6 @@ fun salvarVinculoPasta(context: Context, dataUpload: Long, nomePasta: String) {
     val prefs = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
     if (nomePasta.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
     else prefs.edit().putString(dataUpload.toString(), nomePasta).apply()
-}
-
-data class PastaSync(val uri: String, val nome: String, var ativa: Boolean)
-
-fun carregarPastasSync(context: Context, usuario: String): List<PastaSync> {
-    val sufixo = normalizarUsuario(usuario)
-    val prefs = context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE)
-    val lista = mutableListOf<PastaSync>()
-    prefs.all.forEach { (uriStr, ativo) ->
-        if (ativo is Boolean) {
-            val decodedPath = Uri.decode(uriStr)
-            val nome = decodedPath.substringAfterLast(":", "Pasta").substringAfterLast("/")
-            lista.add(PastaSync(uriStr, nome.ifBlank { "Pasta Selecionada" }, ativo))
-        }
-    }
-    return lista
-}
-
-fun salvarPastaSync(context: Context, usuario: String, uri: String, ativa: Boolean) {
-    val sufixo = normalizarUsuario(usuario)
-    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().putBoolean(uri, ativa).apply()
-}
-
-fun removerPastaSync(context: Context, usuario: String, uri: String) {
-    val sufixo = normalizarUsuario(usuario)
-    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().remove(uri).apply()
 }
 
 fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
@@ -1063,40 +1138,12 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
     var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
 
-    // Remove automaticamente qualquer ficheiro duplicado na base de dados assim que os dados carregam
-    LaunchedEffect(todosArquivos.size, vaultUnlocked) {
-        if (todosArquivos.size > 1) {
-            limparDuplicadosExistentes(context, todosArquivos, vm) {
-                mapaDonos = carregarDonosFicheiros(context)
-                mapaPastas = carregarVinculosPastas(context)
-            }
-        }
-    }
+    // Estados do Detetor de Novos Ficheiros nas Pastas de Sincronização (v1.3)
+    var novosFicheirosSync by remember { mutableStateOf<List<NovoArquivoSync>>(emptyList()) }
+    var selecionadosSync by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showNovosSyncDialog by remember { mutableStateOf(false) }
+    var organizarPorPastaSync by remember { mutableStateOf(true) }
 
-    LaunchedEffect(vaultUnlocked, activeVaultUser) {
-        if (vaultUnlocked && activeVaultUser.isNotBlank()) {
-            // Aguarda o Room Database carregar a lista local antes de sincronizar com a nuvem
-            delay(450)
-            migrarDadosV11SeNecessario(context, activeVaultUser, vm.arquivos.value, vm.pastas.value)
-            limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
-            mapaDonos = carregarDonosFicheiros(context)
-            mapaPastas = carregarVinculosPastas(context)
-            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-
-            sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
-                if (qtd > 0) {
-                    scope.launch(Dispatchers.Main) {
-                        mapaDonos = carregarDonosFicheiros(context)
-                        mapaPastas = carregarVinculosPastas(context)
-                        pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                        Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados!", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            }
-        }
-    }
-
-    // Filtro com proteção visual extra contra duplicados
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
         if (chaveAtiva.isBlank()) emptyList()
@@ -1114,6 +1161,58 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     val armazenamentoUsuario = remember(arquivos) {
         arquivos.sumOf { it.tamanhoBytes }
+    }
+
+    fun verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio: Boolean) {
+        scope.launch {
+            val chaveAtiva = normalizarUsuario(activeVaultUser)
+            val donosAtuais = carregarDonosFicheiros(context)
+            val arquivosAtuaisDoCofre = vm.arquivos.value.filter { donosAtuais[it.dataUpload] == chaveAtiva }
+            val encontrados = withContext(Dispatchers.IO) {
+                procurarNovosFicheirosNasPastas(context, activeVaultUser, arquivosAtuaisDoCofre)
+            }
+            if (encontrados.isNotEmpty()) {
+                novosFicheirosSync = encontrados
+                selecionadosSync = encontrados.map { it.uri.toString() }.toSet()
+                showNovosSyncDialog = true
+            } else if (mostrarAvisoSeVazio) {
+                Toast.makeText(context, "Nenhum ficheiro novo nas pastas selecionadas.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    LaunchedEffect(todosArquivos.size, vaultUnlocked) {
+        if (todosArquivos.size > 1) {
+            limparDuplicadosExistentes(context, todosArquivos, vm) {
+                mapaDonos = carregarDonosFicheiros(context)
+                mapaPastas = carregarVinculosPastas(context)
+            }
+        }
+    }
+
+    LaunchedEffect(vaultUnlocked, activeVaultUser) {
+        if (vaultUnlocked && activeVaultUser.isNotBlank()) {
+            delay(450)
+            migrarDadosV11SeNecessario(context, activeVaultUser, vm.arquivos.value, vm.pastas.value)
+            limparDuplicadosExistentes(context, vm.arquivos.value, vm) {}
+            mapaDonos = carregarDonosFicheiros(context)
+            mapaPastas = carregarVinculosPastas(context)
+            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, vm) { qtd ->
+                scope.launch(Dispatchers.Main) {
+                    if (qtd > 0) {
+                        mapaDonos = carregarDonosFicheiros(context)
+                        mapaPastas = carregarVinculosPastas(context)
+                        pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                        Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados!", Toast.LENGTH_SHORT).show()
+                    }
+                    delay(300)
+                    // Verifica automaticamente se existem ficheiros novos nas pastas selecionadas do telemóvel
+                    verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
+                }
+            }
+        }
     }
 
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -1186,6 +1285,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         salvarDonoFicheiro(context, ts, activeVaultUser)
                         mapaDonos = carregarDonosFicheiros(context)
                         if (pastaEscolhida.isNotBlank()) {
+                            vm.criarPasta(pastaEscolhida)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                             salvarVinculoPasta(context, ts, pastaEscolhida)
                             mapaPastas = carregarVinculosPastas(context)
                         }
@@ -1213,6 +1315,63 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
+    fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
+        if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
+        scope.launch {
+            isUploading = true
+            val total = itensParaEnviar.size
+            var enviados = 0
+
+            for ((index, item) in itensParaEnviar.withIndex()) {
+                NexusTransfer.progress.value = 10
+                val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
+                val loteTag = if (total > 1) "(${index + 1}/$total) " else ""
+                NexusTransfer.label.value = "Sincronizando $loteTag'${item.nome}'..."
+                cloudBannerText = "Sincronizando $loteTag'${item.nome}'..."
+
+                val arqTemp = withContext(Dispatchers.IO) { copiarUriParaCacheTDLib(context, item.uri, item.nome) }
+                val miniatura = withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, item.nome) }
+
+                if (arqTemp != null) {
+                    val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
+                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, item.nome, pastaAlvo) { ok, rId, msg ->
+                        deferred.complete(Triple(ok, rId, msg))
+                    }
+                    val (ok, rId, msg) = deferred.await()
+                    cloudBannerText = msg
+                    if (ok) {
+                        enviados++
+                        val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        mapaDonos = carregarDonosFicheiros(context)
+                        if (pastaAlvo.isNotBlank()) {
+                            vm.criarPasta(pastaAlvo)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                            salvarVinculoPasta(context, ts, pastaAlvo)
+                            mapaPastas = carregarVinculosPastas(context)
+                        }
+                        vm.salvarArquivo(
+                            ArquivoNuvem(
+                                fileId = rId,
+                                nomeArquivo = item.nome,
+                                tamanhoBytes = if (item.tamanho > 0) item.tamanho else arqTemp.length(),
+                                dataUpload = ts,
+                                caminhoMiniatura = miniatura
+                            )
+                        )
+                    }
+                }
+                delay(120)
+            }
+
+            isUploading = false
+            NexusTransfer.progress.value = null
+            cloudBannerText = "$enviados novo(s) ficheiro(s) sincronizados com sucesso!"
+            Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+        }
+    }
+
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
             uris.forEach { u ->
@@ -1230,6 +1389,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 salvarPastaSync(context, activeVaultUser, it.toString(), true)
                 pastasSync = carregarPastasSync(context, activeVaultUser)
+                verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
             } catch (e: Exception) {
                 Toast.makeText(context, "Erro ao guardar permissão da pasta.", Toast.LENGTH_SHORT).show()
             }
@@ -1272,7 +1432,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
-    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (v1.2)
+    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN
     if (!vaultUnlocked) {
         Column(
             modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
@@ -1534,6 +1694,138 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
         }
         return
+    }
+
+    // JANELA AUTOMÁTICA DE NOVOS FICHEIROS NAS PASTAS DE SINCRONIZAÇÃO (v1.3)
+    if (showNovosSyncDialog && novosFicheirosSync.isNotEmpty()) {
+        Dialog(onDismissRequest = { showNovosSyncDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp)
+            ) {
+                Column(Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, null, tint = Gold, modifier = Modifier.size(28.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("NOVOS FICHEIROS", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                            Text(
+                                "${novosFicheirosSync.size} ficheiro(s) novo(s) nas pastas sincronizadas",
+                                color = TextGrey,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = {
+                            selecionadosSync = if (selecionadosSync.size == novosFicheirosSync.size) {
+                                emptySet()
+                            } else {
+                                novosFicheirosSync.map { it.uri.toString() }.toSet()
+                            }
+                        }) {
+                            Text(
+                                if (selecionadosSync.size == novosFicheirosSync.size) "Desmarcar todos" else "Selecionar todos",
+                                color = Gold,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = organizarPorPastaSync,
+                                onCheckedChange = { organizarPorPastaSync = it },
+                                colors = CheckboxDefaults.colors(checkedColor = Gold, checkmarkColor = BgBlack)
+                            )
+                            Text("Manter pasta", color = Color.White, fontSize = 11.sp)
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .fillMaxWidth()
+                            .background(SurfaceDark, RoundedCornerShape(12.dp))
+                            .padding(8.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        novosFicheirosSync.forEach { item ->
+                            val chaveUri = item.uri.toString()
+                            val marcado = selecionadosSync.contains(chaveUri)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selecionadosSync = if (marcado) selecionadosSync - chaveUri else selecionadosSync + chaveUri
+                                    }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = marcado,
+                                    onCheckedChange = {
+                                        selecionadosSync = if (it) selecionadosSync + chaveUri else selecionadosSync - chaveUri
+                                    },
+                                    colors = CheckboxDefaults.colors(checkedColor = Gold, checkmarkColor = BgBlack)
+                                )
+                                Column(Modifier.weight(1f).padding(start = 6.dp)) {
+                                    Text(
+                                        item.nome,
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        "📁 ${item.nomePastaOrigem} • ${formatarTamanhoNuvem(item.tamanho)}",
+                                        color = TextGrey,
+                                        fontSize = 10.sp,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { showNovosSyncDialog = false },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f).height(48.dp)
+                        ) {
+                            Text("AGORA NÃO", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                val escolhidos = novosFicheirosSync.filter { selecionadosSync.contains(it.uri.toString()) }
+                                showNovosSyncDialog = false
+                                executarUploadsNovosSync(escolhidos, organizarPorPastaSync)
+                            },
+                            enabled = selecionadosSync.isNotEmpty(),
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1.3f).height(48.dp)
+                        ) {
+                            Text(
+                                "UPLOAD (${selecionadosSync.size})",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     if (fileToRename != null) {
@@ -2219,11 +2511,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
             if (showSync) {
                 Dialog(onDismissRequest = { showSync = false }) {
-                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().heightIn(max = 500.dp)) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().heightIn(max = 540.dp)) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
                             Text("BACKUP AUTOMÁTICO ($activeVaultUser)", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(8.dp))
-                            Text("Selecione as pastas do dispositivo que deseja sincronizar com este cofre.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Text("Ao abrir o cofre, a app verifica estas pastas e mostra os ficheiros novos para upload.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
                             Spacer(Modifier.height(16.dp))
 
                             if (pastasSync.isEmpty()) {
@@ -2249,13 +2541,28 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
 
                             Spacer(Modifier.height(16.dp))
-                            OutlinedButton(onClick = { folderPicker.launch(null) }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                            OutlinedButton(onClick = { folderPicker.launch(null) }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(46.dp)) {
                                 Icon(Icons.Default.CreateNewFolder, null, tint = Gold)
                                 Spacer(Modifier.width(8.dp))
-                                Text("ADICIONAR PASTA", color = Gold, fontWeight = FontWeight.Bold)
+                                Text("ADICIONAR PASTA", color = Gold, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                            if (pastasSync.any { it.ativa }) {
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = {
+                                        showSync = false
+                                        verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = true)
+                                    },
+                                    border = BorderStroke(1.dp, Color.White),
+                                    modifier = Modifier.fillMaxWidth().height(46.dp)
+                                ) {
+                                    Icon(Icons.Default.Search, null, tint = Color.White)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("PROCURAR NOVOS AGORA", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
                             }
                             Spacer(Modifier.height(8.dp))
-                            Button(onClick = { showSync = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(48.dp)) {
+                            Button(onClick = { showSync = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(46.dp)) {
                                 Text("CONCLUÍDO", color = Color.White, fontWeight = FontWeight.Bold)
                             }
                         }
