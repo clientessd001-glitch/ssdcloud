@@ -8,14 +8,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
-import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.widget.MediaController
 import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -80,7 +79,7 @@ data class CloudFileItem(
     val fileId: Int,
     val name: String,
     val size: Long,
-    val dateTimestamp: Long, // Segundos ou Millis para agrupamento por data
+    val dateTimestamp: Long,
     val category: FileCategory,
     val folderName: String,
     val localPath: String,
@@ -94,7 +93,7 @@ data class VaultProfile(
     val pin: String
 )
 
-// Formatador de Data no padrão da imagem ("9 de nov. de 2026")
+// Formatador de Data no padrão "9 de nov. de 2026"
 fun formatarDataCabecalho(timestamp: Long): String {
     val millis = if (timestamp < 10000000000L) timestamp * 1000L else timestamp
     val localeBr = Locale("pt", "BR")
@@ -111,11 +110,16 @@ fun formatarTamanho(bytes: Long): String {
 
 // ============================================================================
 // COMPONENTE PRINCIPAL: NEXUS UI v1.5
+// Aceita até 3 argumentos opcionais para compatibilidade total com NexusApp.kt
 // ============================================================================
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun NexusUI() {
+fun NexusUI(
+    arg0: Any? = null,
+    arg1: Any? = null,
+    arg2: Any? = null
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val prefs = remember { context.getSharedPreferences("ssd_nexus_prefs_v15", Context.MODE_PRIVATE) }
@@ -134,7 +138,7 @@ fun NexusUI() {
     var vaultError by remember { mutableStateOf("") }
 
     // Estados de Autenticação Nuvem SSD (Motor TDLib)
-    var client by remember { mutableStateOf<Client?>(null) }
+    var client by remember { mutableStateOf<Client?>(arg0 as? Client) }
     var authState by remember { mutableStateOf("AGUARDANDO_COFRE") }
     var phoneInput by remember { mutableStateOf("") }
     var codeInput by remember { mutableStateOf("") }
@@ -175,7 +179,10 @@ fun NexusUI() {
         if (!customFolders.contains("Geral")) customFolders.add(0, "Geral")
 
         autoSyncEnabled = prefs.getBoolean("autosync_${vault.id}", false)
-        syncLocalDirPath = prefs.getString("syncdir_${vault.id}", Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).absolutePath) ?: ""
+        syncLocalDirPath = prefs.getString(
+            "syncdir_${vault.id}",
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM).absolutePath
+        ) ?: ""
     }
 
     fun salvarPastasCofre() {
@@ -220,7 +227,6 @@ fun NexusUI() {
             }
         }
 
-        // Isolamento por Cofre: só exibe se pertencer ao cofre atual ou se for legado sem tag no cofre padrão
         if (caption.contains("[VAULT:") && !caption.contains(vaultTag)) return
 
         val folderRegex = Regex("\\[FOLDER:(.*?)]")
@@ -253,7 +259,6 @@ fun NexusUI() {
             } else {
                 cloudFiles.add(item)
             }
-            // Se for foto ou vídeo e ainda não tiver baixado localmente, solicita download automático para miniatura rápida
             if (!isDownloaded && f.local?.isDownloadingActive == false) {
                 client?.send(TdApi.DownloadFile(f.id, 1, 0, 0, false)) {}
             }
@@ -289,14 +294,14 @@ fun NexusUI() {
         val novoClient = Client.create({ update ->
             when (update) {
                 is TdApi.UpdateAuthorizationState -> {
-                    when (val state = update.authorizationState) {
+                    when (update.authorizationState) {
                         is TdApi.AuthorizationStateWaitTdlibParameters -> {
                             val params = TdApi.SetTdlibParameters().apply {
                                 databaseDirectory = dbDir
                                 filesDirectory = filesDir
                                 useMessageDatabase = true
                                 useSecretChats = false
-                                apiId = 94575 // Substitua pelo seu apiId se usar credencial própria no projeto
+                                apiId = 94575
                                 apiHash = "a3406de8d171bb422bb6ddf3bbd800e2"
                                 systemLanguageCode = "pt"
                                 deviceModel = Build.MODEL
@@ -353,7 +358,7 @@ fun NexusUI() {
         client = novoClient
     }
 
-    // Função de Upload de Arquivo para a Nuvem SSD
+    // Função de Upload de Arquivo para a Nuvem SSD (Compatível com qualquer versão da TDLib)
     fun enviarArquivoParaNuvem(file: File, targetFolder: String) {
         val c = client ?: return
         val vault = activeVault ?: return
@@ -365,26 +370,32 @@ fun NexusUI() {
 
         val inputContent: TdApi.InputMessageContent = when {
             lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") -> {
-                TdApi.InputMessagePhoto(
-                    TdApi.InputFileLocal(file.absolutePath),
-                    null, IntArray(0), 0, 0, formattedCaption, false, null, false
-                )
+                TdApi.InputMessagePhoto().apply {
+                    photo = TdApi.InputFileLocal(file.absolutePath)
+                    caption = formattedCaption
+                }
             }
             lower.endsWith(".mp4") || lower.endsWith(".mov") || lower.endsWith(".mkv") -> {
-                TdApi.InputMessageVideo(
-                    TdApi.InputFileLocal(file.absolutePath),
-                    null, null, 0, IntArray(0), 0, 0, 0, true, formattedCaption, false, null, false
-                )
+                TdApi.InputMessageVideo().apply {
+                    video = TdApi.InputFileLocal(file.absolutePath)
+                    supportsStreaming = true
+                    caption = formattedCaption
+                }
             }
             else -> {
-                TdApi.InputMessageDocument(
-                    TdApi.InputFileLocal(file.absolutePath),
-                    null, false, formattedCaption
-                )
+                TdApi.InputMessageDocument().apply {
+                    document = TdApi.InputFileLocal(file.absolutePath)
+                    caption = formattedCaption
+                }
             }
         }
 
-        c.send(TdApi.SendMessage(savedMessagesChatId, 0, null, null, null, inputContent)) { res ->
+        val sendReq = TdApi.SendMessage().apply {
+            chatId = savedMessagesChatId
+            inputMessageContent = inputContent
+        }
+
+        c.send(sendReq) { res ->
             if (res is TdApi.Message) {
                 processarMensagemNuvem(res)
             }
@@ -422,7 +433,7 @@ fun NexusUI() {
                         }
                     }
                 }
-                delay(15000L) // Verifica a cada 15 segundos
+                delay(15000L)
             }
         }
     }
@@ -576,7 +587,6 @@ fun NexusUI() {
                                 val vaultId = cleanName.lowercase().replace(" ", "_")
                                 val savedPin = prefs.getString("pin_$vaultId", null)
                                 if (savedPin == null) {
-                                    // Cria novo cofre
                                     prefs.edit().putString("pin_$vaultId", cleanPin).apply()
                                     val novo = VaultProfile(vaultId, cleanName, cleanPin)
                                     activeVault = novo
@@ -789,7 +799,6 @@ fun NexusUI() {
                     },
                     actions = {
                         IconButton(onClick = {
-                            // Selecionar todos da visão atual
                             val todosIds = cloudFiles.map { it.messageId }
                             selectedIds.clear()
                             selectedIds.addAll(todosIds)
@@ -827,7 +836,8 @@ fun NexusUI() {
                             Icon(Icons.Default.Refresh, contentDescription = "Atualizar", tint = textPrimary)
                         }
                         IconButton(onClick = {
-                            client?.close()
+                            // Encerra a instância TDLib de forma segura
+                            client?.send(TdApi.Close()) {}
                             client = null
                             cloudFiles.clear()
                             selectedIds.clear()
@@ -894,7 +904,6 @@ fun NexusUI() {
                 // ABA 0: GALERIA ULTRA FLUIDA COM DATAS AGRUPADAS NO TOPO
                 // ============================================================
                 0 -> {
-                    // Barra de Pesquisa Rápida
                     OutlinedTextField(
                         value = searchQuery,
                         onValueChange = { searchQuery = it },
@@ -920,7 +929,6 @@ fun NexusUI() {
                         )
                     )
 
-                    // Filtro horizontal de Pastas
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -941,7 +949,7 @@ fun NexusUI() {
                         }
                     }
 
-                    // Pré-processamento em memória com remember() para rolagem a 60/120 FPS sem travar
+                    // Agrupamento com remember() para rolagem rápida sem travamentos
                     val arquivosAgrupadosPorData = remember(cloudFiles.toList(), selectedFolder, searchQuery) {
                         cloudFiles
                             .filter { item ->
@@ -970,7 +978,7 @@ fun NexusUI() {
                         ) {
                             arquivosAgrupadosPorData.forEach { (dataCabecalho, arquivosDoDia) ->
 
-                                // CABEÇALHO DA DATA (Ex: "9 de nov. de 2026" em cima das fotos do dia)
+                                // CABEÇALHO DA DATA ("9 de nov. de 2026")
                                 item(
                                     key = "header_$dataCabecalho",
                                     span = { GridItemSpan(maxLineSpan) },
@@ -987,7 +995,7 @@ fun NexusUI() {
                                     )
                                 }
 
-                                // MINIATURAS DO DIA (Com chave única e downsampling 280x280 RGB_565 para não travar)
+                                // MINIATURAS DO DIA (Com chave única e downsampling 280x280 RGB_565)
                                 items(
                                     items = arquivosDoDia,
                                     key = { it.messageId },
@@ -1357,7 +1365,6 @@ fun NexusUI() {
                         if (idx >= 0) customFolders[idx] = novoNome
                         salvarPastasCofre()
 
-                        // Atualiza os arquivos da pasta localmente
                         for (i in cloudFiles.indices) {
                             if (cloudFiles[i].folderName == pastaAntiga) {
                                 cloudFiles[i] = cloudFiles[i].copy(folderName = novoNome)
@@ -1390,7 +1397,6 @@ fun NexusUI() {
             },
             confirmButton = {
                 TextButton(onClick = {
-                    // Mover arquivos para Geral
                     for (i in cloudFiles.indices) {
                         if (cloudFiles[i].folderName == pastaParaExcluir) {
                             cloudFiles[i] = cloudFiles[i].copy(folderName = "Geral")
@@ -1406,7 +1412,6 @@ fun NexusUI() {
             },
             dismissButton = {
                 TextButton(onClick = {
-                    // Excluir arquivos da nuvem e a pasta
                     val ids = cloudFiles.filter { it.folderName == pastaParaExcluir }.map { it.messageId }.toLongArray()
                     if (ids.isNotEmpty()) {
                         client?.send(TdApi.DeleteMessages(savedMessagesChatId, ids, true)) {}
@@ -1439,7 +1444,6 @@ fun MiniaturaOtimizadaGrid(
 ) {
     val context = LocalContext.current
 
-    // Redimensiona a imagem na memória para 280x280 em RGB_565: elimina qualquer lentidão ao rolar muitas fotos!
     val imageRequest = remember(item.localPath, item.isDownloaded) {
         if (item.isDownloaded && item.localPath.isNotEmpty()) {
             ImageRequest.Builder(context)
@@ -1471,7 +1475,6 @@ fun MiniaturaOtimizadaGrid(
                 modifier = Modifier.fillMaxSize()
             )
         } else {
-            // Ícone para Documentos/PDFs ou mídia aguardando download
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -1502,7 +1505,6 @@ fun MiniaturaOtimizadaGrid(
             }
         }
 
-        // Indicador de Vídeo
         if (item.category == FileCategory.VIDEO) {
             Box(
                 modifier = Modifier
@@ -1520,7 +1522,6 @@ fun MiniaturaOtimizadaGrid(
             }
         }
 
-        // Sobreposição de Seleção Múltipla em Lote
         if (isSelected) {
             Box(
                 modifier = Modifier
@@ -1613,7 +1614,6 @@ fun VisualizadorInternoTelaCheia(
             } else {
                 when (item.category) {
                     FileCategory.PHOTO -> {
-                        // Imagem em Alta Resolução com Zoom Pinça Interativo
                         AsyncImage(
                             model = File(item.localPath),
                             contentDescription = item.name,
@@ -1642,7 +1642,6 @@ fun VisualizadorInternoTelaCheia(
                     }
 
                     FileCategory.VIDEO -> {
-                        // Player de Vídeo Interno com Controles de Pausa e Avanço Rápido
                         AndroidView(
                             factory = { ctx ->
                                 VideoView(ctx).apply {
@@ -1661,7 +1660,6 @@ fun VisualizadorInternoTelaCheia(
                         if (item.name.lowercase().endsWith(".pdf")) {
                             LeitorPdfInterno(file = File(item.localPath))
                         } else {
-                            // Leitor de Texto / Informações do Documento
                             val textoConteudo = remember(item.localPath) {
                                 runCatching {
                                     File(item.localPath).takeIf { it.length() < 500_000 }?.readText()
@@ -1742,7 +1740,7 @@ fun copiarUriParaArquivoLocal(context: Context, uri: Uri): File? {
         val contentResolver = context.contentResolver
         var fileName = "SSD_${System.currentTimeMillis()}"
         contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex( android.provider.OpenableColumns.DISPLAY_NAME)
+            val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             if (cursor.moveToFirst() && nameIndex >= 0) {
                 fileName = cursor.getString(nameIndex)
             }
