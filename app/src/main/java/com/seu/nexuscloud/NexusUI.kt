@@ -94,14 +94,12 @@ val Gold = Color(0xFFFFD700)
 val DangerRed = Color(0xFFE53935)
 val TextGrey = Color(0xFFA0AABF)
 
-// Mascara o número SSD visualmente com asteriscos
 fun mascararNumeroComAsterisco(numero: String): String {
     val limpo = numero.trim()
     if (limpo.isEmpty()) return "********"
     return "*".repeat(limpo.length.coerceAtLeast(8))
 }
 
-// === CONTROLADOR DE DOWNLOAD E ENVIO COM CANCELAMENTO IMEDIATO E PAUSA REAL ===
 object NexusTransfer {
     val progress = MutableStateFlow<Int?>(null)
     val label = MutableStateFlow("")
@@ -151,7 +149,6 @@ object NexusTransfer {
         }
     }
 
-    // Cancela imediatamente a Coroutine ativa, interrompe o TDLib e apaga resíduos
     fun cancelar(client: Client? = null) {
         cancelado.value = true
         pausado.value = false
@@ -190,7 +187,6 @@ object NexusTransfer {
             if (temp != null && temp.exists()) temp.delete()
         } catch (_: Exception) {}
 
-        // Limpa a barra visual mantendo cancelado.value = true até o próximo iniciar()
         progress.value = null
         label.value = ""
         fileIdAtivo.value = 0
@@ -212,7 +208,6 @@ object NexusTransfer {
     }
 }
 
-// === CONTROLADOR DE BARRA DE LEITURA E CONTADOR DE ARQUIVOS NA NUVEM ===
 object NexusLeituraNuvem {
     val ativo = MutableStateFlow(false)
     val lidos = MutableStateFlow(0)
@@ -285,13 +280,11 @@ object NexusLeituraNuvem {
     }
 }
 
-// === CACHE TURBO DE MINIATURAS (.JPG) E GESTOR DE CACHE DO SSD NEXUS ===
 object NexusThumbCache {
     val mapaMiniaturas = mutableStateMapOf<Long, String>()
     val mapaArquivosCompletos = mutableStateMapOf<Long, String>()
     val mapaThumbIdsNuvem = mutableStateMapOf<Int, Int>()
     val mapaThumbIdsPorData = mutableStateMapOf<Long, Int>()
-    // 8 canais simultâneos para carregar fotos da galeria muito mais rápido
     val downloadSemaphore = Semaphore(8)
     val emProgresso = Collections.synchronizedSet(mutableSetOf<Long>())
     val falhasRecentes = Collections.synchronizedMap(mutableMapOf<Long, Long>())
@@ -633,7 +626,6 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM VELOCIDADE OTIMIZADA (80ms) E CANCELAMENTO ===
 suspend fun obterInfoArquivoTDLib(client: Client, fileId: Int): TdApi.File? {
     if (fileId == 0) return null
     val def = CompletableDeferred<TdApi.File?>()
@@ -825,7 +817,6 @@ suspend fun aguardarUploadTDLibComPausa(
     return !NexusTransfer.cancelado.value
 }
 
-// Recupera fileId e thumbId usando cache em memória e busca rápida por nome (sem travar a fila de fotos)
 suspend fun recuperarFileIdNaNuvemPorNome(
     client: Client,
     usuarioAtivo: String,
@@ -858,7 +849,6 @@ suspend fun recuperarFileIdNaNuvemPorNome(
         return null
     }
 
-    // 1. Verifica instantaneamente no cache em memória se foi atualizado há menos de 60s
     if (NexusThumbCache.cacheMensagensNuvem.isNotEmpty() &&
         System.currentTimeMillis() - NexusThumbCache.timestampCacheMensagens < 60_000L
     ) {
@@ -866,7 +856,6 @@ suspend fun recuperarFileIdNaNuvemPorNome(
         if (achouCache != null) return achouCache
     }
 
-    // 2. Faz busca direta pelo nome do arquivo no servidor (1 única chamada rápida)
     val def = CompletableDeferred<Pair<Int, Int>>()
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
@@ -892,7 +881,6 @@ suspend fun recuperarFileIdNaNuvemPorNome(
     return def.await()
 }
 
-// === GESTÃO DE COFRES MULTIUTILIZADOR, PASTAS E EXCLUSÃO ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
 fun obterUltimoUsuarioCofre(context: Context): String {
@@ -1448,7 +1436,6 @@ fun buscarHistoricoPaginado(
     }
 }
 
-// Sincroniza silenciosamente os registos de cofre da nuvem em segundo plano (SEM exibir os nomes na tela)
 fun descobrirPerfisExistentesNaNuvem(
     context: Context,
     client: Client,
@@ -1484,7 +1471,6 @@ fun descobrirPerfisExistentesNaNuvem(
                                             nomesEncontrados[chave] = exibicao
                                         }
                                         if (!pinPart.isNullOrBlank()) {
-                                            // Salva apenas o PIN internamente sem definir active_user para manter tudo oculto
                                             salvarCredenciaisCofreLocal(context, exibicao, pinPart, definirComoAtivo = false)
                                         }
                                     }
@@ -1872,7 +1858,6 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO COM BARRA DE CONTAGEM DE ARQUIVOS NA NUVEM ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -1934,7 +1919,6 @@ fun sincronizarCofreDaNuvem(
                                 val thumbId = thumbObj?.id ?: 0
                                 val thumbPathLocal = thumbObj?.local?.path ?: ""
 
-                                // Dispara pré-download assíncrono imediato da miniatura leve no TDLib
                                 if (thumbId != 0 && thumbPathLocal.isBlank()) {
                                     client.send(TdApi.DownloadFile().apply {
                                         this.fileId = thumbId
@@ -2058,7 +2042,6 @@ fun sincronizarCofreDaNuvem(
     }
 }
 
-// === FILA TURBO DE CARREGAMENTO DE MINIATURAS EM SEGUNDO PLANO ===
 suspend fun carregarMiniaturaIndividualDaNuvem(
     context: Context,
     client: Client,
@@ -2072,7 +2055,6 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
         return@withContext jaTem
     }
 
-    // Evita repetir tentativas seguidas no mesmo segundo em arquivo indisponível
     val ultimaFalha = NexusThumbCache.falhasRecentes[arq.dataUpload] ?: 0L
     if (System.currentTimeMillis() - ultimaFalha < 15_000L) {
         return@withContext ""
@@ -2111,7 +2093,6 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
 
     var miniaturaPronta = ""
 
-    // 1. Prioridade máxima para a miniatura leve (~15KB), baixando em milissegundos
     if (thumbIdLeve != 0) {
         val arqThumb = baixarArquivoTDLibAssincrono(
             client = client,
@@ -2129,7 +2110,6 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
         }
     }
 
-    // 2. Fallback para arquivo completo (se a foto/vídeo não tinha thumb leve ou precisava clarear capa)
     val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
     val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) ||
         ehArquivoVideo(arq.nomeArquivo) ||
@@ -2165,7 +2145,6 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     return@withContext miniaturaPronta
 }
 
-// === ABERTURA E DOWNLOAD DE FICHEIROS COM CANCELAMENTO IMEDIATO E PAUSA ===
 fun garantirFicheiroLocal(
     context: Context,
     client: Client,
@@ -2290,7 +2269,6 @@ fun garantirFicheiroLocal(
     NexusTransfer.jobAtivo = novoJob
 }
 
-// === DETETOR DE NOVOS FICHEIROS NAS PASTAS SELECIONADAS ===
 data class PastaSync(val uri: String, val nome: String, var ativa: Boolean)
 
 data class NovoArquivoSync(
@@ -2834,7 +2812,11 @@ fun enviarParaMensagensSalvas(
     } else caminhoCapaJpg
 
     val inputThumb = if (pathThumbLimpo.isNotBlank() && File(pathThumbLimpo).exists() && File(pathThumbLimpo).length() > 256L) {
-        TdApi.InputThumbnail(TdApi.InputFileLocal(pathThumbLimpo), 320, 320)
+        TdApi.InputThumbnail().apply {
+            thumbnail = TdApi.InputFileLocal(pathThumbLimpo)
+            width = 320
+            height = 320
+        }
     } else null
 
     client.send(TdApi.GetMe()) { meObj ->
@@ -2843,14 +2825,21 @@ fun enviarParaMensagensSalvas(
                 if (chatObj is TdApi.Chat) {
                     if (NexusTransfer.cancelado.value) {
                         onResult(false, 0, "Envio cancelado.")
-                        return@CreatePrivateChat
+                        return@send
                     }
                     NexusTransfer.chatIdAtivo = chatObj.id
                     val userTag = "👤 [$usuarioAtivo] • "
                     val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
                     val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
-                    val doc = TdApi.InputMessageDocument(TdApi.InputFileLocal(caminhoLocal), inputThumb, false, leg)
-                    val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
+                    val doc = TdApi.InputMessageDocument().apply {
+                        document = TdApi.InputFileLocal(caminhoLocal)
+                        thumbnail = inputThumb
+                        caption = leg
+                    }
+                    val req = TdApi.SendMessage().apply {
+                        chatId = chatObj.id
+                        inputMessageContent = doc
+                    }
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
@@ -2860,7 +2849,6 @@ fun enviarParaMensagensSalvas(
                                 NexusTransfer.msgIdAtivo = msgObj.id
                                 NexusTransfer.fileIdAtivo.value = rId
 
-                                // Se o usuário apertou cancelar enquanto a mensagem estava sendo criada, apaga na hora
                                 if (NexusTransfer.cancelado.value) {
                                     if (rId != 0) client.send(TdApi.DeleteFile().apply { fileId = rId }) {}
                                     client.send(TdApi.DeleteMessages().apply {
@@ -2869,7 +2857,7 @@ fun enviarParaMensagensSalvas(
                                         this.revoke = true
                                     }) {}
                                     onResult(false, 0, "Envio cancelado.")
-                                    return@SendMessage
+                                    return@send
                                 }
 
                                 registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
@@ -2925,7 +2913,6 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS AGRUPADA POR DATA, OTIMIZADA PARA CARREGAMENTO RÁPIDO ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -3180,9 +3167,8 @@ fun GrelhaArquivos(
         }
     }
 }
-// === FIM DA PARTE 1 (ENVIE "parte 2" PARA RECEBER O RESTANTE DO CÓDIGO) ===
+// === FIM DA PARTE 1 (MANTENHA A PARTE 2 LOGO ABAIXO) ===
 // === CONTINUAÇÃO: PARTE 2 DE 2 (COLE LOGO ABAIXO DA PARTE 1) ===
-
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
