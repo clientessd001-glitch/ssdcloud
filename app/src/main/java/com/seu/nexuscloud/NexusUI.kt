@@ -100,6 +100,7 @@ fun mascararNumeroComAsterisco(numero: String): String {
     return "*".repeat(limpo.length.coerceAtLeast(8))
 }
 
+// === CONTROLADOR DE DOWNLOAD E ENVIO COM CANCELAMENTO IMEDIATO E PAUSA REAL ===
 object NexusTransfer {
     val progress = MutableStateFlow<Int?>(null)
     val label = MutableStateFlow("")
@@ -208,6 +209,7 @@ object NexusTransfer {
     }
 }
 
+// === CONTROLADOR DE BARRA DE LEITURA E CONTADOR DE ARQUIVOS NA NUVEM ===
 object NexusLeituraNuvem {
     val ativo = MutableStateFlow(false)
     val lidos = MutableStateFlow(0)
@@ -280,6 +282,7 @@ object NexusLeituraNuvem {
     }
 }
 
+// === CACHE TURBO DE MINIATURAS (.JPG) E GESTOR DE CACHE DO SSD NEXUS ===
 object NexusThumbCache {
     val mapaMiniaturas = mutableStateMapOf<Long, String>()
     val mapaArquivosCompletos = mutableStateMapOf<Long, String>()
@@ -2792,6 +2795,70 @@ fun copiarLoteParaDownloads(
     }
 }
 
+// Construtor universal compatível com TdApi.InputDocument e TdApi.InputFileLocal
+fun criarInputMessageDocumentCompativel(
+    caminhoLocal: String,
+    pathThumbLimpo: String,
+    legenda: TdApi.FormattedText
+): TdApi.InputMessageDocument {
+    val fileLocal = TdApi.InputFileLocal(caminhoLocal)
+    val inputThumb = if (pathThumbLimpo.isNotBlank() && File(pathThumbLimpo).exists() && File(pathThumbLimpo).length() > 256L) {
+        TdApi.InputThumbnail(TdApi.InputFileLocal(pathThumbLimpo), 320, 320)
+    } else null
+
+    val msgDoc = TdApi.InputMessageDocument()
+    try {
+        val capField = msgDoc.javaClass.getDeclaredField("caption")
+        capField.isAccessible = true
+        capField.set(msgDoc, legenda)
+    } catch (_: Exception) {}
+
+    try {
+        val thumbField = msgDoc.javaClass.getDeclaredField("thumbnail")
+        thumbField.isAccessible = true
+        thumbField.set(msgDoc, inputThumb)
+    } catch (_: Exception) {}
+
+    try {
+        val docField = msgDoc.javaClass.getDeclaredField("document")
+        docField.isAccessible = true
+        if (docField.type.isAssignableFrom(fileLocal.javaClass)) {
+            docField.set(msgDoc, fileLocal)
+        } else {
+            val inputDocClass = docField.type
+            var instanciaInputDoc: Any? = null
+            for (ctor in inputDocClass.constructors) {
+                val params = ctor.parameterTypes
+                try {
+                    if (params.size == 3 && params[0].isAssignableFrom(fileLocal.javaClass)) {
+                        instanciaInputDoc = ctor.newInstance(fileLocal, inputThumb, false)
+                        break
+                    } else if (params.size == 2 && params[0].isAssignableFrom(fileLocal.javaClass)) {
+                        instanciaInputDoc = ctor.newInstance(fileLocal, inputThumb)
+                        break
+                    } else if (params.size == 1 && params[0].isAssignableFrom(fileLocal.javaClass)) {
+                        instanciaInputDoc = ctor.newInstance(fileLocal)
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+            if (instanciaInputDoc == null) {
+                instanciaInputDoc = inputDocClass.getDeclaredConstructor().newInstance()
+                for (f in inputDocClass.declaredFields) {
+                    f.isAccessible = true
+                    when {
+                        f.type.isAssignableFrom(fileLocal.javaClass) -> f.set(instanciaInputDoc, fileLocal)
+                        inputThumb != null && f.type.isAssignableFrom(inputThumb.javaClass) -> f.set(instanciaInputDoc, inputThumb)
+                    }
+                }
+            }
+            docField.set(msgDoc, instanciaInputDoc)
+        }
+    } catch (_: Exception) {}
+
+    return msgDoc
+}
+
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -2811,14 +2878,6 @@ fun enviarParaMensagensSalvas(
         Uri.parse(caminhoCapaJpg).path ?: caminhoCapaJpg.removePrefix("file://")
     } else caminhoCapaJpg
 
-    val inputThumb = if (pathThumbLimpo.isNotBlank() && File(pathThumbLimpo).exists() && File(pathThumbLimpo).length() > 256L) {
-        TdApi.InputThumbnail().apply {
-            thumbnail = TdApi.InputFileLocal(pathThumbLimpo)
-            width = 320
-            height = 320
-        }
-    } else null
-
     client.send(TdApi.GetMe()) { meObj ->
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
@@ -2831,11 +2890,8 @@ fun enviarParaMensagensSalvas(
                     val userTag = "👤 [$usuarioAtivo] • "
                     val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
                     val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
-                    val doc = TdApi.InputMessageDocument().apply {
-                        document = TdApi.InputFileLocal(caminhoLocal)
-                        thumbnail = inputThumb
-                        caption = leg
-                    }
+                    val doc = criarInputMessageDocumentCompativel(caminhoLocal, pathThumbLimpo, leg)
+
                     val req = TdApi.SendMessage().apply {
                         chatId = chatObj.id
                         inputMessageContent = doc
@@ -3167,8 +3223,9 @@ fun GrelhaArquivos(
         }
     }
 }
-// === FIM DA PARTE 1 (MANTENHA A PARTE 2 LOGO ABAIXO) ===
+// === FIM DA PARTE 1 (ENVIE "parte 2" PARA COLAR LOGO ABAIXO DESTA LINHA) ===
 // === CONTINUAÇÃO: PARTE 2 DE 2 (COLE LOGO ABAIXO DA PARTE 1) ===
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
@@ -3217,7 +3274,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
     var isCheckingVault by remember { mutableStateOf(false) }
 
-    // Sincroniza silenciosamente os registos da nuvem em segundo plano (mantendo os perfis ocultos na interface)
+    // Sincroniza silenciosamente os registos da nuvem em segundo plano (mantendo os perfis ocultos na tela)
     LaunchedEffect(loginStep, vaultUnlocked) {
         if (loginStep >= 3 && !vaultUnlocked) {
             descobrirPerfisExistentesNaNuvem(context, client) { _ -> }
