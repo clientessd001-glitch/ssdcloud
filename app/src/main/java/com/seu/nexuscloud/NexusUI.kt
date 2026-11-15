@@ -621,7 +621,7 @@ fun compartilharFicheiroNativo(context: Context, file: File, nome: String) {
     }
 }
 
-// === ENVIO REAL PARA MENSAGENS SALVAS (COMPATÍVEL COM TDLIB 1.8+ VIA APPLY) ===
+// === ENVIO REAL PARA MENSAGENS SALVAS (COMPATÍVEL COM TDAPI INPUTDOCUMENT) ===
 suspend fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -664,12 +664,44 @@ suspend fun enviarParaMensagensSalvas(
     val legendaTexto = "NEXUS_VAULT:$cofreTag|FOLDER:$pastaDestino|FILE:$nomeOriginal"
     val legendaFormatada = TdApi.FormattedText(legendaTexto, emptyArray())
 
-    // Usa construtor vazio + apply para compatibilidade total e thumbnail = null para evitar Erro 400
+    val fileLocal = TdApi.InputFileLocal(arquivoLocal.absolutePath)
     val conteudoDoc = TdApi.InputMessageDocument().apply {
-        document = TdApi.InputFileLocal(arquivoLocal.absolutePath)
-        thumbnail = null
-        disableContentTypeDetection = true
         caption = legendaFormatada
+        try {
+            val docField = javaClass.getDeclaredField("document")
+            docField.isAccessible = true
+            if (docField.type.isAssignableFrom(fileLocal.javaClass)) {
+                docField.set(this, fileLocal)
+            } else {
+                val inputDocClass = docField.type
+                var inst: Any? = null
+                for (ctor in inputDocClass.constructors) {
+                    val p = ctor.parameterTypes
+                    try {
+                        if (p.size == 3 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                            inst = ctor.newInstance(fileLocal, null, false)
+                            break
+                        } else if (p.size == 2 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                            inst = ctor.newInstance(fileLocal, null)
+                            break
+                        } else if (p.size == 1 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                            inst = ctor.newInstance(fileLocal)
+                            break
+                        }
+                    } catch (_: Exception) {}
+                }
+                if (inst == null) {
+                    inst = inputDocClass.getDeclaredConstructor().newInstance()
+                    for (f in inputDocClass.declaredFields) {
+                        f.isAccessible = true
+                        if (f.type.isAssignableFrom(fileLocal.javaClass)) {
+                            f.set(inst, fileLocal)
+                        }
+                    }
+                }
+                docField.set(this, inst)
+            }
+        } catch (_: Exception) {}
     }
 
     val msgEnviadaRef = AtomicReference<TdApi.Message?>(null)
