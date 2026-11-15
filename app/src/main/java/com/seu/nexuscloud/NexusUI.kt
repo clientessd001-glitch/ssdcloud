@@ -1,5 +1,6 @@
 package com.seu.nexuscloud
 
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -10,43 +11,37 @@ import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
+import android.media.ThumbnailUtils
 import android.net.Uri
+import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.StrictMode
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
-import android.webkit.MimeTypeMap
 import android.widget.Toast
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
-import androidx.compose.foundation.lazy.grid.GridCells
-import androidx.compose.foundation.lazy.grid.GridItemSpan
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
+import androidx.compose.ui.*
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -58,373 +53,2320 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.*
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.core.content.FileProvider
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.coroutines.flow.stateIn
-import org.drinkless.tdlib.Client
-import org.drinkless.tdlib.TdApi
+import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
+import java.util.ArrayList
+import java.util.Calendar
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
-import kotlin.math.min
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
 
-// === VERSÃO GLOBAL E TEMA NEXUS CLOUD v1.9 ===
 const val NEXUS_VERSION = "v1.9"
 
-val BgBlack = Color(0xFF0A0A0C)
-val SurfaceDark = Color(0xFF16161A)
-val SurfaceDarker = Color(0xFF101014)
-val Gold = Color(0xFFD4AF37)
+val BgBlack = Color(0xFF05070A)
+val SurfaceDark = Color(0xFF161A25)
+val SurfaceDarker = Color(0xFF10131B)
+val Gold = Color(0xFFFFD700)
 val DangerRed = Color(0xFFE53935)
-val TextGrey = Color(0xFF9E9E9E)
+val TextGrey = Color(0xFFA0AABF)
 
-// === MOTOR DE CONTROLE DE TRANSFERÊNCIAS (PAUSA / CANCELAMENTO SEGURO) ===
-object NexusTransfer {
-    @Volatile var pausado: Boolean = false
-    @Volatile var cancelado: Boolean = false
-    @Volatile var fileIdAtivo: Int = 0
-    val idsCancelados = ConcurrentHashMap.newKeySet<Int>()
-
-    fun resetarParaNovoFluxo() {
-        pausado = false
-        cancelado = false
-        fileIdAtivo = 0
-    }
-
-    fun cancelarTudo(client: Client?) {
-        cancelado = true
-        pausado = false
-        val id = fileIdAtivo
-        if (id != 0) {
-            idsCancelados.add(id)
-            try {
-                client?.send(TdApi.CancelPreliminaryUploadFile(id)) {}
-                client?.send(TdApi.CancelDownloadFile(id, false)) {}
-            } catch (_: Exception) {}
-        }
-    }
-}
-
-// === VIEWMODEL CONECTADO AO NEXUSDAO ===
-class UIViewModel(private val dao: NexusDao) : ViewModel() {
-    val arquivos = dao.buscarTodos()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    val pastas = dao.buscarPastas()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    val armazenamento = dao.calcularUsoTotal()
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
-
-    fun criarPasta(nome: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            dao.criarPasta(PastaNuvem(nomePasta = nome))
-        }
-    }
-
-    fun salvarArquivo(arq: ArquivoNuvem) {
-        viewModelScope.launch(Dispatchers.IO) {
-            dao.salvarArquivo(arq)
-        }
-    }
-
-    fun apagar(id: Int) {
-        viewModelScope.launch(Dispatchers.IO) {
-            dao.apagarArquivo(id)
-        }
-    }
-
-    fun apagar(arq: ArquivoNuvem) {
-        viewModelScope.launch(Dispatchers.IO) {
-            dao.apagarArquivo(arq.id)
-        }
-    }
-}
-
-// === FUNÇÕES UTILITÁRIAS DE FORMATAÇÃO E PRIVACIDADE ===
+// Mascara o número SSD visualmente com asteriscos
 fun mascararNumeroComAsterisco(numero: String): String {
     val limpo = numero.trim()
-    if (limpo.length <= 4) return "****"
-    val prefixo = limpo.take(4)
-    val sufixo = limpo.takeLast(2)
-    return "$prefixo*****$sufixo"
+    if (limpo.isEmpty()) return "********"
+    return "*".repeat(limpo.length.coerceAtLeast(8))
 }
 
-fun formatarDataNuvem(timestamp: Long): String {
-    val sdf = SimpleDateFormat("dd 'de' MMMM 'de' yyyy", Locale("pt", "BR"))
-    return sdf.format(Date(timestamp))
+// === CONTROLADOR DE DOWNLOAD E ENVIO COM PAUSAR / CONTINUAR / CANCELAR ===
+object NexusTransfer {
+    val progress = MutableStateFlow<Int?>(null)
+    val label = MutableStateFlow("")
+    val pausado = MutableStateFlow(false)
+    val cancelado = MutableStateFlow(false)
+    val fileIdAtivo = MutableStateFlow(0)
+    val ehUpload = MutableStateFlow(false)
+
+    fun iniciar(texto: String, upload: Boolean, fileId: Int = 0) {
+        pausado.value = false
+        cancelado.value = false
+        ehUpload.value = upload
+        fileIdAtivo.value = fileId
+        progress.value = 5
+        label.value = texto
+    }
+
+    fun alternarPausa(client: Client? = null) {
+        val novoEstado = !pausado.value
+        pausado.value = novoEstado
+        val fId = fileIdAtivo.value
+        if (client != null && fId != 0 && !ehUpload.value) {
+            if (novoEstado) {
+                client.send(TdApi.CancelDownloadFile().apply {
+                    this.fileId = fId
+                    this.onlyIfPending = false
+                }) {}
+            } else {
+                client.send(TdApi.DownloadFile().apply {
+                    this.fileId = fId
+                    this.priority = 32
+                    this.offset = 0
+                    this.limit = 0
+                    this.synchronous = false
+                }) {}
+            }
+        }
+    }
+
+    fun cancelar(client: Client? = null) {
+        cancelado.value = true
+        pausado.value = false
+        val fId = fileIdAtivo.value
+        if (client != null && fId != 0) {
+            if (ehUpload.value) {
+                client.send(TdApi.DeleteFile().apply { this.fileId = fId }) {}
+            } else {
+                client.send(TdApi.CancelDownloadFile().apply {
+                    this.fileId = fId
+                    this.onlyIfPending = false
+                }) {}
+            }
+        }
+        encerrar()
+    }
+
+    fun encerrar() {
+        progress.value = null
+        label.value = ""
+        pausado.value = false
+        cancelado.value = false
+        fileIdAtivo.value = 0
+        ehUpload.value = false
+    }
 }
 
-fun formatarDataCurta(timestamp: Long): String {
-    val sdf = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale("pt", "BR"))
-    return sdf.format(Date(timestamp))
+// === CONTROLADOR DE BARRA DE LEITURA E CONTADOR DE ARQUIVOS NA NUVEM ===
+object NexusLeituraNuvem {
+    val ativo = MutableStateFlow(false)
+    val lidos = MutableStateFlow(0)
+    val total = MutableStateFlow(0)
+    val subProgressoItem = MutableStateFlow(0)
+    val titulo = MutableStateFlow("")
+    val pausado = MutableStateFlow(false)
+
+    fun iniciar(totalItens: Int, texto: String) {
+        if (totalItens <= 0) {
+            encerrar()
+            return
+        }
+        pausado.value = false
+        total.value = totalItens
+        lidos.value = 0
+        subProgressoItem.value = 0
+        titulo.value = texto
+        ativo.value = true
+    }
+
+    fun alternarPausa() {
+        pausado.value = !pausado.value
+    }
+
+    fun avancar(novoLido: Int, novoTotal: Int = total.value, texto: String? = null) {
+        if (novoTotal > 0) total.value = novoTotal
+        lidos.value = novoLido.coerceIn(0, total.value.coerceAtLeast(1))
+        subProgressoItem.value = 0
+        if (texto != null) titulo.value = texto
+        ativo.value = true
+    }
+
+    fun atualizarSubProgresso(pctItem: Int, texto: String? = null) {
+        subProgressoItem.value = pctItem.coerceIn(0, 99)
+        if (texto != null) titulo.value = texto
+    }
+
+    fun concluirItem() {
+        val t = total.value
+        if (t <= 0) {
+            encerrar()
+            return
+        }
+        val prox = (lidos.value + 1).coerceAtMost(t)
+        lidos.value = prox
+        subProgressoItem.value = 0
+        if (prox >= t) {
+            encerrar()
+        }
+    }
+
+    fun encerrar() {
+        ativo.value = false
+        pausado.value = false
+        lidos.value = 0
+        total.value = 0
+        subProgressoItem.value = 0
+        titulo.value = ""
+    }
 }
 
-fun formatarTempoVideo(ms: Long): String {
-    val totalSegundos = max(0L, ms / 1000L)
-    val minutos = totalSegundos / 60L
-    val segundos = totalSegundos % 60L
-    return String.format(Locale.getDefault(), "%02d:%02d", minutos, segundos)
+// === CACHE RÁPIDO DE MINIATURAS (.JPG) E GESTOR DE CACHE DO SSD NEXUS ===
+object NexusThumbCache {
+    val mapaMiniaturas = mutableStateMapOf<Long, String>()
+    val mapaArquivosCompletos = mutableStateMapOf<Long, String>()
+    val mapaThumbIdsNuvem = mutableStateMapOf<Int, Int>()
+    val downloadSemaphore = Semaphore(4)
+    val emProgresso = Collections.synchronizedSet(mutableSetOf<Long>())
+    private var inicializado = false
+
+    fun inicializar(context: Context) {
+        if (inicializado) return
+        inicializado = true
+        val prefs = context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+        for ((k, v) in prefs.all) {
+            if (v is String && v.isNotBlank()) {
+                when {
+                    k.startsWith("ts_") -> {
+                        val ts = k.removePrefix("ts_").toLongOrNull()
+                        if (ts != null) {
+                            val resolvido = resolverCaminhoCapaJpg(v)
+                            if (resolvido.isNotBlank()) {
+                                mapaMiniaturas[ts] = resolvido
+                            }
+                        }
+                    }
+                    k.startsWith("full_") -> {
+                        val ts = k.removePrefix("full_").toLongOrNull()
+                        if (ts != null && arquivoCompletoExisteLocalmente(v)) {
+                            mapaArquivosCompletos[ts] = v
+                        }
+                    }
+                    k.startsWith("thid_") -> {
+                        val fId = k.removePrefix("thid_").toIntOrNull()
+                        val tId = v.toIntOrNull()
+                        if (fId != null && tId != null && tId != 0) mapaThumbIdsNuvem[fId] = tId
+                    }
+                }
+            }
+        }
+    }
+
+    fun obterMiniatura(arq: ArquivoNuvem): String {
+        val emCache = mapaMiniaturas[arq.dataUpload]
+        if (!emCache.isNullOrBlank() && miniaturaExisteLocalmente(emCache, arq.nomeArquivo)) {
+            return resolverCaminhoCapaJpg(emCache)
+        }
+        val doArq = arq.caminhoMiniatura ?: ""
+        if (doArq.isNotBlank() && miniaturaExisteLocalmente(doArq, arq.nomeArquivo)) {
+            val resolvido = resolverCaminhoCapaJpg(doArq)
+            if (resolvido.isNotBlank()) {
+                mapaMiniaturas[arq.dataUpload] = resolvido
+                return resolvido
+            }
+        }
+        return ""
+    }
+
+    fun obterArquivoCompleto(arq: ArquivoNuvem): String {
+        val emCache = mapaArquivosCompletos[arq.dataUpload]
+        if (!emCache.isNullOrBlank() && arquivoCompletoExisteLocalmente(emCache)) return emCache
+        val doArq = arq.caminhoMiniatura ?: ""
+        if (doArq.isNotBlank() && arquivoCompletoExisteLocalmente(doArq)) return doArq
+        return ""
+    }
+
+    fun salvarMiniatura(context: Context, dataUpload: Long, caminho: String) {
+        val capaLimpa = resolverCaminhoCapaJpg(caminho)
+        if (capaLimpa.isBlank()) return
+        mapaMiniaturas[dataUpload] = capaLimpa
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("ts_$dataUpload", capaLimpa)
+            .apply()
+    }
+
+    fun salvarArquivoCompleto(context: Context, dataUpload: Long, caminho: String) {
+        if (caminho.isBlank() || !arquivoCompletoExisteLocalmente(caminho)) return
+        mapaArquivosCompletos[dataUpload] = caminho
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("full_$dataUpload", caminho)
+            .apply()
+    }
+
+    fun salvarThumbIdNuvem(context: Context, fileId: Int, thumbFileId: Int) {
+        if (fileId == 0 || thumbFileId == 0) return
+        mapaThumbIdsNuvem[fileId] = thumbFileId
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("thid_$fileId", thumbFileId.toString())
+            .apply()
+    }
+
+    fun limparCapasDeVideos(context: Context, arquivos: List<ArquivoNuvem>): Int {
+        var removidas = 0
+        val prefs = context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+        val dir = File(context.filesDir, "nexus_thumbs")
+
+        arquivos.filter { ehArquivoVideo(it.nomeArquivo) }.forEach { vid ->
+            val atual = mapaMiniaturas[vid.dataUpload] ?: vid.caminhoMiniatura ?: ""
+            if (atual.isNotBlank()) {
+                val limpo = if (atual.startsWith("file://")) Uri.parse(atual).path ?: atual.removePrefix("file://") else atual
+                val f = File(limpo)
+                if (f.exists()) f.delete()
+                val fFrame = File("${limpo}_frame.jpg")
+                if (fFrame.exists()) fFrame.delete()
+            }
+            mapaMiniaturas.remove(vid.dataUpload)
+            editor.remove("ts_${vid.dataUpload}")
+            emProgresso.remove(vid.dataUpload)
+            removidas++
+        }
+
+        if (dir.exists()) {
+            dir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("fast_") || ehArquivoVideo(f.name.removeSuffix("_frame.jpg"))) {
+                    f.delete()
+                }
+            }
+        }
+        editor.apply()
+        return removidas
+    }
+
+    fun limparTodoCacheLocal(context: Context) {
+        mapaMiniaturas.clear()
+        mapaArquivosCompletos.clear()
+        emProgresso.clear()
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE).edit().clear().apply()
+        try {
+            File(context.filesDir, "nexus_thumbs").deleteRecursively()
+            File(context.filesDir, "tdlib_upload_cache").deleteRecursively()
+            context.cacheDir.deleteRecursively()
+        } catch (_: Exception) {}
+    }
 }
 
-fun formatarTamanhoNuvem(bytes: Long): String {
-    if (bytes <= 0L) return "0 B"
-    val kb = bytes / 1024.0
-    if (kb < 1024.0) return String.format(Locale.US, "%.1f KB", kb)
-    val mb = kb / 1024.0
-    if (mb < 1024.0) return String.format(Locale.US, "%.2f MB", mb)
-    val gb = mb / 1024.0
-    return String.format(Locale.US, "%.2f GB", gb)
+fun calcularUsoCacheLocal(context: Context): Triple<Long, Int, Int> {
+    var totalBytes = 0L
+    var qtdThumbs = 0
+    var qtdTemp = 0
+
+    val dirThumbs = File(context.filesDir, "nexus_thumbs")
+    if (dirThumbs.exists()) {
+        dirThumbs.walkTopDown().forEach { f ->
+            if (f.isFile) {
+                totalBytes += f.length()
+                if (f.name.endsWith("_frame.jpg")) qtdThumbs++ else qtdTemp++
+            }
+        }
+    }
+
+    val dirUpload = File(context.filesDir, "tdlib_upload_cache")
+    if (dirUpload.exists()) {
+        dirUpload.walkTopDown().forEach { f ->
+            if (f.isFile) {
+                totalBytes += f.length()
+                qtdTemp++
+            }
+        }
+    }
+
+    context.cacheDir?.walkTopDown()?.forEach { f ->
+        if (f.isFile) {
+            totalBytes += f.length()
+            qtdTemp++
+        }
+    }
+
+    return Triple(totalBytes, qtdThumbs, qtdTemp)
 }
 
-// === PREFERÊNCIAS DE PASTAS E AUTO-SYNC POR COFRE ===
-fun carregarVinculosPastas(context: Context, cofreTag: String): Map<String, String> {
-    val prefs = context.getSharedPreferences("nexus_pastas_$cofreTag", Context.MODE_PRIVATE)
-    val mapa = mutableMapOf<String, String>()
+fun limparCacheUploadsTemporarios(context: Context): Long {
+    var liberado = 0L
+    try {
+        val dirUpload = File(context.filesDir, "tdlib_upload_cache")
+        if (dirUpload.exists()) {
+            dirUpload.walkTopDown().forEach { if (it.isFile) liberado += it.length() }
+            dirUpload.deleteRecursively()
+        }
+        val dirThumbs = File(context.filesDir, "nexus_thumbs")
+        if (dirThumbs.exists()) {
+            dirThumbs.listFiles()?.forEach { f ->
+                if (f.isFile && !f.name.endsWith("_frame.jpg")) {
+                    liberado += f.length()
+                    f.delete()
+                }
+            }
+        }
+        context.cacheDir?.listFiles()?.forEach { f ->
+            if (f.isFile) liberado += f.length()
+            f.deleteRecursively()
+        }
+        NexusThumbCache.mapaArquivosCompletos.clear()
+    } catch (_: Exception) {}
+    return liberado
+}
+
+fun resolverCaminhoCapaJpg(caminho: String?): String {
+    val c = caminho ?: return ""
+    if (c.isBlank()) return ""
+    if (c.startsWith("content://")) return c
+    val limpo = if (c.startsWith("file://")) Uri.parse(c).path ?: c.removePrefix("file://") else c
+    if (limpo.isBlank()) return ""
+
+    if (limpo.endsWith("_frame.jpg")) {
+        val f = File(limpo)
+        return if (f.exists() && f.length() > 256L) Uri.fromFile(f).toString() else ""
+    }
+
+    val fFrame = File("${limpo}_frame.jpg")
+    if (fFrame.exists() && fFrame.length() > 256L) {
+        return Uri.fromFile(fFrame).toString()
+    }
+
+    val fOriginal = File(limpo)
+    if (fOriginal.exists() && fOriginal.length() > 256L && ehArquivoImagem(fOriginal.name)) {
+        return Uri.fromFile(fOriginal).toString()
+    }
+    return ""
+}
+
+fun limparPrefixoTimestamp(nome: String): String {
+    return nome.trim()
+        .replace(Regex("^fast_\\d+_"), "")
+        .replace(Regex("^thumb_\\d+_"), "")
+        .replace(Regex("^\\d{10,16}_"), "")
+        .removeSuffix("_frame.jpg")
+        .trim()
+}
+
+fun ehArquivoImagem(nomeArquivo: String): Boolean {
+    val limpo = nomeArquivo.trim()
+    val ext = limpo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+    return ext in listOf("JPG", "JPEG", "JPE", "JFIF", "PNG", "WEBP", "HEIC", "HEIF", "GIF", "BMP", "AVIF") ||
+        ext.startsWith("JP") ||
+        limpo.contains("IMG", ignoreCase = true) ||
+        limpo.contains("PHOTO", ignoreCase = true) ||
+        limpo.contains("Screenshot", ignoreCase = true) ||
+        (Regex("^\\d{8}_\\d{6}.*").matches(limpo) && !ehArquivoVideo(limpo))
+}
+
+fun ehArquivoVideo(nomeArquivo: String): Boolean {
+    val limpo = nomeArquivo.trim()
+    val ext = limpo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+    return ext in listOf("MP4", "MKV", "MOV", "AVI", "WEBM", "3GP", "M4V") ||
+        limpo.contains("VID", ignoreCase = true) ||
+        limpo.contains("Video", ignoreCase = true)
+}
+
+class UIViewModel(private val dao: NexusDao) : ViewModel() {
+    val arquivos = dao.buscarTodos().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val pastas = dao.buscarPastas().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val armazenamento = dao.calcularUsoTotal().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
+
+    suspend fun obterArquivosReais(): List<ArquivoNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarTodos().first()
+    }
+
+    suspend fun obterPastasReais(): List<PastaNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarPastas().first()
+    }
+
+    fun criarPasta(nome: String) = viewModelScope.launch {
+        val limpo = nome.trim()
+        if (limpo.isNotBlank()) {
+            val atuais = obterPastasReais()
+            val jaExiste = atuais.any { it.nomePasta.trim().equals(limpo, ignoreCase = true) }
+            if (!jaExiste) {
+                dao.criarPasta(PastaNuvem(nomePasta = limpo))
+            }
+        }
+    }
+
+    fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch {
+        val atuais = obterArquivosReais()
+        val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
+        val existente = atuais.firstOrNull {
+            limparPrefixoTimestamp(it.nomeArquivo).equals(nomeLimpo, ignoreCase = true) &&
+                (it.tamanhoBytes == arq.tamanhoBytes || it.tamanhoBytes == 0L || arq.tamanhoBytes == 0L)
+        }
+        if (existente != null) {
+            val thumbAntigaOk = miniaturaExisteLocalmente(existente.caminhoMiniatura, nomeLimpo)
+            val thumbNovaOk = miniaturaExisteLocalmente(arq.caminhoMiniatura, nomeLimpo)
+            val precisaAtualizarFileId = arq.fileId != 0 && existente.fileId != arq.fileId
+            if ((!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
+                dao.apagarArquivo(existente.id)
+                dao.salvarArquivo(
+                    existente.copy(
+                        id = 0,
+                        nomeArquivo = nomeLimpo,
+                        caminhoMiniatura = if (thumbNovaOk) resolverCaminhoCapaJpg(arq.caminhoMiniatura) else existente.caminhoMiniatura,
+                        fileId = if (arq.fileId != 0) arq.fileId else existente.fileId
+                    )
+                )
+            }
+        } else {
+            val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
+            dao.salvarArquivo(arq.copy(nomeArquivo = nomeLimpo, caminhoMiniatura = capaValida))
+        }
+    }
+
+    fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
+
+    fun atualizarCaminhoMiniatura(context: Context, arq: ArquivoNuvem, novoCaminho: String) {
+        val capaJpg = resolverCaminhoCapaJpg(novoCaminho)
+        if (capaJpg.isNotBlank()) {
+            NexusThumbCache.salvarMiniatura(context, arq.dataUpload, capaJpg)
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    dao.apagarArquivo(arq.id)
+                    dao.salvarArquivo(arq.copy(id = 0, caminhoMiniatura = capaJpg))
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
+        if (novoNome.isNotBlank()) {
+            dao.apagarArquivo(arq.id)
+            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = novoNome.trim()))
+        }
+    }
+}
+
+// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA E RETOMADA ===
+suspend fun obterInfoArquivoTDLib(client: Client, fileId: Int): TdApi.File? {
+    if (fileId == 0) return null
+    val def = CompletableDeferred<TdApi.File?>()
+    client.send(TdApi.GetFile(fileId)) { obj ->
+        def.complete(obj as? TdApi.File)
+    }
+    return def.await()
+}
+
+suspend fun baixarArquivoTDLibAssincrono(
+    client: Client,
+    fileId: Int,
+    prioridade: Int = 16,
+    maxTentativas: Int = 400,
+    controlarPausaTransfer: Boolean = false,
+    onProgress: ((Int, Long, Long) -> Unit)? = null
+): File? {
+    if (fileId == 0) return null
+
+    if (controlarPausaTransfer) {
+        NexusTransfer.fileIdAtivo.value = fileId
+    }
+
+    val infoInicial = obterInfoArquivoTDLib(client, fileId)
+    val caminhoInicial = infoInicial?.local?.path ?: ""
+    if (caminhoInicial.isNotBlank() && infoInicial?.local?.isDownloadingCompleted == true) {
+        val f = File(caminhoInicial)
+        if (f.exists() && f.length() > 100L) {
+            onProgress?.invoke(100, f.length(), f.length())
+            return f
+        }
+    }
+
+    val req = TdApi.DownloadFile().apply {
+        this.fileId = fileId
+        this.priority = prioridade
+        this.offset = 0
+        this.limit = 0
+        this.synchronous = false
+    }
+    client.send(req) {}
+
+    var tentativas = 0
+    var semEvolucao = 0
+    var ultimoBaixado = -1L
+
+    while (tentativas < maxTentativas) {
+        if (controlarPausaTransfer && NexusTransfer.cancelado.value) {
+            client.send(TdApi.CancelDownloadFile().apply {
+                this.fileId = fileId
+                this.onlyIfPending = false
+            }) {}
+            return null
+        }
+
+        var estavaPausado = false
+        while ((controlarPausaTransfer && NexusTransfer.pausado.value) ||
+            (!controlarPausaTransfer && NexusLeituraNuvem.pausado.value)
+        ) {
+            if (!estavaPausado) {
+                estavaPausado = true
+                client.send(TdApi.CancelDownloadFile().apply {
+                    this.fileId = fileId
+                    this.onlyIfPending = false
+                }) {}
+            }
+            delay(200)
+            if (controlarPausaTransfer && NexusTransfer.cancelado.value) return null
+        }
+        if (estavaPausado) {
+            client.send(req) {}
+            semEvolucao = 0
+        }
+
+        delay(150)
+        tentativas++
+        val info = obterInfoArquivoTDLib(client, fileId) ?: break
+        val local = info.local
+        val path = local?.path ?: ""
+        val baixado = local?.downloadedSize ?: 0L
+        val total = when {
+            info.size > 0 -> info.size
+            info.expectedSize > 0 -> info.expectedSize
+            else -> 0L
+        }
+
+        if (total > 0L && baixado > 0L) {
+            val pct = ((baixado * 100L) / total).toInt().coerceIn(1, 99)
+            onProgress?.invoke(pct, baixado, total)
+        } else {
+            val pctEst = (5 + tentativas).coerceAtMost(90)
+            onProgress?.invoke(pctEst, baixado, total)
+        }
+
+        if (local?.isDownloadingCompleted == true && path.isNotBlank()) {
+            val arqFinal = File(path)
+            if (arqFinal.exists() && arqFinal.length() > 100L) {
+                onProgress?.invoke(100, arqFinal.length(), arqFinal.length())
+                return arqFinal
+            }
+        }
+
+        if (baixado == ultimoBaixado) {
+            semEvolucao++
+        } else {
+            semEvolucao = 0
+            ultimoBaixado = baixado
+        }
+
+        if (local?.isDownloadingActive == false && local.isDownloadingCompleted == false) {
+            if (tentativas == 4 || tentativas == 12 || tentativas == 24) {
+                client.send(req) {}
+            } else if (semEvolucao > 25) {
+                break
+            }
+        }
+    }
+    return null
+}
+
+suspend fun aguardarUploadTDLibComPausa(
+    client: Client,
+    fileId: Int,
+    nomeArquivo: String,
+    loteTag: String = ""
+): Boolean {
+    if (fileId == 0) return true
+    NexusTransfer.fileIdAtivo.value = fileId
+    var tentativas = 0
+    var inativoCount = 0
+
+    while (tentativas < 1200) {
+        if (NexusTransfer.cancelado.value) {
+            client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return false
+        }
+        while (NexusTransfer.pausado.value) {
+            delay(200)
+            if (NexusTransfer.cancelado.value) {
+                client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+                return false
+            }
+        }
+
+        delay(150)
+        tentativas++
+        val info = obterInfoArquivoTDLib(client, fileId) ?: return true
+        val remote = info.remote ?: return true
+        val enviado = remote.uploadedSize
+        val total = when {
+            info.size > 0 -> info.size
+            info.expectedSize > 0 -> info.expectedSize
+            else -> 0L
+        }
+
+        if (remote.isUploadingCompleted) {
+            NexusTransfer.progress.value = 100
+            return true
+        }
+
+        if (total > 0L && enviado > 0L) {
+            val pctRede = ((enviado * 100L) / total).toInt().coerceIn(1, 99)
+            val pctTotal = (40 + (pctRede * 59) / 100).coerceIn(40, 99)
+            val mbEnv = String.format(Locale.US, "%.1f", enviado / (1024.0 * 1024.0))
+            val mbTot = String.format(Locale.US, "%.1f", total / (1024.0 * 1024.0))
+            NexusTransfer.progress.value = pctTotal
+            NexusTransfer.label.value = "Enviando $loteTag'$nomeArquivo': $mbEnv / $mbTot MB ($pctTotal%)"
+        }
+
+        if (!remote.isUploadingActive) {
+            inativoCount++
+            if (inativoCount >= 4) return true
+        } else {
+            inativoCount = 0
+        }
+    }
+    return true
+}
+
+suspend fun recuperarFileIdNaNuvemPorNome(
+    client: Client,
+    usuarioAtivo: String,
+    nomeAlvo: String,
+    tamanhoAlvo: Long
+): Pair<Int, Int> {
+    val def = CompletableDeferred<Pair<Int, Int>>()
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+    val tagPerfil = "👤 [$chaveAtiva]"
+    val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+    val nomeAlvoLimpo = limparPrefixoTimestamp(nomeAlvo).lowercase(Locale.ROOT)
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 12, mutableListOf()) { todasMensagens ->
+                        var achouFileId = 0
+                        var achouThumbId = 0
+                        for (msg in todasMensagens) {
+                            val docContent = msg.content as? TdApi.MessageDocument ?: continue
+                            val legenda = docContent.caption?.text ?: ""
+                            if (legenda.contains(tagPerfil, ignoreCase = true) ||
+                                legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                legenda.contains("☁️ Nexus Cloud")
+                            ) {
+                                val nomeBruto = docContent.document?.fileName ?: ""
+                                val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+                                val tamMsg = docContent.document?.document?.size ?: 0L
+                                if (nomeMsg == nomeAlvoLimpo || (tamanhoAlvo > 0L && tamMsg == tamanhoAlvo && nomeMsg.contains(nomeAlvoLimpo.take(8)))) {
+                                    achouFileId = docContent.document?.document?.id ?: 0
+                                    achouThumbId = docContent.document?.thumbnail?.file?.id ?: 0
+                                    if (achouFileId != 0) break
+                                }
+                            }
+                        }
+                        def.complete(Pair(achouFileId, achouThumbId))
+                    }
+                } else def.complete(Pair(0, 0))
+            }
+        } else def.complete(Pair(0, 0))
+    }
+    return def.await()
+}
+
+// === GESTÃO DE COFRES MULTIUTILIZADOR, PASTAS E EXCLUSÃO ===
+fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
+
+fun obterUltimoUsuarioCofre(context: Context): String {
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    return prefs.getString("last_active_user", "") ?: ""
+}
+
+fun salvarCredenciaisCofreLocal(context: Context, nomeOriginal: String, pin: String, definirComoAtivo: Boolean = true) {
+    val chave = normalizarUsuario(nomeOriginal)
+    if (chave.isBlank()) return
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    val editor = prefs.edit()
+        .putString("pin_$chave", pin.trim())
+        .putString("display_$chave", nomeOriginal.trim())
+    if (definirComoAtivo) {
+        editor.putString("last_active_user", nomeOriginal.trim())
+    }
+    editor.apply()
+}
+
+fun obterPinCofreLocal(context: Context, nome: String): String? {
+    val chave = normalizarUsuario(nome)
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    return prefs.getString("pin_$chave", null)
+}
+
+fun listarPerfisSalvosLocalmente(context: Context): List<String> {
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    val nomes = mutableListOf<String>()
     for ((k, v) in prefs.all) {
-        if (v is String) mapa[k] = v
+        if (k.startsWith("display_") && v is String && v.isNotBlank()) {
+            nomes.add(v.trim())
+        }
+    }
+    return nomes.distinctBy { normalizarUsuario(it) }.sortedBy { normalizarUsuario(it) }
+}
+
+fun carregarDonosFicheiros(context: Context): Map<Long, String> {
+    val prefs = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+    val mapa = mutableMapOf<Long, String>()
+    for ((k, v) in prefs.all) {
+        val ts = k.toLongOrNull()
+        if (ts != null && v is String && v.isNotBlank()) mapa[ts] = v
     }
     return mapa
 }
 
-fun salvarVinculoPasta(context: Context, cofreTag: String, chaveArquivo: String, nomePasta: String) {
-    val prefs = context.getSharedPreferences("nexus_pastas_$cofreTag", Context.MODE_PRIVATE)
-    prefs.edit().putString(chaveArquivo, nomePasta).apply()
+fun salvarDonoFicheiro(context: Context, dataUpload: Long, usuario: String) {
+    val prefs = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+    if (usuario.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
+    else prefs.edit().putString(dataUpload.toString(), normalizarUsuario(usuario)).apply()
 }
 
-fun carregarPastasSync(context: Context, cofreTag: String): Set<String> {
-    val prefs = context.getSharedPreferences("nexus_sync_$cofreTag", Context.MODE_PRIVATE)
-    return prefs.getStringSet("uris_sync", emptySet())?.toSet() ?: emptySet()
+fun carregarPastasDoUsuario(context: Context, usuario: String): Set<String> {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+    return prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()
 }
 
-fun salvarPastaSync(context: Context, cofreTag: String, uriStr: String) {
-    val prefs = context.getSharedPreferences("nexus_sync_$cofreTag", Context.MODE_PRIVATE)
-    val atual = prefs.getStringSet("uris_sync", emptySet())?.toMutableSet() ?: mutableSetOf()
-    atual.add(uriStr)
-    prefs.edit().putStringSet("uris_sync", atual).apply()
+fun associarPastaAoUsuario(context: Context, usuario: String, nomePasta: String) {
+    val limpo = nomePasta.trim()
+    if (limpo.isBlank()) return
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+    val atuais = (prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()).toMutableSet()
+    val jaTem = atuais.any { it.equals(limpo, ignoreCase = true) }
+    if (!jaTem) {
+        atuais.add(limpo)
+        prefs.edit().putStringSet("folders_$chave", atuais).apply()
+    }
+    desmarcarPastaEliminada(context, usuario, limpo)
 }
 
-fun removerPastaSync(context: Context, cofreTag: String, uriStr: String) {
-    val prefs = context.getSharedPreferences("nexus_sync_$cofreTag", Context.MODE_PRIVATE)
-    val atual = prefs.getStringSet("uris_sync", emptySet())?.toMutableSet() ?: mutableSetOf()
-    atual.remove(uriStr)
-    prefs.edit().putStringSet("uris_sync", atual).apply()
+fun desassociarPastaDoUsuario(context: Context, usuario: String, nomePasta: String) {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+    val atuais = (prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet())
+        .filterNot { it.equals(nomePasta.trim(), ignoreCase = true) }
+        .toSet()
+    prefs.edit().putStringSet("folders_$chave", atuais).apply()
 }
 
-fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
-    var nome = "arquivo_${System.currentTimeMillis()}"
-    var tamanho = 0L
-    try {
-        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-            val sizeIdx = cursor.getColumnIndex(OpenableColumns.SIZE)
-            if (cursor.moveToFirst()) {
-                if (nameIdx != -1 && !cursor.isNull(nameIdx)) {
-                    nome = cursor.getString(nameIdx)
-                }
-                if (sizeIdx != -1 && !cursor.isNull(sizeIdx)) {
-                    tamanho = cursor.getLong(sizeIdx)
-                }
+fun marcarPastaComoEliminada(context: Context, usuario: String, nomePasta: String) {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_deleted_folders_$chave", Context.MODE_PRIVATE)
+    prefs.edit().putBoolean(nomePasta.trim().lowercase(Locale.ROOT), true).apply()
+}
+
+fun desmarcarPastaEliminada(context: Context, usuario: String, nomePasta: String) {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_deleted_folders_$chave", Context.MODE_PRIVATE)
+    prefs.edit().remove(nomePasta.trim().lowercase(Locale.ROOT)).apply()
+}
+
+fun pastaFoiEliminadaPeloUsuario(context: Context, usuario: String, nomePasta: String): Boolean {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_deleted_folders_$chave", Context.MODE_PRIVATE)
+    return prefs.getBoolean(nomePasta.trim().lowercase(Locale.ROOT), false)
+}
+
+fun guardarRenomeacaoPasta(context: Context, usuario: String, nomeAntigo: String, nomeNovo: String) {
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_renames_$chave", Context.MODE_PRIVATE)
+    val antigoLower = nomeAntigo.trim().lowercase(Locale.ROOT)
+    val novoLimpo = nomeNovo.trim()
+    val editor = prefs.edit()
+    for ((k, v) in prefs.all) {
+        if (v is String && v.equals(nomeAntigo.trim(), ignoreCase = true)) {
+            editor.putString(k, novoLimpo)
+        }
+    }
+    editor.putString(antigoLower, novoLimpo)
+    editor.apply()
+}
+
+fun resolverNomePastaAtualizado(context: Context, usuario: String, nomeOriginal: String): String {
+    val limpo = nomeOriginal.trim()
+    if (limpo.isBlank()) return ""
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_folder_renames_$chave", Context.MODE_PRIVATE)
+    return prefs.getString(limpo.lowercase(Locale.ROOT), limpo) ?: limpo
+}
+
+fun renomearPastaCompleta(
+    context: Context,
+    usuario: String,
+    nomeAntigo: String,
+    nomeNovo: String,
+    vm: UIViewModel
+) {
+    val antigoLimpo = nomeAntigo.trim()
+    val novoLimpo = nomeNovo.trim()
+    if (antigoLimpo.isBlank() || novoLimpo.isBlank() || antigoLimpo.equals(novoLimpo, ignoreCase = true)) return
+
+    desassociarPastaDoUsuario(context, usuario, antigoLimpo)
+    marcarPastaComoEliminada(context, usuario, antigoLimpo)
+
+    vm.criarPasta(novoLimpo)
+    associarPastaAoUsuario(context, usuario, novoLimpo)
+    guardarRenomeacaoPasta(context, usuario, antigoLimpo, novoLimpo)
+
+    val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+    val editor = prefsLinks.edit()
+    for ((k, v) in prefsLinks.all) {
+        if (v is String && v.equals(antigoLimpo, ignoreCase = true)) {
+            editor.putString(k, novoLimpo)
+        }
+    }
+    editor.apply()
+}
+
+fun eliminarPastaCompleta(
+    context: Context,
+    client: Client,
+    usuario: String,
+    nomePasta: String,
+    apagarFicheirosDaPasta: Boolean,
+    arquivosDaPasta: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onComplete: (String) -> Unit
+) {
+    val limpo = nomePasta.trim()
+    desassociarPastaDoUsuario(context, usuario, limpo)
+    marcarPastaComoEliminada(context, usuario, limpo)
+
+    if (!apagarFicheirosDaPasta || arquivosDaPasta.isEmpty()) {
+        val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+        val editor = prefsLinks.edit()
+        for ((k, v) in prefsLinks.all) {
+            if (v is String && v.equals(limpo, ignoreCase = true)) {
+                editor.remove(k)
             }
         }
-    } catch (_: Exception) {}
-    return Pair(nome, tamanho)
-}
-
-fun descobrirMimeType(nome: String): String {
-    val ext = nome.substringAfterLast('.', "").lowercase(Locale.getDefault())
-    if (ext.isEmpty()) return "*/*"
-    return MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: when (ext) {
-        "mp4", "mkv", "mov", "avi", "webm", "3gp" -> "video/*"
-        "jpg", "jpeg", "png", "webp", "gif", "bmp", "heic" -> "image/*"
-        "pdf" -> "application/pdf"
-        "txt", "log", "json", "xml", "csv", "md", "kt" -> "text/plain"
-        "mp3", "wav", "ogg", "m4a", "flac" -> "audio/*"
-        else -> "*/*"
+        editor.apply()
+        onComplete("Pasta '$limpo' apagada! Ficheiros movidos para a Galeria Geral.")
+    } else {
+        eliminarMultiplosFicheiros(context, client, usuario, arquivosDaPasta, true, vm) {
+            onComplete("Pasta '$limpo' e ${arquivosDaPasta.size} ficheiro(s) eliminados!")
+        }
     }
 }
 
-// === PROCESSAMENTO DE MINIATURAS E CORREÇÃO DE CAPA DE VÍDEO ESCURA ===
-fun calcularBrilhoMedioBitmap(bmp: Bitmap): Double {
-    val w = bmp.width
-    val h = bmp.height
-    if (w <= 0 || h <= 0) return 0.0
-    var soma = 0L
-    var amostras = 0
-    val passoX = max(1, w / 20)
-    val passoY = max(1, h / 20)
-    for (y in 0 until h step passoY) {
-        for (x in 0 until w step passoX) {
-            val pixel = bmp.getPixel(x, y)
-            val r = (pixel shr 16) and 0xFF
-            val g = (pixel shr 8) and 0xFF
-            val b = pixel and 0xFF
-            soma += (r * 299 + g * 587 + b * 114) / 1000
-            amostras++
-        }
-    }
-    return if (amostras > 0) soma.toDouble() / amostras else 0.0
+fun registarMensagemSincronizada(context: Context, usuario: String, msgId: Long) {
+    if (msgId == 0L) return
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_synced_msgs_$chave", Context.MODE_PRIVATE)
+    prefs.edit().putBoolean(msgId.toString(), true).apply()
 }
 
-fun bitmapNaoEhTotalmentePreto(bmp: Bitmap): Boolean {
-    return calcularBrilhoMedioBitmap(bmp) > 14.0
+fun mensagemJaSincronizada(context: Context, usuario: String, msgId: Long): Boolean {
+    if (msgId == 0L) return false
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_synced_msgs_$chave", Context.MODE_PRIVATE)
+    return prefs.getBoolean(msgId.toString(), false)
 }
 
-fun clarearBitmapVideoSeNecessario(bmp: Bitmap): Bitmap {
-    val brilho = calcularBrilhoMedioBitmap(bmp)
-    if (brilho >= 42.0) return bmp
-    return try {
-        val out = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        val ganho = if (brilho < 18.0) 1.65f else 1.35f
-        val offset = if (brilho < 18.0) 38f else 22f
-        val cm = ColorMatrix(
-            floatArrayOf(
-                ganho, 0f, 0f, 0f, offset,
-                0f, ganho, 0f, 0f, offset,
-                0f, 0f, ganho, 0f, offset,
-                0f, 0f, 0f, 1f, 0f
-            )
-        )
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(cm)
-        }
-        canvas.drawBitmap(bmp, 0f, 0f, paint)
-        out
-    } catch (_: Exception) {
-        bmp
+fun marcarFicheiroComoSincronizado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long, uriStr: String = "") {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    val editor = prefs.edit()
+    editor.putBoolean("name_$nomeLimpo", true)
+    editor.putBoolean("key_${nomeLimpo}|$tamanho", true)
+    if (uriStr.isNotBlank()) {
+        editor.putBoolean("uri_$uriStr", true)
     }
+    editor.apply()
 }
 
-fun extrairCapaVideoParaArquivo(context: Context, videoFile: File, destinoJpg: File): Boolean {
-    val retriever = MediaMetadataRetriever()
-    try {
-        retriever.setDataSource(videoFile.absolutePath)
-        val duracaoStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-        val duracaoMs = duracaoStr?.toLongOrNull() ?: 0L
-
-        val temposTesteUs = listOf(
-            min(1_500_000L, max(200_000L, (duracaoMs * 1000L) / 5L)),
-            min(3_500_000L, max(500_000L, (duracaoMs * 1000L) / 3L)),
-            min(7_000_000L, max(1_000_000L, (duracaoMs * 1000L) / 2L)),
-            300_000L,
-            0L
-        )
-
-        var melhorFrame: Bitmap? = null
-        var melhorBrilho = -1.0
-
-        for (tempoUs in temposTesteUs) {
-            val frame = try {
-                retriever.getFrameAtTime(tempoUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                    ?: retriever.getFrameAtTime(tempoUs, MediaMetadataRetriever.OPTION_CLOSEST)
-            } catch (_: Exception) {
-                null
-            }
-            if (frame != null) {
-                val brilho = calcularBrilhoMedioBitmap(frame)
-                if (brilho > melhorBrilho) {
-                    melhorBrilho = brilho
-                    melhorFrame = frame
-                }
-                if (bitmapNaoEhTotalmentePreto(frame) && brilho >= 36.0) {
-                    break
-                }
-            }
-        }
-
-        if (melhorFrame == null) {
-            melhorFrame = retriever.frameAtTime
-        }
-
-        if (melhorFrame != null) {
-            val corrigido = clarearBitmapVideoSeNecessario(melhorFrame)
-            val w = corrigido.width
-            val h = corrigido.height
-            val maxDim = 420
-            val escala = min(maxDim.toFloat() / max(1, w), maxDim.toFloat() / max(1, h)).coerceAtMost(1f)
-            val finalBmp = if (escala < 1f) {
-                Bitmap.createScaledBitmap(
-                    corrigido,
-                    max(1, (w * escala).toInt()),
-                    max(1, (h * escala).toInt()),
-                    true
-                )
-            } else corrigido
-
-            destinoJpg.parentFile?.mkdirs()
-            FileOutputStream(destinoJpg).use { out ->
-                finalBmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
-            }
-            return destinoJpg.exists() && destinoJpg.length() > 100L
-        }
-    } catch (_: Exception) {
-    } finally {
-        try {
-            retriever.release()
-        } catch (_: Exception) {}
-    }
+fun ficheiroJaSincronizadoAntes(context: Context, usuario: String, nomeArquivo: String, tamanho: Long, uriStr: String = ""): Boolean {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    if (uriStr.isNotBlank() && prefs.getBoolean("uri_$uriStr", false)) return true
+    if (prefs.getBoolean("key_${nomeLimpo}|$tamanho", false)) return true
+    if (prefs.getBoolean("name_$nomeLimpo", false)) return true
     return false
 }
 
-fun gerarMiniaturaImagemLeve(origemFile: File, destinoJpg: File, maxDim: Int = 360): Boolean {
+fun marcarFicheiroComoDeletado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long) {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    prefs.edit()
+        .putBoolean("del_name_$nomeLimpo", true)
+        .putBoolean("del_key_${nomeLimpo}|$tamanho", true)
+        .apply()
+}
+
+fun desmarcarFicheiroDeletado(context: Context, usuario: String, nomeArquivo: String, tamanho: Long) {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    prefs.edit()
+        .remove("del_name_$nomeLimpo")
+        .remove("del_key_${nomeLimpo}|$tamanho")
+        .apply()
+}
+
+fun ficheiroFoiDeletadoPeloUsuario(context: Context, usuario: String, nomeArquivo: String, tamanho: Long): Boolean {
+    val chave = normalizarUsuario(usuario)
+    val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
+    val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    return prefs.getBoolean("del_key_${nomeLimpo}|$tamanho", false) ||
+        prefs.getBoolean("del_name_$nomeLimpo", false)
+}
+
+fun eliminarMultiplosFicheiros(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    listaArquivos: List<ArquivoNuvem>,
+    apagarNaNuvemSSD: Boolean,
+    vm: UIViewModel,
+    onComplete: (String) -> Unit
+) {
+    if (listaArquivos.isEmpty()) {
+        onComplete("Nenhum ficheiro selecionado.")
+        return
+    }
+
+    val nomesParaApagar = mutableSetOf<String>()
+    val idsRemotosParaApagar = mutableSetOf<Int>()
+
+    for (arq in listaArquivos) {
+        val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
+        nomesParaApagar.add(nomeLimpo.lowercase(Locale.ROOT))
+        if (arq.fileId != 0) idsRemotosParaApagar.add(arq.fileId)
+
+        marcarFicheiroComoDeletado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+        marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+
+        try {
+            val thumb = NexusThumbCache.obterMiniatura(arq)
+            if (thumb.startsWith("file://") || thumb.startsWith("/")) {
+                val limpo = if (thumb.startsWith("file://")) Uri.parse(thumb).path ?: thumb.removePrefix("file://") else thumb
+                if (limpo.isNotBlank()) {
+                    val f = File(limpo)
+                    if (f.exists()) f.delete()
+                    val fFrame = File("${limpo}_frame.jpg")
+                    if (fFrame.exists()) fFrame.delete()
+                }
+            }
+        } catch (_: Exception) {}
+
+        NexusThumbCache.mapaMiniaturas.remove(arq.dataUpload)
+        NexusThumbCache.mapaArquivosCompletos.remove(arq.dataUpload)
+        salvarVinculoPasta(context, arq.dataUpload, "")
+        salvarDonoFicheiro(context, arq.dataUpload, "")
+        vm.apagar(arq.id)
+    }
+
+    val qtd = listaArquivos.size
+    if (!apagarNaNuvemSSD) {
+        onComplete("$qtd ficheiro(s) removido(s) do aplicativo.")
+        return
+    }
+
+    idsRemotosParaApagar.forEach { fId ->
+        client.send(TdApi.DeleteFile().apply { fileId = fId }) {}
+    }
+
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+    val tagPerfil = "👤 [$chaveAtiva]"
+    val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 12, mutableListOf()) { todasMensagens ->
+                        val msgIdsParaApagar = mutableListOf<Long>()
+                        for (msg in todasMensagens) {
+                            val docContent = msg.content as? TdApi.MessageDocument ?: continue
+                            val legenda = docContent.caption?.text ?: ""
+                            val pertenceAoUsuario = legenda.contains(tagPerfil, ignoreCase = true) ||
+                                legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                legenda.contains("☁️ Nexus Cloud")
+
+                            if (pertenceAoUsuario) {
+                                val rId = docContent.document?.document?.id ?: 0
+                                val nomeBruto = docContent.document?.fileName ?: ""
+                                val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+
+                                if ((rId != 0 && idsRemotosParaApagar.contains(rId)) || nomesParaApagar.contains(nomeMsg)) {
+                                    msgIdsParaApagar.add(msg.id)
+                                }
+                            }
+                        }
+
+                        if (msgIdsParaApagar.isNotEmpty()) {
+                            val delReq = TdApi.DeleteMessages().apply {
+                                this.chatId = chatObj.id
+                                this.messageIds = msgIdsParaApagar.toLongArray()
+                                this.revoke = true
+                            }
+                            client.send(delReq) {
+                                onComplete("$qtd ficheiro(s) deletado(s) do app e da nuvem SSD!")
+                            }
+                        } else {
+                            onComplete("$qtd ficheiro(s) deletado(s)!")
+                        }
+                    }
+                } else {
+                    onComplete("$qtd ficheiro(s) deletado(s) localmente.")
+                }
+            }
+        } else {
+            onComplete("$qtd ficheiro(s) deletado(s) localmente.")
+        }
+    }
+}
+
+fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List<ArquivoNuvem>, pastas: List<PastaNuvem>) {
+    val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+    if (!prefs.getBoolean("migrated_v11_data", false)) {
+        val donosAtuais = carregarDonosFicheiros(context)
+        arquivos.forEach { arq ->
+            if (!donosAtuais.containsKey(arq.dataUpload)) {
+                salvarDonoFicheiro(context, arq.dataUpload, usuario)
+            }
+        }
+        pastas.forEach { p ->
+            associarPastaAoUsuario(context, usuario, p.nomePasta)
+        }
+        prefs.edit().putBoolean("migrated_v11_data", true).apply()
+    }
+    if (!prefs.getBoolean("fixed_video_thumbs_v19", false)) {
+        NexusThumbCache.limparCapasDeVideos(context, arquivos)
+        prefs.edit().putBoolean("fixed_video_thumbs_v19", true).apply()
+    }
+}
+
+fun miniaturaExisteLocalmente(caminhoMiniatura: String?, nomeArquivo: String = ""): Boolean {
+    val resolvido = resolverCaminhoCapaJpg(caminhoMiniatura)
+    if (resolvido.isBlank()) return false
+    if (resolvido.startsWith("content://")) {
+        return !ehArquivoVideo(nomeArquivo)
+    }
+    val limpo = if (resolvido.startsWith("file://")) Uri.parse(resolvido).path ?: resolvido.removePrefix("file://") else resolvido
+    if (limpo.isBlank()) return false
+    val f = File(limpo)
+    return f.exists() && f.length() > 256L
+}
+
+fun arquivoCompletoExisteLocalmente(caminho: String?): Boolean {
+    val c = caminho ?: return false
+    if (c.isBlank()) return false
+    if (c.startsWith("content://")) return true
+    val limpo = if (c.startsWith("file://")) Uri.parse(c).path ?: c.removePrefix("file://") else c
+    if (limpo.isBlank() || limpo.endsWith("_frame.jpg")) return false
+    val f = File(limpo)
+    return f.exists() && f.length() > 256L
+}
+
+fun limparDuplicadosExistentes(
+    context: Context,
+    todosArquivos: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onCleaned: () -> Unit
+) {
+    if (todosArquivos.isEmpty()) return
+    val donos = carregarDonosFicheiros(context)
+    val pastas = carregarVinculosPastas(context)
+
+    val grupos = todosArquivos.groupBy { arq ->
+        val dono = donos[arq.dataUpload] ?: ""
+        val nomeBase = limparPrefixoTimestamp(arq.nomeArquivo).lowercase(Locale.ROOT)
+        "${dono}|${nomeBase}|${arq.tamanhoBytes}"
+    }
+
+    var alterouAlgum = false
+    for ((_, listaGrupo) in grupos) {
+        if (listaGrupo.size > 1) {
+            val principal = listaGrupo.sortedWith(
+                compareByDescending<ArquivoNuvem> { miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(it), it.nomeArquivo) }
+                    .thenByDescending { it.fileId != 0 }
+                    .thenByDescending { !pastas[it.dataUpload].isNullOrBlank() }
+                    .thenBy { it.nomeArquivo.length }
+                    .thenBy { it.id }
+            ).first()
+
+            val pastaEncontrada = listaGrupo.firstNotNullOfOrNull { pastas[it.dataUpload] }
+            if (!pastaEncontrada.isNullOrBlank() && pastas[principal.dataUpload].isNullOrBlank()) {
+                salvarVinculoPasta(context, principal.dataUpload, pastaEncontrada)
+            }
+
+            val donoEncontrado = listaGrupo.firstNotNullOfOrNull { donos[it.dataUpload] }
+            if (!donoEncontrado.isNullOrBlank()) {
+                if (donos[principal.dataUpload].isNullOrBlank()) {
+                    salvarDonoFicheiro(context, principal.dataUpload, donoEncontrado)
+                }
+                if (!pastaEncontrada.isNullOrBlank()) {
+                    associarPastaAoUsuario(context, donoEncontrado, pastaEncontrada)
+                }
+                marcarFicheiroComoSincronizado(context, donoEncontrado, principal.nomeArquivo, principal.tamanhoBytes)
+            }
+
+            listaGrupo.forEach { item ->
+                if (item.id != principal.id) {
+                    vm.apagar(item.id)
+                    alterouAlgum = true
+                }
+            }
+            val nomeLimpoPrincipal = limparPrefixoTimestamp(principal.nomeArquivo)
+            if (principal.nomeArquivo != nomeLimpoPrincipal) {
+                vm.renomearArquivo(principal, nomeLimpoPrincipal)
+                alterouAlgum = true
+            }
+        } else {
+            val unico = listaGrupo.first()
+            val donoUnico = donos[unico.dataUpload] ?: ""
+            val pastaUnico = pastas[unico.dataUpload] ?: ""
+            if (donoUnico.isNotBlank()) {
+                marcarFicheiroComoSincronizado(context, donoUnico, unico.nomeArquivo, unico.tamanhoBytes)
+                if (pastaUnico.isNotBlank()) {
+                    associarPastaAoUsuario(context, donoUnico, pastaUnico)
+                }
+            }
+            val nomeLimpo = limparPrefixoTimestamp(unico.nomeArquivo)
+            if (unico.nomeArquivo != nomeLimpo) {
+                vm.renomearArquivo(unico, nomeLimpo)
+                alterouAlgum = true
+            }
+        }
+    }
+
+    if (alterouAlgum) {
+        onCleaned()
+    }
+}
+
+// Extrai o array de mensagens de qualquer resposta do TDLib (compatível com TdApi.Messages e TdApi.FoundChatMessages)
+fun extrairArrayMensagensTDLib(obj: TdApi.Object?): Array<TdApi.Message>? {
+    if (obj == null) return null
+    if (obj is TdApi.Messages) return obj.messages
     return try {
-        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeFile(origemFile.absolutePath, opts)
-        if (opts.outWidth <= 0 || opts.outHeight <= 0) return false
-        var sample = 1
-        while (opts.outWidth / sample > maxDim * 2 || opts.outHeight / sample > maxDim * 2) {
-            sample *= 2
+        @Suppress("UNCHECKED_CAST")
+        obj.javaClass.getField("messages").get(obj) as? Array<TdApi.Message>
+    } catch (_: Exception) {
+        null
+    }
+}
+
+// Busca diretamente no servidor da nuvem SSD por um termo (ex: "REGISTO_COFRE" ou nome do usuário),
+// funcionando imediatamente mesmo em uma instalação limpa com milhares de arquivos!
+fun buscarMensagensPorTermoNaNuvem(
+    client: Client,
+    chatId: Long,
+    termo: String,
+    onResult: (List<TdApi.Message>) -> Unit
+) {
+    if (termo.isBlank()) {
+        onResult(emptyList())
+        return
+    }
+    try {
+        val req = TdApi.SearchChatMessages().apply {
+            this.chatId = chatId
+            this.query = termo
+            this.fromMessageId = 0L
+            this.offset = 0
+            this.limit = 100
         }
-        val decodeOpts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bmp = BitmapFactory.decodeFile(origemFile.absolutePath, decodeOpts) ?: return false
-        val escala = min(maxDim.toFloat() / bmp.width, maxDim.toFloat() / bmp.height).coerceAtMost(1f)
-        val reduzido = if (escala < 1f) {
-            Bitmap.createScaledBitmap(
-                bmp,
-                max(1, (bmp.width * escala).toInt()),
-                max(1, (bmp.height * escala).toInt()),
-                true
+        client.send(req) { obj ->
+            val arr = extrairArrayMensagensTDLib(obj)
+            onResult(arr?.filterNotNull() ?: emptyList())
+        }
+    } catch (_: Exception) {
+        onResult(emptyList())
+    }
+}
+
+// Paginação robusta para novas instalações: aguarda sincronização inicial do servidor se o cache local vier vazio
+fun buscarHistoricoPaginado(
+    client: Client,
+    chatId: Long,
+    fromMsgId: Long,
+    lotesRestantes: Int,
+    acumulado: MutableList<TdApi.Message>,
+    tentativasVazio: Int = 0,
+    onComplete: (List<TdApi.Message>) -> Unit
+) {
+    if (lotesRestantes <= 0) {
+        onComplete(acumulado.distinctBy { it.id })
+        return
+    }
+    if (fromMsgId == 0L && tentativasVazio == 0) {
+        try { client.send(TdApi.OpenChat(chatId)) {} } catch (_: Exception) {}
+    }
+
+    val req = TdApi.GetChatHistory().apply {
+        this.chatId = chatId
+        this.fromMessageId = fromMsgId
+        this.offset = 0
+        this.limit = 100
+        this.onlyLocal = false
+    }
+    client.send(req) { obj ->
+        val msgs = extrairArrayMensagensTDLib(obj)?.filterNotNull() ?: emptyList()
+        if (msgs.isNotEmpty()) {
+            acumulado.addAll(msgs)
+            val ultimoId = msgs.last().id
+            if (ultimoId != 0L && ultimoId != fromMsgId) {
+                buscarHistoricoPaginado(client, chatId, ultimoId, lotesRestantes - 1, acumulado, 0, onComplete)
+            } else {
+                onComplete(acumulado.distinctBy { it.id })
+            }
+        } else if (acumulado.size <= 1 && tentativasVazio < 5) {
+            // Na nova instalação o TDLib busca do servidor em segundo plano na 1ª chamada; aguarda e tenta novamente
+            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                delay(550)
+                buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
+            }
+        } else {
+            onComplete(acumulado.distinctBy { it.id })
+        }
+    }
+}
+
+// Varre a nuvem SSD automaticamente após o login para descobrir cofres existentes em novas instalações
+fun descobrirPerfisExistentesNaNuvem(
+    context: Context,
+    client: Client,
+    onFound: (List<String>) -> Unit
+) {
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsBusca ->
+                        buscarHistoricoPaginado(client, chatObj.id, 0L, 10, mutableListOf()) { msgsHist ->
+                            val todas = (msgsBusca + msgsHist).distinctBy { it.id }
+                            val nomesEncontrados = mutableMapOf<String, String>()
+
+                            // 1. Extrai todos os registos de cofre com PIN e salva localmente
+                            for (msg in todas) {
+                                val texto = when (val c = msg.content) {
+                                    is TdApi.MessageText -> c.text?.text ?: ""
+                                    is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                    else -> ""
+                                }
+                                if (texto.contains("[REGISTO_COFRE]")) {
+                                    val partes = texto.split("|").map { it.trim() }
+                                    val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                    val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                    val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+
+                                    val chave = normalizarUsuario(userPart ?: nomePart ?: "")
+                                    val exibicao = (nomePart ?: userPart ?: "").trim()
+                                    if (chave.isNotBlank() && exibicao.isNotBlank()) {
+                                        if (!nomesEncontrados.containsKey(chave)) {
+                                            nomesEncontrados[chave] = exibicao
+                                        }
+                                        if (!pinPart.isNullOrBlank()) {
+                                            val definirAtivo = obterUltimoUsuarioCofre(context).isBlank()
+                                            salvarCredenciaisCofreLocal(context, exibicao, pinPart, definirComoAtivo = definirAtivo)
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 2. Também reconhece perfis que já possuem arquivos "👤 [nome]" enviados na nuvem
+                            for (msg in todas) {
+                                val doc = msg.content as? TdApi.MessageDocument ?: continue
+                                val leg = doc.caption?.text ?: ""
+                                if (leg.contains("👤 [")) {
+                                    val bruto = leg.substringAfter("👤 [").substringBefore("]").trim()
+                                    val chave = normalizarUsuario(bruto)
+                                    if (chave.isNotBlank() && !nomesEncontrados.containsKey(chave)) {
+                                        nomesEncontrados[chave] = bruto
+                                    }
+                                }
+                            }
+
+                            val locais = listarPerfisSalvosLocalmente(context)
+                            locais.forEach { loc ->
+                                val ch = normalizarUsuario(loc)
+                                if (ch.isNotBlank() && !nomesEncontrados.containsKey(ch)) {
+                                    nomesEncontrados[ch] = loc
+                                }
+                            }
+
+                            onFound(nomesEncontrados.values.toList())
+                        }
+                    }
+                } else onFound(listarPerfisSalvosLocalmente(context))
+            }
+        } else onFound(listarPerfisSalvosLocalmente(context))
+    }
+}
+
+// Verifica ou regista o cofre combinando Busca no Servidor + Histórico + Reconhecimento de Arquivos Existentes
+fun verificarOuRegistarCofreNuvem(
+    client: Client,
+    nomeUsuario: String,
+    pin: String,
+    modoCriarNovo: Boolean,
+    onResult: (Boolean, String, String) -> Unit
+) {
+    val chaveDesejada = normalizarUsuario(nomeUsuario)
+    val pinLimpo = pin.trim()
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsRegisto ->
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeUsuario.trim()) { msgsUsuario ->
+                            buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
+                                val todasMensagens = (msgsRegisto + msgsUsuario + msgsHistorico).distinctBy { it.id }
+
+                                var pinEncontrado: String? = null
+                                var nomeOriginalEncontrado = nomeUsuario.trim()
+                                var temArquivosDoUsuarioNaNuvem = false
+
+                                for (msg in todasMensagens) {
+                                    val texto = when (val c = msg.content) {
+                                        is TdApi.MessageText -> c.text?.text ?: ""
+                                        is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                        else -> ""
+                                    }
+
+                                    if (texto.contains("[REGISTO_COFRE]") && pinEncontrado == null) {
+                                        val partes = texto.split("|").map { it.trim() }
+                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+
+                                        val chaveMsg = normalizarUsuario(userPart ?: nomePart ?: "")
+                                        if (chaveMsg == chaveDesejada && !pinPart.isNullOrBlank()) {
+                                            pinEncontrado = pinPart
+                                            if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
+                                        }
+                                    }
+
+                                    if (msg.content is TdApi.MessageDocument) {
+                                        if (texto.contains("👤 [$chaveDesejada]", ignoreCase = true) ||
+                                            texto.contains("👤 [${nomeUsuario.trim()}]", ignoreCase = true)
+                                        ) {
+                                            temArquivosDoUsuarioNaNuvem = true
+                                            val extraido = texto.substringAfter("👤 [", "").substringBefore("]", "").trim()
+                                            if (extraido.isNotBlank() && nomeOriginalEncontrado.equals(nomeUsuario.trim(), ignoreCase = true)) {
+                                                nomeOriginalEncontrado = extraido
+                                            }
+                                        }
+                                    }
+                                }
+
+                                fun gravarRegistoNaNuvem(nomeConfirmado: String, mensagemSucesso: String) {
+                                    val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeConfirmado.trim()} | PIN:$pinLimpo"
+                                    val msgContent = TdApi.InputMessageText().apply {
+                                        text = TdApi.FormattedText(regTexto, emptyArray())
+                                    }
+                                    val sendReq = TdApi.SendMessage().apply {
+                                        chatId = chatObj.id
+                                        inputMessageContent = msgContent
+                                    }
+                                    client.send(sendReq) {
+                                        onResult(true, nomeConfirmado.trim(), mensagemSucesso)
+                                    }
+                                }
+
+                                if (modoCriarNovo) {
+                                    when {
+                                        pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                            // O usuário já era dono deste cofre e digitou o PIN correto: entra direto sem erro!
+                                            onResult(true, nomeOriginalEncontrado, "Cofre existente reconhecido e restaurado!")
+                                        }
+                                        pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                            onResult(false, "", "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
+                                        }
+                                        temArquivosDoUsuarioNaNuvem -> {
+                                            // Já existiam arquivos desse perfil na nuvem sem registo recente: vincula o PIN e restaura
+                                            gravarRegistoNaNuvem(nomeOriginalEncontrado, "Perfil existente vinculado e restaurado!")
+                                        }
+                                        else -> {
+                                            gravarRegistoNaNuvem(nomeUsuario.trim(), "Cofre SSD criado com sucesso!")
+                                        }
+                                    }
+                                } else {
+                                    when {
+                                        pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                            onResult(true, nomeOriginalEncontrado, "Cofre SSD desbloqueado!")
+                                        }
+                                        pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                            onResult(false, "", "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
+                                        }
+                                        temArquivosDoUsuarioNaNuvem -> {
+                                            // Encontrou os arquivos do usuário na nuvem SSD (mesmo que o registo antigo tenha ficado para trás)
+                                            gravarRegistoNaNuvem(nomeOriginalEncontrado, "Cofre '$nomeOriginalEncontrado' reconhecido na nuvem SSD!")
+                                        }
+                                        else -> {
+                                            onResult(false, "", "Cofre '${nomeUsuario.trim()}' não encontrado na nuvem SSD. Verifique o nome ou use 'CRIAR COFRE'.")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    onResult(false, "", "Erro ao aceder ao cofre na nuvem SSD.")
+                }
+            }
+        } else {
+            onResult(false, "", "Sessão SSD indisponível.")
+        }
+    }
+}
+
+fun calcularBrilhoMedioBitmap(bmp: Bitmap): Int {
+    if (bmp.width <= 0 || bmp.height <= 0) return 0
+    var somaBrilho = 0L
+    var totalAmostras = 0
+    val cols = 5
+    val rows = 5
+    for (ix in 1..cols) {
+        for (iy in 1..rows) {
+            val x = ((bmp.width * ix) / (cols + 1)).coerceIn(0, bmp.width - 1)
+            val y = ((bmp.height * iy) / (rows + 1)).coerceIn(0, bmp.height - 1)
+            val px = bmp.getPixel(x, y)
+            val r = (px shr 16) and 0xFF
+            val g = (px shr 8) and 0xFF
+            val b = px and 0xFF
+            val luma = (r * 299 + g * 587 + b * 114) / 1000
+            somaBrilho += luma
+            totalAmostras++
+        }
+    }
+    return if (totalAmostras > 0) (somaBrilho / totalAmostras).toInt() else 0
+}
+
+fun bitmapNaoEhTotalmentePreto(bmp: Bitmap): Boolean {
+    return calcularBrilhoMedioBitmap(bmp) >= 26
+}
+
+fun clarearBitmapVideoSeNecessario(origem: Bitmap): Bitmap {
+    val brilho = calcularBrilhoMedioBitmap(origem)
+    if (brilho >= 68) return origem
+
+    return try {
+        val fatorEscala = when {
+            brilho < 20 -> 1.75f
+            brilho < 40 -> 1.48f
+            else -> 1.25f
+        }
+        val offsetLuz = when {
+            brilho < 20 -> 42f
+            brilho < 40 -> 28f
+            else -> 16f
+        }
+        val cm = ColorMatrix(
+            floatArrayOf(
+                fatorEscala, 0f, 0f, 0f, offsetLuz,
+                0f, fatorEscala, 0f, 0f, offsetLuz,
+                0f, 0f, fatorEscala, 0f, offsetLuz,
+                0f, 0f, 0f, 1f, 0f
             )
-        } else bmp
-        destinoJpg.parentFile?.mkdirs()
-        FileOutputStream(destinoJpg).use { out ->
-            reduzido.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        )
+        val resultado = Bitmap.createBitmap(origem.width, origem.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(resultado)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            colorFilter = ColorMatrixColorFilter(cm)
         }
-        destinoJpg.exists() && destinoJpg.length() > 100L
+        canvas.drawBitmap(origem, 0f, 0f, paint)
+        resultado
+    } catch (_: Exception) {
+        origem
+    }
+}
+
+fun extrairCapaVideoParaArquivo(
+    context: Context,
+    arquivoVideo: File?,
+    uriFallback: Uri?,
+    destinoFrame: File
+): Boolean {
+    if (destinoFrame.exists() && destinoFrame.length() > 256L) {
+        val existenteBmp = try { BitmapFactory.decodeFile(destinoFrame.absolutePath) } catch (_: Exception) { null }
+        if (existenteBmp != null && calcularBrilhoMedioBitmap(existenteBmp) >= 35) {
+            return true
+        }
+    }
+
+    var melhorBitmap: Bitmap? = null
+    var melhorBrilho = -1
+
+    val retriever = MediaMetadataRetriever()
+    try {
+        if (arquivoVideo != null && arquivoVideo.exists() && arquivoVideo.length() > 100L) {
+            retriever.setDataSource(arquivoVideo.absolutePath)
+        } else if (uriFallback != null) {
+            retriever.setDataSource(context, uriFallback)
+        }
+
+        val duracaoMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        val temposUs = mutableListOf<Long>()
+        if (duracaoMs > 500L) {
+            temposUs.add((duracaoMs * 250L))
+            temposUs.add((duracaoMs * 450L))
+            temposUs.add((duracaoMs * 150L))
+            temposUs.add((duracaoMs * 650L))
+        }
+        temposUs.addAll(listOf(1_500_000L, 3_000_000L, 800_000L, 300_000L, 0L))
+
+        for (t in temposUs) {
+            val candidato = try {
+                retriever.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST)
+                    ?: retriever.getFrameAtTime(t, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: retriever.getFrameAtTime(t)
+            } catch (_: Exception) {
+                null
+            }
+            if (candidato != null) {
+                val b = calcularBrilhoMedioBitmap(candidato)
+                if (b > melhorBrilho) {
+                    melhorBrilho = b
+                    melhorBitmap = candidato
+                }
+                if (b >= 48) break
+            }
+        }
+    } catch (_: Exception) {
+    } finally {
+        try { retriever.release() } catch (_: Exception) {}
+    }
+
+    if ((melhorBitmap == null || melhorBrilho < 20) && arquivoVideo != null && arquivoVideo.exists()) {
+        try {
+            @Suppress("DEPRECATION")
+            val thumbFallback = ThumbnailUtils.createVideoThumbnail(
+                arquivoVideo.absolutePath,
+                MediaStore.Images.Thumbnails.MINI_KIND
+            )
+            if (thumbFallback != null) {
+                val b = calcularBrilhoMedioBitmap(thumbFallback)
+                if (melhorBitmap == null || b > melhorBrilho) {
+                    melhorBitmap = thumbFallback
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    val bmpBruto = melhorBitmap ?: return false
+    val bmpFinal = clarearBitmapVideoSeNecessario(bmpBruto)
+
+    return try {
+        val tempFile = File("${destinoFrame.absolutePath}.tmp")
+        FileOutputStream(tempFile).use { out ->
+            bmpFinal.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        }
+        if (tempFile.exists() && tempFile.length() > 256L) {
+            if (destinoFrame.exists()) destinoFrame.delete()
+            tempFile.renameTo(destinoFrame)
+            true
+        } else {
+            tempFile.delete()
+            false
+        }
     } catch (_: Exception) {
         false
     }
 }
 
-fun gerarCapaPdf(context: Context, uri: Uri, nome: String): String? {
+fun gerarMiniaturaImagemLeve(arquivoImagem: File, destinoFrame: File): Boolean {
+    if (destinoFrame.exists() && destinoFrame.length() > 256L) return true
     return try {
-        val dir = File(context.cacheDir, "thumbs_privadas").apply { mkdirs() }
-        val outFile = File(dir, "pdf_${nome.hashCode()}_${System.currentTimeMillis()}.jpg")
-        context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+        val optsBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(arquivoImagem.absolutePath, optsBounds)
+        if (optsBounds.outWidth <= 0 || optsBounds.outHeight <= 0) return false
+
+        var sample = 1
+        while (optsBounds.outWidth / sample > 360 || optsBounds.outHeight / sample > 360) {
+            sample *= 2
+        }
+        val optsDecode = BitmapFactory.Options().apply {
+            inSampleSize = sample.coerceAtLeast(1)
+            inPreferredConfig = Bitmap.Config.ARGB_8888
+        }
+        val bmp = BitmapFactory.decodeFile(arquivoImagem.absolutePath, optsDecode) ?: return false
+        val tempFile = File("${destinoFrame.absolutePath}.tmp")
+        FileOutputStream(tempFile).use { out ->
+            bmp.compress(Bitmap.CompressFormat.JPEG, 86, out)
+        }
+        if (tempFile.exists() && tempFile.length() > 256L) {
+            if (destinoFrame.exists()) destinoFrame.delete()
+            tempFile.renameTo(destinoFrame)
+            true
+        } else {
+            tempFile.delete()
+            false
+        }
+    } catch (_: Exception) {
+        false
+    }
+}
+
+fun salvarMiniaturaRapidaTDLib(context: Context, arquivoThumb: File, fileId: Int, nomeArquivo: String): String {
+    return try {
+        if (!arquivoThumb.exists() || arquivoThumb.length() <= 100L) return ""
+        val ehVid = ehArquivoVideo(nomeArquivo)
+        val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
+        val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val fFrame = File(dir, "fast_${fileId}_${nomeSeguro}_frame.jpg")
+
+        val bmp = BitmapFactory.decodeFile(arquivoThumb.absolutePath) ?: return ""
+        if (bmp.width <= 0 || bmp.height <= 0) return ""
+
+        val brilho = calcularBrilhoMedioBitmap(bmp)
+        if (ehVid && brilho < 22) {
+            return ""
+        }
+
+        val bmpAjustado = if (ehVid) clarearBitmapVideoSeNecessario(bmp) else bmp
+        FileOutputStream(fFrame).use { out ->
+            bmpAjustado.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        }
+        if (fFrame.exists() && fFrame.length() > 256L) {
+            Uri.fromFile(fFrame).toString()
+        } else ""
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, nomeArquivo: String): String {
+    return try {
+        if (!arquivoOrigem.exists() || arquivoOrigem.length() <= 100L) return ""
+        val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
+        val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val baseFile = File(dir, "thumb_${arquivoOrigem.length()}_$nomeSeguro")
+        val frameFile = File("${baseFile.absolutePath}_frame.jpg")
+
+        if (ehArquivoVideo(nomeSeguro)) {
+            val ok = extrairCapaVideoParaArquivo(context, arquivoOrigem, null, frameFile)
+            return if (ok && frameFile.exists() && frameFile.length() > 256L) {
+                Uri.fromFile(frameFile).toString()
+            } else ""
+        }
+
+        if (!baseFile.exists() || baseFile.length() <= 100L) {
+            FileInputStream(arquivoOrigem).use { inp ->
+                FileOutputStream(baseFile).use { out -> inp.copyTo(out) }
+            }
+        }
+
+        if (ehArquivoImagem(nomeSeguro)) {
+            val gerou = gerarMiniaturaImagemLeve(baseFile, frameFile)
+            return if (gerou && frameFile.exists()) Uri.fromFile(frameFile).toString() else Uri.fromFile(baseFile).toString()
+        } else if (descobrirMimeType(nomeSeguro) == "application/pdf") {
+            val capaPdf = gerarCapaPdf(baseFile)
+            return if (capaPdf != null && capaPdf.exists()) Uri.fromFile(capaPdf).toString() else ""
+        }
+        Uri.fromFile(baseFile).toString()
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
+    val daLegenda = if (legenda.contains("• ")) {
+        legenda.substringAfterLast("• ").trim()
+    } else ""
+    val candidato = if (daLegenda.isNotBlank() && daLegenda.contains(".")) daLegenda else nomeDocumento
+    return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
+}
+
+// === SINCRONIZAÇÃO COM BARRA DE CONTAGEM DE ARQUIVOS NA NUVEM ===
+fun sincronizarCofreDaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arquivosAtuaisReais: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onComplete: (Int) -> Unit
+) {
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+    val tagPerfil = "👤 [$chaveAtiva]"
+    val tagPerfilExibicao = "👤 [$usuarioAtivo]"
+
+    NexusLeituraNuvem.iniciar(1, "Conectando à nuvem SSD de $usuarioAtivo...")
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, usuarioAtivo.trim()) { msgsBusca ->
+                        buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
+                            val todasMensagens = (msgsBusca + msgsHistorico).distinctBy { it.id }
+                            val mensagensDoUsuario = todasMensagens.filter { msg ->
+                                val docContent = msg.content as? TdApi.MessageDocument ?: return@filter false
+                                val legenda = docContent.caption?.text ?: ""
+                                legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)
+                            }
+
+                            val totalNaNuvem = mensagensDoUsuario.size
+                            if (totalNaNuvem > 0) {
+                                NexusLeituraNuvem.iniciar(totalNaNuvem, "Lendo arquivos da nuvem SSD...")
+                            } else {
+                                NexusLeituraNuvem.encerrar()
+                                onComplete(0)
+                                return@buscarHistoricoPaginado
+                            }
+
+                            var importados = 0
+                            val donosAtuais = carregarDonosFicheiros(context)
+                            val pastasAtuais = carregarVinculosPastas(context)
+
+                            val mapaExistentesPorChave = arquivosAtuaisReais
+                                .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                                .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                                .toMutableMap()
+
+                            val nomesExistentes = arquivosAtuaisReais
+                                .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                                .map { limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT) }
+                                .toMutableSet()
+
+                            mensagensDoUsuario.forEachIndexed { index, msg ->
+                                val docContent = msg.content as? TdApi.MessageDocument ?: return@forEachIndexed
+                                val legenda = docContent.caption?.text ?: ""
+                                val rId = docContent.document?.document?.id ?: 0
+                                val thumbObj = docContent.document?.thumbnail?.file
+                                val thumbId = thumbObj?.id ?: 0
+                                val thumbPathLocal = thumbObj?.local?.path ?: ""
+
+                                if (rId != 0 && thumbId != 0) {
+                                    NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
+                                }
+
+                                val nomeBruto = docContent.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                                val nomeLower = nomeDoc.lowercase(Locale.ROOT)
+                                val tam = docContent.document?.document?.size ?: 0L
+                                val chaveUnica = "$nomeLower|$tam"
+
+                                NexusLeituraNuvem.avancar(
+                                    novoLido = index + 1,
+                                    novoTotal = totalNaNuvem,
+                                    texto = "Lendo nuvem SSD: $nomeDoc"
+                                )
+
+                                if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+                                    return@forEachIndexed
+                                }
+
+                                val pastaBruta = if (legenda.contains("📁 [")) {
+                                    legenda.substringAfter("📁 [").substringBefore("]").trim()
+                                } else ""
+                                val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaBruta)
+                                val pastaFinal = if (pastaResolvida.isNotBlank() && !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)) {
+                                    pastaResolvida
+                                } else ""
+
+                                if (pastaFinal.isNotBlank()) {
+                                    vm.criarPasta(pastaFinal)
+                                    associarPastaAoUsuario(context, usuarioAtivo, pastaFinal)
+                                }
+
+                                marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeDoc, tam)
+
+                                val caminhoLocalExistente = docContent.document?.document?.local?.path ?: ""
+                                val uriMiniaturaInicial = when {
+                                    caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
+                                        prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
+                                    thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
+                                        salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
+                                    else -> ""
+                                }
+
+                                val arqExistente = mapaExistentesPorChave[chaveUnica]
+                                if (arqExistente != null) {
+                                    if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
+                                        salvarVinculoPasta(context, arqExistente.dataUpload, pastaFinal)
+                                    }
+                                    if (uriMiniaturaInicial.isNotBlank()) {
+                                        NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
+                                    }
+                                    if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                        NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                    }
+                                    if ((rId != 0 && arqExistente.fileId != rId) ||
+                                        (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
+                                    ) {
+                                        vm.salvarArquivo(
+                                            arqExistente.copy(
+                                                fileId = if (rId != 0) rId else arqExistente.fileId,
+                                                caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
+                                            )
+                                        )
+                                    }
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+                                } else if (!nomesExistentes.contains(nomeLower)) {
+                                    nomesExistentes.add(nomeLower)
+                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+
+                                    val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + index
+                                    salvarDonoFicheiro(context, ts, usuarioAtivo)
+                                    if (pastaFinal.isNotBlank()) {
+                                        salvarVinculoPasta(context, ts, pastaFinal)
+                                    }
+                                    if (uriMiniaturaInicial.isNotBlank()) {
+                                        NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
+                                    }
+                                    if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                    }
+
+                                    val novoArq = ArquivoNuvem(
+                                        fileId = rId,
+                                        nomeArquivo = nomeDoc,
+                                        tamanhoBytes = tam,
+                                        dataUpload = ts,
+                                        caminhoMiniatura = uriMiniaturaInicial
+                                    )
+                                    mapaExistentesPorChave[chaveUnica] = novoArq
+                                    vm.salvarArquivo(novoArq)
+                                    importados++
+                                }
+                            }
+
+                            onComplete(importados)
+                        }
+                    }
+                } else {
+                    NexusLeituraNuvem.encerrar()
+                    onComplete(0)
+                }
+            }
+        } else {
+            NexusLeituraNuvem.encerrar()
+            onComplete(0)
+        }
+    }
+}
+
+// === FILA DE CARREGAMENTO DE MINIATURAS EM SEGUNDO PLANO ===
+suspend fun carregarMiniaturaIndividualDaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arq: ArquivoNuvem,
+    vm: UIViewModel,
+    atualizarSubBarra: Boolean = false
+): String = withContext(Dispatchers.IO) {
+    val jaTem = NexusThumbCache.obterMiniatura(arq)
+    if (jaTem.isNotBlank() && miniaturaExisteLocalmente(jaTem, arq.nomeArquivo)) {
+        return@withContext jaTem
+    }
+
+    val completoLocal = NexusThumbCache.obterArquivoCompleto(arq)
+    if (completoLocal.isNotBlank()) {
+        val limpoComp = if (completoLocal.startsWith("file://")) Uri.parse(completoLocal).path ?: completoLocal.removePrefix("file://") else completoLocal
+        val fComp = File(limpoComp)
+        if (fComp.exists() && fComp.length() > 256L) {
+            val geradaLocal = prepararMiniaturaDeFicheiroBaixado(context, fComp, arq.nomeArquivo)
+            if (geradaLocal.isNotBlank()) {
+                withContext(Dispatchers.Main) {
+                    vm.atualizarCaminhoMiniatura(context, arq, geradaLocal)
+                }
+                return@withContext geradaLocal
+            }
+        }
+    }
+
+    var fIdAtual = arq.fileId
+    var thumbIdLeve = NexusThumbCache.mapaThumbIdsNuvem[fIdAtual] ?: 0
+
+    if ((fIdAtual == 0 || (thumbIdLeve == 0 && ehArquivoVideo(arq.nomeArquivo))) && usuarioAtivo.isNotBlank()) {
+        val (recFileId, recThumbId) = recuperarFileIdNaNuvemPorNome(client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
+        if (recFileId != 0) {
+            fIdAtual = recFileId
+            if (recThumbId != 0) {
+                thumbIdLeve = recThumbId
+                NexusThumbCache.salvarThumbIdNuvem(context, recFileId, recThumbId)
+            }
+        }
+    }
+
+    var miniaturaPronta = ""
+
+    if (thumbIdLeve != 0) {
+        val arqThumb = baixarArquivoTDLibAssincrono(client, thumbIdLeve, prioridade = 30, maxTentativas = 80, controlarPausaTransfer = false) { pct, _, _ ->
+            if (atualizarSubBarra) {
+                NexusLeituraNuvem.atualizarSubProgresso(pct, "Carregando capa: ${arq.nomeArquivo}")
+            }
+        }
+        if (arqThumb != null && arqThumb.exists() && arqThumb.length() > 100L) {
+            miniaturaPronta = salvarMiniaturaRapidaTDLib(context, arqThumb, fIdAtual, arq.nomeArquivo)
+        }
+    }
+
+    val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+    val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) ||
+        ehArquivoVideo(arq.nomeArquivo) ||
+        ext == "PDF"
+
+    if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && arq.tamanhoBytes <= 250L * 1024L * 1024L) {
+        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 24, maxTentativas = 450, controlarPausaTransfer = false) { pct, _, _ ->
+            if (atualizarSubBarra) {
+                NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
+            }
+        }
+        if (arqFull != null && arqFull.exists() && arqFull.length() > 100L) {
+            NexusThumbCache.salvarArquivoCompleto(context, arq.dataUpload, Uri.fromFile(arqFull).toString())
+            miniaturaPronta = prepararMiniaturaDeFicheiroBaixado(context, arqFull, arq.nomeArquivo)
+        }
+    }
+
+    if (miniaturaPronta.isNotBlank()) {
+        withContext(Dispatchers.Main) {
+            vm.atualizarCaminhoMiniatura(context, arq, miniaturaPronta)
+        }
+    }
+    return@withContext miniaturaPronta
+}
+
+// === ABERTURA E DOWNLOAD DE FICHEIROS COM SUPORTE A PAUSAR E CONTINUAR ===
+fun garantirFicheiroLocal(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arq: ArquivoNuvem,
+    vm: UIViewModel,
+    onReady: (ArquivoNuvem) -> Unit
+) {
+    val completoCache = NexusThumbCache.obterArquivoCompleto(arq)
+    if (completoCache.isNotBlank() && arquivoCompletoExisteLocalmente(completoCache)) {
+        onReady(arq.copy(caminhoMiniatura = completoCache))
+        return
+    }
+
+    val thumbAtual = NexusThumbCache.obterMiniatura(arq)
+    if (!ehArquivoVideo(arq.nomeArquivo) && thumbAtual.isNotBlank()) {
+        val limpo = if (thumbAtual.startsWith("file://")) Uri.parse(thumbAtual).path ?: thumbAtual.removePrefix("file://") else thumbAtual
+        val fOrig = File(limpo.removeSuffix("_frame.jpg"))
+        if (fOrig.exists() && fOrig.length() > 256L) {
+            onReady(arq.copy(caminhoMiniatura = Uri.fromFile(fOrig).toString()))
+            return
+        }
+    }
+
+    kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
+        var targetFileId = arq.fileId
+        NexusTransfer.iniciar(
+            texto = "Baixando '${arq.nomeArquivo}' (5%)...",
+            upload = false,
+            fileId = targetFileId
+        )
+
+        var arquivoBaixado = withContext(Dispatchers.IO) {
+            if (targetFileId != 0) {
+                baixarArquivoTDLibAssincrono(
+                    client = client,
+                    fileId = targetFileId,
+                    prioridade = 32,
+                    maxTentativas = 800,
+                    controlarPausaTransfer = true
+                ) { pct, baixadoBytes, totalBytes ->
+                    val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
+                    val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                    NexusTransfer.progress.value = pct
+                    NexusTransfer.label.value = if (totalBytes > 0) {
+                        "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
+                    } else {
+                        "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                    }
+                }
+            } else null
+        }
+
+        if (NexusTransfer.cancelado.value) {
+            NexusTransfer.encerrar()
+            Toast.makeText(context, "Download de '${arq.nomeArquivo}' cancelado.", Toast.LENGTH_SHORT).show()
+            return@launch
+        }
+
+        if (arquivoBaixado == null && usuarioAtivo.isNotBlank()) {
+            NexusTransfer.label.value = "Localizando '${arq.nomeArquivo}' na nuvem SSD..."
+            val (novoId, novoThumbId) = withContext(Dispatchers.IO) {
+                recuperarFileIdNaNuvemPorNome(client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
+            }
+            if (novoId != 0 && !NexusTransfer.cancelado.value) {
+                targetFileId = novoId
+                NexusTransfer.fileIdAtivo.value = novoId
+                if (novoThumbId != 0) {
+                    NexusThumbCache.salvarThumbIdNuvem(context, novoId, novoThumbId)
+                }
+                arquivoBaixado = withContext(Dispatchers.IO) {
+                    baixarArquivoTDLibAssincrono(
+                        client = client,
+                        fileId = novoId,
+                        prioridade = 32,
+                        maxTentativas = 800,
+                        controlarPausaTransfer = true
+                    ) { pct, baixadoBytes, totalBytes ->
+                        val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
+                        val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                        NexusTransfer.progress.value = pct
+                        NexusTransfer.label.value = if (totalBytes > 0) {
+                            "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
+                        } else {
+                            "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                        }
+                    }
+                }
+            }
+        }
+
+        val foiCancelado = NexusTransfer.cancelado.value
+        NexusTransfer.encerrar()
+        if (foiCancelado) {
+            Toast.makeText(context, "Download cancelado.", Toast.LENGTH_SHORT).show()
+            return@launch
+        }
+
+        if (arquivoBaixado != null && arquivoBaixado.exists() && arquivoBaixado.length() > 100L) {
+            val capaJpg = withContext(Dispatchers.IO) {
+                prepararMiniaturaDeFicheiroBaixado(context, arquivoBaixado, arq.nomeArquivo)
+            }
+            val uriRealCompleto = Uri.fromFile(arquivoBaixado).toString()
+            NexusThumbCache.salvarArquivoCompleto(context, arq.dataUpload, uriRealCompleto)
+            if (capaJpg.isNotBlank()) {
+                vm.atualizarCaminhoMiniatura(context, arq, capaJpg)
+            }
+            onReady(
+                arq.copy(
+                    fileId = if (targetFileId != 0) targetFileId else arq.fileId,
+                    caminhoMiniatura = uriRealCompleto
+                )
+            )
+        } else {
+            Toast.makeText(context, "Não foi possível carregar '${arq.nomeArquivo}' da nuvem agora.", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+// === DETETOR DE NOVOS FICHEIROS NAS PASTAS SELECIONADAS ===
+data class PastaSync(val uri: String, val nome: String, var ativa: Boolean)
+
+data class NovoArquivoSync(
+    val uri: Uri,
+    val nome: String,
+    val tamanho: Long,
+    val nomePastaOrigem: String
+)
+
+fun carregarPastasSync(context: Context, usuario: String): List<PastaSync> {
+    val sufixo = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE)
+    val lista = mutableListOf<PastaSync>()
+    prefs.all.forEach { (uriStr, ativo) ->
+        if (ativo is Boolean) {
+            val decodedPath = Uri.decode(uriStr)
+            val nome = decodedPath.substringAfterLast(":", "Pasta").substringAfterLast("/")
+            lista.add(PastaSync(uriStr, nome.ifBlank { "Pasta Selecionada" }, ativo))
+        }
+    }
+    return lista.distinctBy { it.uri }
+}
+
+fun salvarPastaSync(context: Context, usuario: String, uri: String, ativa: Boolean) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().putBoolean(uri, ativa).apply()
+}
+
+fun removerPastaSync(context: Context, usuario: String, uri: String) {
+    val sufixo = normalizarUsuario(usuario)
+    context.getSharedPreferences("nexus_sync_prefs_$sufixo", Context.MODE_PRIVATE).edit().remove(uri).apply()
+}
+
+fun procurarNovosFicheirosNasPastas(
+    context: Context,
+    usuarioAtivo: String,
+    arquivosNoCofre: List<ArquivoNuvem>
+): List<NovoArquivoSync> {
+    if (usuarioAtivo.isBlank()) return emptyList()
+    val pastasAtivas = carregarPastasSync(context, usuarioAtivo).filter { it.ativa }
+    if (pastasAtivas.isEmpty()) return emptyList()
+
+    val chavesNoCofre = arquivosNoCofre.map {
+        "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}"
+    }.toSet()
+    val nomesNoCofre = arquivosNoCofre.map {
+        limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)
+    }.toSet()
+
+    val encontrados = mutableListOf<NovoArquivoSync>()
+    val chavesJaAdicionadas = mutableSetOf<String>()
+
+    for (pasta in pastasAtivas) {
+        try {
+            val treeUri = Uri.parse(pasta.uri)
+            val parentDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+
+            val projection = arrayOf(
+                DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                DocumentsContract.Document.COLUMN_SIZE,
+                DocumentsContract.Document.COLUMN_MIME_TYPE
+            )
+
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idxId = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val idxName = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val idxSize = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val idxMime = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+
+                while (cursor.moveToNext()) {
+                    val docId = if (idxId != -1 && !cursor.isNull(idxId)) cursor.getString(idxId) else continue
+                    val nomeBruto = if (idxName != -1 && !cursor.isNull(idxName)) cursor.getString(idxName) else continue
+                    val tamanho = if (idxSize != -1 && !cursor.isNull(idxSize)) cursor.getLong(idxSize) else 0L
+                    val mime = if (idxMime != -1 && !cursor.isNull(idxMime)) cursor.getString(idxMime) else ""
+
+                    if (mime == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                    val nome = limparPrefixoTimestamp(nomeBruto)
+                    if (nome.startsWith(".") || tamanho <= 0L) continue
+
+                    val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    val uriStr = fileUri.toString()
+                    val nomeLower = nome.lowercase(Locale.ROOT)
+                    val chave = "$nomeLower|$tamanho"
+
+                    val jaSincronizado = chavesNoCofre.contains(chave) ||
+                        nomesNoCofre.contains(nomeLower) ||
+                        chavesJaAdicionadas.contains(chave) ||
+                        ficheiroJaSincronizadoAntes(context, usuarioAtivo, nome, tamanho, uriStr) ||
+                        ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nome, tamanho)
+
+                    if (!jaSincronizado) {
+                        chavesJaAdicionadas.add(chave)
+                        encontrados.add(
+                            NovoArquivoSync(
+                                uri = fileUri,
+                                nome = nome,
+                                tamanho = tamanho,
+                                nomePastaOrigem = pasta.nome
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+    }
+    return encontrados
+}
+
+fun formatarDataCabecalhoGaleria(timestamp: Long): String {
+    if (timestamp <= 0L) return "Sem data"
+    val cal = Calendar.getInstance()
+    cal.timeInMillis = timestamp
+    val dia = cal.get(Calendar.DAY_OF_MONTH)
+    val ano = cal.get(Calendar.YEAR)
+    val meses = arrayOf("jan.", "fev.", "mar.", "abr.", "mai.", "jun.", "jul.", "ago.", "set.", "out.", "nov.", "dez.")
+    val mes = meses[cal.get(Calendar.MONTH).coerceIn(0, 11)]
+    return "$dia de $mes de $ano"
+}
+
+fun formatarDataNuvem(timestamp: Long): String {
+    if (timestamp <= 0L) return "Data desconhecida"
+    return SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault()).format(Date(timestamp))
+}
+
+fun formatarTempoVideo(ms: Int): String {
+    val totalSegundos = (ms / 1000).coerceAtLeast(0)
+    val minutos = totalSegundos / 60
+    val segundos = totalSegundos % 60
+    return String.format(Locale.getDefault(), "%02d:%02d", minutos, segundos)
+}
+
+fun carregarVinculosPastas(context: Context): Map<Long, String> {
+    val prefs = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+    val mapa = mutableMapOf<Long, String>()
+    for ((k, v) in prefs.all) {
+        val chave = k.toLongOrNull()
+        if (chave != null && v is String && v.isNotBlank()) mapa[chave] = v.trim()
+    }
+    return mapa
+}
+
+fun salvarVinculoPasta(context: Context, dataUpload: Long, nomePasta: String) {
+    val prefs = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+    if (nomePasta.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
+    else prefs.edit().putString(dataUpload.toString(), nomePasta.trim()).apply()
+}
+
+fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
+    var nome = "Arquivo_${System.currentTimeMillis()}"
+    var tamanho = 0L
+    context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+        if (c.moveToFirst()) {
+            val iN = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+            val iT = c.getColumnIndex(OpenableColumns.SIZE)
+            if (iN != -1 && !c.isNull(iN)) nome = c.getString(iN)
+            if (iT != -1 && !c.isNull(iT)) tamanho = c.getLong(iT)
+        }
+    }
+    return Pair(limparPrefixoTimestamp(nome), tamanho)
+}
+
+fun descobrirMimeType(nome: String): String {
+    val limpo = nome.trim()
+    return when (limpo.substringAfterLast('.', "").lowercase(Locale.ROOT)) {
+        "jpg", "jpeg", "jpe", "jfif" -> "image/jpeg"
+        "png" -> "image/png"
+        "webp" -> "image/webp"
+        "heic", "heif" -> "image/heic"
+        "gif" -> "image/gif"
+        "bmp" -> "image/bmp"
+        "mp4", "mov", "mkv", "avi", "webm", "3gp" -> "video/mp4"
+        "pdf" -> "application/pdf"
+        "doc" -> "application/msword"
+        "docx" -> "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        "xls" -> "application/vnd.ms-excel"
+        "xlsx" -> "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "ppt" -> "application/vnd.ms-powerpoint"
+        "pptx" -> "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        "txt", "csv", "log", "json", "xml", "md" -> "text/plain"
+        "zip" -> "application/zip"
+        "rar" -> "application/x-rar-compressed"
+        "apk" -> "application/vnd.android.package-archive"
+        else -> if (ehArquivoImagem(limpo)) "image/jpeg" else if (ehArquivoVideo(limpo)) "video/mp4" else "*/*"
+    }
+}
+
+fun gerarCapaPdf(arquivoPdf: File): File? {
+    return try {
+        val frameFile = File("${arquivoPdf.absolutePath}_frame.jpg")
+        if (frameFile.exists() && frameFile.length() > 256L) return frameFile
+        ParcelFileDescriptor.open(arquivoPdf, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
             PdfRenderer(pfd).use { renderer ->
                 if (renderer.pageCount > 0) {
                     renderer.openPage(0).use { page ->
-                        val bmp = Bitmap.createBitmap(360, 480, Bitmap.Config.ARGB_8888)
+                        val largura = (page.width * 2).coerceIn(300, 800)
+                        val altura = (page.height * 2).coerceIn(400, 1100)
+                        val bmp = Bitmap.createBitmap(largura, altura, Bitmap.Config.ARGB_8888)
                         bmp.eraseColor(android.graphics.Color.WHITE)
                         page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                        FileOutputStream(outFile).use { out ->
+                        FileOutputStream(frameFile).use { out ->
                             bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
                         }
-                        return outFile.absolutePath
+                        return frameFile
                     }
                 }
             }
@@ -435,17 +2377,22 @@ fun gerarCapaPdf(context: Context, uri: Uri, nome: String): String? {
     }
 }
 
-fun renderizarPaginasPdf(context: Context, file: File): List<Bitmap> {
+fun renderizarPaginasPdf(caminhoMiniatura: String?): List<Bitmap> {
     val lista = mutableListOf<Bitmap>()
     try {
-        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
+        val caminho = caminhoMiniatura ?: return emptyList()
+        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+        val arq = File(limpo)
+        if (!arq.exists()) return emptyList()
+
+        ParcelFileDescriptor.open(arq, ParcelFileDescriptor.MODE_READ_ONLY)?.use { pfd ->
             PdfRenderer(pfd).use { renderer ->
-                val total = min(renderer.pageCount, 25)
+                val total = renderer.pageCount.coerceAtMost(20)
                 for (i in 0 until total) {
                     renderer.openPage(i).use { page ->
-                        val w = max(600, min(1200, page.width * 2))
-                        val h = max(800, min(1600, page.height * 2))
-                        val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        val largura = (page.width * 2).coerceIn(400, 1400)
+                        val altura = (page.height * 2).coerceIn(500, 1800)
+                        val bmp = Bitmap.createBitmap(largura, altura, Bitmap.Config.ARGB_8888)
                         bmp.eraseColor(android.graphics.Color.WHITE)
                         page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
                         lista.add(bmp)
@@ -457,756 +2404,582 @@ fun renderizarPaginasPdf(context: Context, file: File): List<Bitmap> {
     return lista
 }
 
-fun lerTextoDocumento(file: File, maxChars: Int = 50000): String {
+fun lerTextoDocumento(caminhoMiniatura: String?): String? {
     return try {
-        val texto = file.readText(Charsets.UTF_8)
-        if (texto.length > maxChars) texto.take(maxChars) + "\n\n[... Documento truncado na pré-visualização ...]"
-        else texto
-    } catch (_: Exception) {
-        "Não foi possível exibir o texto deste documento internamente."
-    }
-}
-
-fun salvarMiniaturaPrivada(context: Context, uri: Uri, nome: String): String? {
-    val ext = nome.substringAfterLast('.', "").lowercase(Locale.getDefault())
-    val dir = File(context.cacheDir, "thumbs_privadas").apply { mkdirs() }
-    val destino = File(dir, "thumb_${nome.hashCode()}_${System.currentTimeMillis()}.jpg")
-
-    if (ext == "pdf") {
-        return gerarCapaPdf(context, uri, nome)
-    }
-
-    val isVideo = ext in listOf("mp4", "mkv", "mov", "avi", "webm", "3gp")
-    val isImage = ext in listOf("jpg", "jpeg", "png", "webp", "bmp", "heic")
-
-    if (isVideo) {
-        val tempVid = copiarUriParaCacheTDLib(context, uri, "tmp_thumb_$nome")
-        if (tempVid != null) {
-            val ok = extrairCapaVideoParaArquivo(context, tempVid, destino)
-            tempVid.delete()
-            if (ok) return destino.absolutePath
-        }
-    } else if (isImage) {
-        val tempImg = copiarUriParaCacheTDLib(context, uri, "tmp_img_$nome")
-        if (tempImg != null) {
-            val ok = gerarMiniaturaImagemLeve(tempImg, destino, 360)
-            tempImg.delete()
-            if (ok) return destino.absolutePath
-        }
-    }
-    return null
-}
-
-fun salvarMiniaturaRapidaTDLib(context: Context, minithumb: TdApi.Minithumbnail?, chaveUnica: String): String? {
-    if (minithumb == null || minithumb.data == null || minithumb.data.isEmpty()) return null
-    return try {
-        val dir = File(context.cacheDir, "thumbs_privadas").apply { mkdirs() }
-        val arq = File(dir, "tdmini_${chaveUnica.hashCode()}.jpg")
-        if (!arq.exists() || arq.length() < 50L) {
-            FileOutputStream(arq).use { it.write(minithumb.data) }
-        }
-        if (arq.exists() && arq.length() > 50L) arq.absolutePath else null
+        val caminho = caminhoMiniatura ?: return null
+        val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+        val arq = File(limpo)
+        if (!arq.exists()) return null
+        arq.bufferedReader().use { it.readText().take(40000) }
     } catch (_: Exception) {
         null
     }
 }
 
-fun prepararMiniaturaDeFicheiroBaixado(context: Context, localFile: File, nome: String): String? {
-    if (!localFile.exists()) return null
-    val ext = nome.substringAfterLast('.', "").lowercase(Locale.getDefault())
-    val dir = File(context.cacheDir, "thumbs_privadas").apply { mkdirs() }
-    val destino = File(dir, "local_${nome.hashCode()}_${localFile.length()}.jpg")
-    if (destino.exists() && destino.length() > 150L) return destino.absolutePath
-
-    return when {
-        ext in listOf("mp4", "mkv", "mov", "avi", "webm", "3gp") -> {
-            if (extrairCapaVideoParaArquivo(context, localFile, destino)) destino.absolutePath else null
-        }
-        ext in listOf("jpg", "jpeg", "png", "webp", "bmp") -> {
-            if (gerarMiniaturaImagemLeve(localFile, destino, 360)) destino.absolutePath else null
-        }
-        ext == "pdf" -> {
-            gerarCapaPdf(context, Uri.fromFile(localFile), nome)
-        }
-        else -> null
-    }
-}
-
-fun obterUriCapaMidia(context: Context, arq: ArquivoNuvem): String? {
-    val caminho = arq.caminhoMiniatura
-    if (!caminho.isNullOrBlank()) {
-        val f = File(caminho)
-        if (f.exists() && f.length() > 50L) return f.absolutePath
-    }
-    val cacheFile = File(File(context.cacheDir, "tdlib_upload_cache"), arq.nomeArquivo)
-    if (cacheFile.exists() && cacheFile.length() > 0L) {
-        val gerada = prepararMiniaturaDeFicheiroBaixado(context, cacheFile, arq.nomeArquivo)
-        if (!gerada.isNullOrBlank()) return gerada
-    }
-    return null
-}
-
-fun temCapaPdfLocal(arq: ArquivoNuvem): Boolean {
-    val c = arq.caminhoMiniatura ?: return false
-    return File(c).exists()
-}
-
-fun copiarUriParaCacheTDLib(context: Context, uri: Uri, nome: String): File? {
+fun salvarMiniaturaPrivada(context: Context, uri: Uri, nomeArquivo: String, arquivoCopiadoLocal: File? = null): String {
     return try {
-        val dir = File(context.cacheDir, "tdlib_upload_cache").apply { mkdirs() }
-        val nomeSeguro = nome.replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        val destino = File(dir, nomeSeguro)
-        if (destino.exists() && destino.length() > 0L && !nome.startsWith("tmp_")) {
-            return destino
+        val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
+        val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val tamRef = arquivoCopiadoLocal?.length() ?: System.currentTimeMillis()
+        val f = File(dir, "thumb_${tamRef}_$nomeSeguro")
+        val frameFile = File("${f.absolutePath}_frame.jpg")
+
+        if (ehArquivoVideo(nomeSeguro)) {
+            val gerou = extrairCapaVideoParaArquivo(context, arquivoCopiadoLocal, uri, frameFile)
+            return if (gerou && frameFile.exists() && frameFile.length() > 256L) {
+                Uri.fromFile(frameFile).toString()
+            } else ""
         }
-        context.contentResolver.openInputStream(uri)?.use { input ->
-            FileOutputStream(destino).use { output ->
+
+        if (arquivoCopiadoLocal != null && arquivoCopiadoLocal.exists()) {
+            FileInputStream(arquivoCopiadoLocal).use { inp ->
+                FileOutputStream(f).use { out -> inp.copyTo(out) }
+            }
+        } else {
+            context.contentResolver.openInputStream(uri)?.use { inp ->
+                FileOutputStream(f).use { out -> inp.copyTo(out) }
+            }
+        }
+
+        if (ehArquivoImagem(nomeSeguro)) {
+            val ok = gerarMiniaturaImagemLeve(f, frameFile)
+            return if (ok && frameFile.exists()) Uri.fromFile(frameFile).toString() else Uri.fromFile(f).toString()
+        } else if (descobrirMimeType(nomeSeguro) == "application/pdf") {
+            val capa = gerarCapaPdf(f)
+            return if (capa != null && capa.exists()) Uri.fromFile(capa).toString() else ""
+        }
+        Uri.fromFile(f).toString()
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+fun obterUriCapaMidia(caminhoMiniatura: String?): Uri {
+    val resolvido = resolverCaminhoCapaJpg(caminhoMiniatura)
+    if (resolvido.isNotBlank()) return Uri.parse(resolvido)
+    return Uri.parse(caminhoMiniatura ?: "")
+}
+
+fun temCapaPdfLocal(caminhoMiniatura: String?): Boolean {
+    return resolverCaminhoCapaJpg(caminhoMiniatura).isNotBlank()
+}
+
+suspend fun copiarUriParaCacheTDLib(
+    context: Context,
+    uri: Uri,
+    nomeArquivo: String,
+    tamanhoEsperado: Long = 0L,
+    loteTag: String = ""
+): File? = withContext(Dispatchers.IO) {
+    try {
+        val subDir = File(context.filesDir, "tdlib_upload_cache/${System.currentTimeMillis()}").apply { if (!exists()) mkdirs() }
+        val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val f = File(subDir, nomeLimpo)
+
+        context.contentResolver.openInputStream(uri)?.use { inp ->
+            FileOutputStream(f).use { out ->
                 val buffer = ByteArray(64 * 1024)
-                var lidos: Int
-                while (input.read(buffer).also { lidos = it } != -1) {
-                    if (NexusTransfer.cancelado) break
-                    output.write(buffer, 0, lidos)
+                var lidosTotal = 0L
+                while (true) {
+                    if (NexusTransfer.cancelado.value) {
+                        out.close()
+                        f.delete()
+                        return@withContext null
+                    }
+                    while (NexusTransfer.pausado.value) {
+                        delay(200)
+                        if (NexusTransfer.cancelado.value) {
+                            out.close()
+                            f.delete()
+                            return@withContext null
+                        }
+                    }
+                    val read = inp.read(buffer)
+                    if (read == -1) break
+                    out.write(buffer, 0, read)
+                    lidosTotal += read
+                    if (tamanhoEsperado > 0L) {
+                        val pctCopia = ((lidosTotal * 35L) / tamanhoEsperado).toInt().coerceIn(5, 35)
+                        NexusTransfer.progress.value = pctCopia
+                        NexusTransfer.label.value = "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)..."
+                    }
                 }
             }
         }
-        if (NexusTransfer.cancelado) {
-            destino.delete()
-            null
-        } else if (destino.exists() && destino.length() > 0L) {
-            destino
-        } else null
+        if (f.exists() && f.length() > 0L) f else null
     } catch (_: Exception) {
         null
     }
 }
 
-fun prepararUriPublica(context: Context, file: File): Uri? {
-    return try {
-        FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
-    } catch (_: Exception) {
-        try {
-            Uri.fromFile(file)
-        } catch (_: Exception) {
-            null
-        }
+fun prepararUriPublica(context: Context, caminhoMiniatura: String?, nomeArquivo: String): Pair<Uri, String>? {
+    val caminho = caminhoMiniatura ?: ""
+    if (caminho.isBlank()) return null
+
+    StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().build())
+    val mime = descobrirMimeType(nomeArquivo)
+    if (caminho.startsWith("content://")) {
+        val u = Uri.parse(caminho)
+        return Pair(u, context.contentResolver.getType(u) ?: mime)
     }
+
+    val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+    val arq = File(limpo)
+    if (!arq.exists()) return null
+
+    val col = when {
+        mime.startsWith("image/") -> MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        mime.startsWith("video/") -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        else -> MediaStore.Files.getContentUri("external")
+    }
+    val vals = ContentValues().apply {
+        put(MediaStore.MediaColumns.DISPLAY_NAME, "Nexus_${System.currentTimeMillis()}_$nomeArquivo")
+        put(MediaStore.MediaColumns.MIME_TYPE, if (mime == "*/*") "application/octet-stream" else mime)
+    }
+    val uriMedia = try {
+        context.contentResolver.insert(col, vals)?.also { d ->
+            context.contentResolver.openOutputStream(d)?.use { o -> arq.inputStream().use { it.copyTo(o) } }
+        }
+    } catch (_: Exception) { null }
+
+    return Pair(uriMedia ?: Uri.fromFile(arq), mime)
 }
 
-fun abrirFicheiroExterno(context: Context, file: File, nome: String) {
+fun abrirFicheiroExterno(context: Context, caminhoMiniatura: String?, nomeArquivo: String) {
     try {
-        val uri = prepararUriPublica(context, file) ?: return
-        val mime = descobrirMimeType(nome)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime)
+        val preparado = prepararUriPublica(context, caminhoMiniatura, nomeArquivo)
+        if (preparado == null) {
+            Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem' primeiro.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (uri, mime) = preparado
+        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, if (mime == "*/*") "application/octet-stream" else mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, "Abrir com").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-    } catch (_: Exception) {
-        Toast.makeText(context, "Nenhum aplicativo encontrado para abrir este arquivo.", Toast.LENGTH_SHORT).show()
+        context.startActivity(Intent.createChooser(viewIntent, "Abrir $nomeArquivo com..."))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Nenhuma app encontrada para abrir este formato.", Toast.LENGTH_SHORT).show()
     }
 }
 
-fun compartilharFicheiroNativo(context: Context, file: File, nome: String) {
+fun compartilharFicheiroNativo(context: Context, caminhoMiniatura: String?, nomeArquivo: String) {
     try {
-        val uri = prepararUriPublica(context, file) ?: return
-        val mime = descobrirMimeType(nome)
-        val intent = Intent(Intent.ACTION_SEND).apply {
+        val preparado = prepararUriPublica(context, caminhoMiniatura, nomeArquivo)
+        if (preparado == null) {
+            Toast.makeText(context, "Ficheiro local indisponível. Use 'Baixar da Nuvem'.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val (uri, mime) = preparado
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
             type = mime
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        context.startActivity(Intent.createChooser(intent, "Compartilhar $nome").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-    } catch (_: Exception) {
-        Toast.makeText(context, "Erro ao compartilhar o arquivo.", Toast.LENGTH_SHORT).show()
+        context.startActivity(Intent.createChooser(shareIntent, "Compartilhar $nomeArquivo"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Erro ao partilhar: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
     }
 }
 
-// === ENVIO REAL PARA MENSAGENS SALVAS (COMPATÍVEL COM TDAPI INPUTDOCUMENT) ===
-suspend fun enviarParaMensagensSalvas(
+fun compartilharMultiplosFicheirosNativo(
     context: Context,
     client: Client,
-    arquivoLocal: File,
-    nomeOriginal: String,
-    cofreTag: String,
-    pastaDestino: String,
-    caminhoThumbLocal: String?,
-    onProgress: (Float) -> Unit
-): Int = withContext(Dispatchers.IO) {
-    if (!arquivoLocal.exists() || arquivoLocal.length() <= 0L) return@withContext -1
-
-    // 1. Descobrir o ID do próprio usuário (Mensagens Salvas)
-    val myUserIdRef = AtomicReference<Long>(0L)
-    val meLatch = CountDownLatch(1)
-    client.send(TdApi.GetMe()) { res ->
-        if (res is TdApi.User) {
-            myUserIdRef.set(res.id)
-        }
-        meLatch.countDown()
-    }
-    meLatch.await(12, TimeUnit.SECONDS)
-    val myUserId = myUserIdRef.get()
-    if (myUserId == 0L) return@withContext -1
-
-    // 2. Garantir criação/abertura do chat privado "Mensagens Salvas"
-    val chatIdRef = AtomicReference<Long>(0L)
-    val chatLatch = CountDownLatch(1)
-    client.send(TdApi.CreatePrivateChat(myUserId, false)) { res ->
-        if (res is TdApi.Chat) {
-            chatIdRef.set(res.id)
-        }
-        chatLatch.countDown()
-    }
-    chatLatch.await(12, TimeUnit.SECONDS)
-    val savedMessagesChatId = chatIdRef.get()
-    if (savedMessagesChatId == 0L) return@withContext -1
-
-    // 3. Montar a legenda com a tag de isolamento do cofre e pasta
-    val legendaTexto = "NEXUS_VAULT:$cofreTag|FOLDER:$pastaDestino|FILE:$nomeOriginal"
-    val legendaFormatada = TdApi.FormattedText(legendaTexto, emptyArray())
-
-    val fileLocal = TdApi.InputFileLocal(arquivoLocal.absolutePath)
-    val conteudoDoc = TdApi.InputMessageDocument().apply {
-        caption = legendaFormatada
-        try {
-            val docField = javaClass.getDeclaredField("document")
-            docField.isAccessible = true
-            if (docField.type.isAssignableFrom(fileLocal.javaClass)) {
-                docField.set(this, fileLocal)
-            } else {
-                val inputDocClass = docField.type
-                var inst: Any? = null
-                for (ctor in inputDocClass.constructors) {
-                    val p = ctor.parameterTypes
-                    try {
-                        if (p.size == 3 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                            inst = ctor.newInstance(fileLocal, null, false)
-                            break
-                        } else if (p.size == 2 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                            inst = ctor.newInstance(fileLocal, null)
-                            break
-                        } else if (p.size == 1 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                            inst = ctor.newInstance(fileLocal)
-                            break
-                        }
-                    } catch (_: Exception) {}
-                }
-                if (inst == null) {
-                    inst = inputDocClass.getDeclaredConstructor().newInstance()
-                    for (f in inputDocClass.declaredFields) {
-                        f.isAccessible = true
-                        if (f.type.isAssignableFrom(fileLocal.javaClass)) {
-                            f.set(inst, fileLocal)
-                        }
-                    }
-                }
-                docField.set(this, inst)
-            }
-        } catch (_: Exception) {}
-    }
-
-    val msgEnviadaRef = AtomicReference<TdApi.Message?>(null)
-    val sendLatch = CountDownLatch(1)
-
-    val reqEnvio = TdApi.SendMessage().apply {
-        chatId = savedMessagesChatId
-        inputMessageContent = conteudoDoc
-    }
-
-    client.send(reqEnvio) { res ->
-        if (res is TdApi.Message) {
-            msgEnviadaRef.set(res)
-        }
-        sendLatch.countDown()
-    }
-    sendLatch.await(20, TimeUnit.SECONDS)
-
-    val msgInicial = msgEnviadaRef.get() ?: return@withContext -1
-    val docInicial = (msgInicial.content as? TdApi.MessageDocument)?.document ?: return@withContext -1
-    var fileId = docInicial.document.id
-    NexusTransfer.fileIdAtivo = fileId
-
-    // Registrar vínculos locais imediatamente para que o arquivo nunca se perca
-    salvarVinculoPasta(context, cofreTag, nomeOriginal, pastaDestino)
-
-    // 4. Acompanhar o upload real na TDLib até atingir 100% nas Mensagens Salvas
-    val totalBytes = max(1L, arquivoLocal.length())
-    var tentativasSemAtividade = 0
-    var uploadConcluido = docInicial.document.remote?.isUploadingCompleted == true &&
-            !docInicial.document.remote?.id.isNullOrEmpty()
-
-    while (!uploadConcluido && !NexusTransfer.cancelado) {
-        if (NexusTransfer.pausado) {
-            delay(300)
-            continue
-        }
-
-        val fileRef = AtomicReference<TdApi.File?>(null)
-        val fileLatch = CountDownLatch(1)
-        client.send(TdApi.GetFile(fileId)) { res ->
-            if (res is TdApi.File) fileRef.set(res)
-            fileLatch.countDown()
-        }
-        fileLatch.await(5, TimeUnit.SECONDS)
-
-        val f = fileRef.get()
-        if (f != null) {
-            val remote = f.remote
-            val enviados = remote?.uploadedSize ?: 0L
-            val prog = (enviados.toFloat() / totalBytes.toFloat()).coerceIn(0.02f, 0.99f)
-            onProgress(prog)
-
-            if (remote != null && remote.isUploadingCompleted && !remote.id.isNullOrEmpty()) {
-                uploadConcluido = true
-                fileId = f.id
-                break
-            }
-
-            if (remote != null && !remote.isUploadingActive && !remote.isUploadingCompleted) {
-                tentativasSemAtividade++
-                if (tentativasSemAtividade > 60) {
-                    break
-                }
-            } else {
-                tentativasSemAtividade = 0
-            }
-        }
-        delay(250)
-    }
-
-    if (NexusTransfer.cancelado) {
-        try {
-            client.send(TdApi.DeleteMessages(savedMessagesChatId, longArrayOf(msgInicial.id), true)) {}
-        } catch (_: Exception) {}
-        return@withContext -1
-    }
-
-    onProgress(1.0f)
-    return@withContext fileId
-}
-
-// === DOWNLOAD DE ARQUIVOS DA NUVEM TDLIB ===
-suspend fun baixarFicheiroDaNuvem(
-    client: Client,
-    fileId: Int,
-    onProgress: (Float) -> Unit = {}
-): File? = withContext(Dispatchers.IO) {
-    if (fileId <= 0) return@withContext null
-    NexusTransfer.fileIdAtivo = fileId
-
-    val fileInicialRef = AtomicReference<TdApi.File?>(null)
-    val initLatch = CountDownLatch(1)
-    client.send(TdApi.GetFile(fileId)) { res ->
-        if (res is TdApi.File) fileInicialRef.set(res)
-        initLatch.countDown()
-    }
-    initLatch.await(8, TimeUnit.SECONDS)
-
-    val inicial = fileInicialRef.get()
-    if (inicial?.local?.isDownloadingCompleted == true && !inicial.local.path.isNullOrEmpty()) {
-        val fLocal = File(inicial.local.path)
-        if (fLocal.exists() && fLocal.length() > 0L) {
-            onProgress(1f)
-            return@withContext fLocal
-        }
-    }
-
-    client.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
-
-    var tentativas = 0
-    while (tentativas < 1200 && !NexusTransfer.cancelado) {
-        if (NexusTransfer.pausado) {
-            delay(300)
-            continue
-        }
-        val fRef = AtomicReference<TdApi.File?>(null)
-        val l = CountDownLatch(1)
-        client.send(TdApi.GetFile(fileId)) { res ->
-            if (res is TdApi.File) fRef.set(res)
-            l.countDown()
-        }
-        l.await(5, TimeUnit.SECONDS)
-        val f = fRef.get()
-        if (f != null) {
-            val total = max(1L, f.expectedSize.takeIf { it > 0 } ?: f.size)
-            val baixado = f.local?.downloadedSize ?: 0L
-            onProgress((baixado.toFloat() / total.toFloat()).coerceIn(0.01f, 0.99f))
-
-            if (f.local?.isDownloadingCompleted == true && !f.local.path.isNullOrEmpty()) {
-                val arqFinal = File(f.local.path)
-                if (arqFinal.exists() && arqFinal.length() > 0L) {
-                    onProgress(1f)
-                    return@withContext arqFinal
-                }
-            }
-            if (f.local?.isDownloadingActive == false && f.local?.isDownloadingCompleted == false) {
-                client.send(TdApi.DownloadFile(fileId, 32, 0, 0, false)) {}
-            }
-        }
-        tentativas++
-        delay(250)
-    }
-    null
-}
-
-suspend fun garantirFicheiroLocal(
-    context: Context,
-    client: Client,
-    arq: ArquivoNuvem,
-    onProgress: (Float) -> Unit = {}
-): File? = withContext(Dispatchers.IO) {
-    val cacheUpload = File(File(context.cacheDir, "tdlib_upload_cache"), arq.nomeArquivo)
-    if (cacheUpload.exists() && cacheUpload.length() > 0L) {
-        onProgress(1f)
-        return@withContext cacheUpload
-    }
-    baixarFicheiroDaNuvem(client, arq.fileId, onProgress)
-}
-
-// === EXTRAÇÃO E SINCRONIZAÇÃO DE MENSAGENS SALVAS POR COFRE ===
-fun extrairNomeLimpoDaMensagem(legenda: String, nomeDocPadrao: String): Triple<String?, String, String> {
-    if (legenda.startsWith("NEXUS_VAULT:")) {
-        val partes = legenda.split("|")
-        val cofre = partes.find { it.startsWith("NEXUS_VAULT:") }?.removePrefix("NEXUS_VAULT:")?.trim()
-        val pasta = partes.find { it.startsWith("FOLDER:") }?.removePrefix("FOLDER:")?.trim() ?: "Geral"
-        val nome = partes.find { it.startsWith("FILE:") }?.removePrefix("FILE:")?.trim() ?: nomeDocPadrao
-        return Triple(cofre, pasta, nome)
-    }
-    return Triple(null, "Geral", nomeDocPadrao)
-}
-
-suspend fun sincronizarCofreDaNuvem(
-    context: Context,
-    client: Client,
-    vm: UIViewModel,
-    cofreTag: String,
-    arquivosAtuais: List<ArquivoNuvem>
-) = withContext(Dispatchers.IO) {
-    val meRef = AtomicReference<TdApi.User?>(null)
-    val l1 = CountDownLatch(1)
-    client.send(TdApi.GetMe()) { res ->
-        if (res is TdApi.User) meRef.set(res)
-        l1.countDown()
-    }
-    l1.await(8, TimeUnit.SECONDS)
-    val me = meRef.get() ?: return@withContext
-
-    val chatRef = AtomicReference<TdApi.Chat?>(null)
-    val l2 = CountDownLatch(1)
-    client.send(TdApi.CreatePrivateChat(me.id, false)) { res ->
-        if (res is TdApi.Chat) chatRef.set(res)
-        l2.countDown()
-    }
-    l2.await(8, TimeUnit.SECONDS)
-    val chat = chatRef.get() ?: return@withContext
-
-    val msgsRef = AtomicReference<TdApi.Messages?>(null)
-    val l3 = CountDownLatch(1)
-    client.send(TdApi.GetChatHistory(chat.id, 0, 0, 100, false)) { res ->
-        if (res is TdApi.Messages) msgsRef.set(res)
-        l3.countDown()
-    }
-    l3.await(10, TimeUnit.SECONDS)
-    val mensagens = msgsRef.get()?.messages ?: return@withContext
-
-    val nomesExistentes = arquivosAtuais.map { it.nomeArquivo }.toMutableSet()
-
-    for (msg in mensagens) {
-        val content = msg.content
-        if (content is TdApi.MessageDocument) {
-            val legenda = content.caption?.text ?: ""
-            val doc = content.document
-            val (cofreMsg, pastaMsg, nomeLimpo) = extrairNomeLimpoDaMensagem(legenda, doc.fileName ?: "arquivo_${msg.id}")
-            if (cofreMsg == cofreTag && !nomesExistentes.contains(nomeLimpo)) {
-                val thumbRapida = salvarMiniaturaRapidaTDLib(context, doc.minithumbnail, "${msg.id}_$nomeLimpo")
-                salvarVinculoPasta(context, cofreTag, nomeLimpo, pastaMsg)
-                vm.criarPasta(pastaMsg)
-                vm.salvarArquivo(
-                    ArquivoNuvem(
-                        fileId = doc.document.id,
-                        nomeArquivo = nomeLimpo,
-                        tamanhoBytes = doc.document.size.takeIf { it > 0 } ?: doc.document.expectedSize,
-                        dataUpload = msg.date.toLong() * 1000L,
-                        caminhoMiniatura = thumbRapida
-                    )
-                )
-                nomesExistentes.add(nomeLimpo)
-            }
-        }
-    }
-}
-
-// === AUTO-SYNC COM DOCUMENTSCONTRACT NATIVO (SEM PRECISAR DE DOCUMENTFILE) ===
-suspend fun procurarNovosFicheirosNasPastas(
-    context: Context,
-    cofreTag: String,
-    nomesJaSalvos: Set<String>
-): List<Pair<Uri, String>> = withContext(Dispatchers.IO) {
-    val encontrados = mutableListOf<Pair<Uri, String>>()
-    val pastasSync = carregarPastasSync(context, cofreTag)
-    for (uriStr in pastasSync) {
-        try {
-            val treeUri = Uri.parse(uriStr)
-            val docId = DocumentsContract.getTreeDocumentId(treeUri)
-            val nomePasta = docId.substringAfterLast(':').substringAfterLast('/').ifBlank { "AutoSync" }
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
-
-            context.contentResolver.query(
-                childrenUri,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE
-                ),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                while (cursor.moveToNext()) {
-                    val childId = cursor.getString(0) ?: continue
-                    val nome = cursor.getString(1) ?: continue
-                    val mime = cursor.getString(2) ?: ""
-                    if (mime != DocumentsContract.Document.MIME_TYPE_DIR && !nomesJaSalvos.contains(nome)) {
-                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
-                        encontrados.add(Pair(fileUri, nomePasta))
-                    }
-                }
-            }
-        } catch (_: Exception) {}
-    }
-    encontrados
-}
-
-// === COMPONENTES VISUAIS DE BARRA DE PROGRESSO E GRELHA ===
-@Composable
-fun LinhaSincronizacao(
-    visivel: Boolean,
-    textoStatus: String,
-    progresso: Float,
-    pausado: Boolean,
-    onTogglePausa: () -> Unit,
-    onCancelar: () -> Unit
+    usuarioAtivo: String,
+    listaArquivos: List<ArquivoNuvem>,
+    vm: UIViewModel
 ) {
-    AnimatedVisibility(visible = visivel) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 6.dp),
-            colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = if (pausado) "PAUSADO • $textoStatus" else textoStatus,
-                            color = Color.White,
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "${(progresso * 100).toInt()}% concluído",
-                            color = Gold,
-                            fontSize = 11.sp
-                        )
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = onTogglePausa) {
-                            Icon(
-                                imageVector = if (pausado) Icons.Default.PlayArrow else Icons.Default.Pause,
-                                contentDescription = "Pausar ou Retomar",
-                                tint = Gold
-                            )
-                        }
-                        IconButton(onClick = onCancelar) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Cancelar",
-                                tint = DangerRed
-                            )
-                        }
-                    }
-                }
-                Spacer(modifier = Modifier.height(6.dp))
-                LinearProgressIndicator(
-                    progress = { progresso.coerceIn(0f, 1f) },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(6.dp)
-                        .clip(RoundedCornerShape(3.dp)),
-                    color = Gold,
-                    trackColor = SurfaceDarker
-                )
-            }
-        }
-    }
-}
-
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun GrelhaArquivos(
-    arquivos: List<ArquivoNuvem>,
-    selecionados: Set<Int>,
-    modoSelecao: Boolean,
-    onClickArquivo: (ArquivoNuvem) -> Unit,
-    onLongClickArquivo: (ArquivoNuvem) -> Unit
-) {
-    val context = LocalContext.current
-    val agrupados = remember(arquivos) {
-        arquivos.sortedByDescending { it.dataUpload }
-            .groupBy { formatarDataNuvem(it.dataUpload) }
-    }
-
-    if (arquivos.isEmpty()) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(32.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Icon(
-                    imageVector = Icons.Default.CloudQueue,
-                    contentDescription = null,
-                    tint = TextGrey,
-                    modifier = Modifier.size(56.dp)
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Text(
-                    text = "Nenhum arquivo neste cofre ou pasta",
-                    color = TextGrey,
-                    fontSize = 14.sp,
-                    textAlign = TextAlign.Center
-                )
-            }
+    if (listaArquivos.isEmpty()) return
+    if (listaArquivos.size == 1) {
+        val unico = listaArquivos.first()
+        garantirFicheiroLocal(context, client, usuarioAtivo, unico, vm) { pronto ->
+            compartilharFicheiroNativo(context, pronto.caminhoMiniatura, pronto.nomeArquivo)
         }
         return
     }
 
+    val urisPublicas = ArrayList<Uri>()
+    var restantes = listaArquivos.size
+
+    listaArquivos.forEach { arq ->
+        garantirFicheiroLocal(context, client, usuarioAtivo, arq, vm) { pronto ->
+            val prep = prepararUriPublica(context, pronto.caminhoMiniatura, pronto.nomeArquivo)
+            if (prep != null) {
+                synchronized(urisPublicas) {
+                    urisPublicas.add(prep.first)
+                }
+            }
+            restantes--
+            if (restantes == 0) {
+                if (urisPublicas.isEmpty()) {
+                    Toast.makeText(context, "Não foi possível preparar os ficheiros para partilha.", Toast.LENGTH_SHORT).show()
+                } else {
+                    try {
+                        val shareIntent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                            type = "*/*"
+                            putParcelableArrayListExtra(Intent.EXTRA_STREAM, urisPublicas)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        context.startActivity(Intent.createChooser(shareIntent, "Compartilhar ${urisPublicas.size} ficheiro(s)"))
+                    } catch (e: Exception) {
+                        Toast.makeText(context, "Erro ao partilhar lote: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+}
+
+fun copiarLoteParaDownloads(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    listaArquivos: List<ArquivoNuvem>,
+    vm: UIViewModel,
+    onComplete: (String) -> Unit
+) {
+    if (listaArquivos.isEmpty()) return
+    var restantes = listaArquivos.size
+    var copiados = 0
+
+    listaArquivos.forEach { arq ->
+        garantirFicheiroLocal(context, client, usuarioAtivo, arq, vm) { pronto ->
+            try {
+                val caminho = pronto.caminhoMiniatura ?: ""
+                val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_${limparPrefixoTimestamp(pronto.nomeArquivo)}")
+
+                if (caminho.startsWith("content://")) {
+                    context.contentResolver.openInputStream(Uri.parse(caminho))?.use { inp ->
+                        FileOutputStream(destino).use { out -> inp.copyTo(out) }
+                    }
+                    copiados++
+                } else if (limpo.isNotBlank() && File(limpo).exists()) {
+                    FileInputStream(File(limpo)).use { inp ->
+                        FileOutputStream(destino).use { out -> inp.copyTo(out) }
+                    }
+                    copiados++
+                }
+            } catch (_: Exception) {}
+
+            restantes--
+            if (restantes == 0) {
+                onComplete("$copiados de ${listaArquivos.size} ficheiro(s) copiados para a pasta Downloads!")
+            }
+        }
+    }
+}
+
+fun enviarParaMensagensSalvas(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    caminhoLocal: String,
+    caminhoCapaJpg: String,
+    nomeOriginal: String,
+    pastaDestino: String,
+    onResult: (Boolean, Int, String) -> Unit
+) {
+    val nomeLimpo = limparPrefixoTimestamp(nomeOriginal)
+    val pathThumbLimpo = if (caminhoCapaJpg.startsWith("file://")) {
+        Uri.parse(caminhoCapaJpg).path ?: caminhoCapaJpg.removePrefix("file://")
+    } else caminhoCapaJpg
+
+    val inputThumb = if (pathThumbLimpo.isNotBlank() && File(pathThumbLimpo).exists() && File(pathThumbLimpo).length() > 256L) {
+        TdApi.InputThumbnail(TdApi.InputFileLocal(pathThumbLimpo), 320, 320)
+    } else null
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    val userTag = "👤 [$usuarioAtivo] • "
+                    val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
+                    val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
+                    val doc = TdApi.InputMessageDocument(TdApi.InputFileLocal(caminhoLocal), inputThumb, false, leg)
+                    val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
+                    client.send(req) { msgObj ->
+                        when (msgObj) {
+                            is TdApi.Message -> {
+                                registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
+                                val docResp = (msgObj.content as? TdApi.MessageDocument)?.document
+                                val rId = docResp?.document?.id ?: 0
+                                val tId = docResp?.thumbnail?.file?.id ?: 0
+                                if (rId != 0 && tId != 0) {
+                                    NexusThumbCache.salvarThumbIdNuvem(context, rId, tId)
+                                }
+                                val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Guardado no cofre SSD de $usuarioAtivo!"
+                                onResult(true, rId, txt)
+                            }
+                            is TdApi.Error -> onResult(false, 0, "Erro SSD (${msgObj.code}): ${msgObj.message}")
+                            else -> onResult(true, 0, "Upload SSD iniciado!")
+                        }
+                    }
+                } else if (chatObj is TdApi.Error) onResult(false, 0, "Erro cofre SSD: ${chatObj.message}")
+            }
+        } else if (meObj is TdApi.Error) onResult(false, 0, "Erro sessão SSD: ${meObj.message}")
+    }
+}
+
+fun baixarFicheiroDaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    arq: ArquivoNuvem,
+    vm: UIViewModel,
+    onResult: (String) -> Unit
+) {
+    garantirFicheiroLocal(context, client, usuarioAtivo, arq, vm) { pronto ->
+        try {
+            val caminho = pronto.caminhoMiniatura ?: ""
+            val limpo = if (caminho.startsWith("file://")) Uri.parse(caminho).path ?: caminho.removePrefix("file://") else caminho
+            if (limpo.isNotBlank() && File(limpo).exists()) {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                if (!downloadsDir.exists()) downloadsDir.mkdirs()
+                val destino = File(downloadsDir, "Nexus_${System.currentTimeMillis()}_${limparPrefixoTimestamp(arq.nomeArquivo)}")
+                FileInputStream(File(limpo)).use { input ->
+                    FileOutputStream(destino).use { output -> input.copyTo(output) }
+                }
+                onResult("Salvo em Downloads: ${destino.name}")
+            } else {
+                onResult("Não foi possível gravar o ficheiro localmente.")
+            }
+        } catch (e: Exception) {
+            onResult("Erro ao gravar ficheiro: ${e.localizedMessage}")
+        }
+    }
+}
+
+fun formatarTamanhoNuvem(bytes: Long?): String {
+    val total = bytes ?: 0L
+    if (total <= 0L) return "0 MB"
+    val mb = total.toDouble() / (1024.0 * 1024.0)
+    return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
+}
+
+// === GRELHA DE ARQUIVOS AGRUPADA POR DATA, COM PREVIEW DE VÍDEO CLARO E NÍTIDO ===
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun GrelhaArquivos(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    vm: UIViewModel,
+    lista: List<ArquivoNuvem>,
+    mapaPastas: Map<Long, String>,
+    modoSelecao: Boolean,
+    idsSelecionados: Set<Int>,
+    onFileClick: (ArquivoNuvem) -> Unit,
+    onFileLongClick: (ArquivoNuvem) -> Unit
+) {
+    val gruposPorData = remember(lista) {
+        lista
+            .sortedByDescending { it.dataUpload }
+            .groupBy { formatarDataCabecalhoGaleria(it.dataUpload) }
+    }
+
     LazyVerticalGrid(
         columns = GridCells.Fixed(3),
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(10.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp)
+        modifier = Modifier.fillMaxSize().padding(1.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
     ) {
-        agrupados.forEach { (dataTitulo, listaDia) ->
-            item(span = { GridItemSpan(maxLineSpan) }, key = "header_$dataTitulo") {
-                Text(
-                    text = dataTitulo,
-                    color = Gold,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(top = 8.dp, bottom = 4.dp, start = 4.dp)
-                )
+        gruposPorData.forEach { (dataCabecalho, arquivosDoDia) ->
+
+            item(
+                key = "header_$dataCabecalho",
+                span = { GridItemSpan(maxLineSpan) },
+                contentType = "cabecalho_data"
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(BgBlack)
+                        .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = dataCabecalho,
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "${arquivosDoDia.size}",
+                        color = Gold,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
-            items(listaDia, key = { "${it.fileId}_${it.nomeArquivo}_${it.dataUpload}" }) { arq ->
-                val isSelected = selecionados.contains(arq.fileId)
-                val ext = arq.nomeArquivo.substringAfterLast('.', "").lowercase(Locale.getDefault())
-                val isVideo = ext in listOf("mp4", "mkv", "mov", "avi", "webm", "3gp")
-                val isPdf = ext == "pdf"
 
-                var bitmapCapa by remember(arq.fileId, arq.caminhoMiniatura) { mutableStateOf<Bitmap?>(null) }
+            items(
+                items = arquivosDoDia,
+                key = { "${it.dataUpload}_${it.nomeArquivo}" },
+                contentType = { "item_midia" }
+            ) { arq ->
+                val ext = remember(arq.nomeArquivo) { arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT) }
+                val pasta = mapaPastas[arq.dataUpload]
+                val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
+                val estaSelecionado = idsSelecionados.contains(arq.id)
 
-                LaunchedEffect(arq.fileId, arq.caminhoMiniatura) {
-                    withContext(Dispatchers.IO) {
-                        val caminho = obterUriCapaMidia(context, arq)
-                        if (!caminho.isNullOrBlank()) {
-                            val bmp = BitmapFactory.decodeFile(caminho)
-                            if (bmp != null) {
-                                bitmapCapa = if (isVideo) clarearBitmapVideoSeNecessario(bmp) else bmp
+                val isImage = remember(arq.nomeArquivo) { ehArquivoImagem(arq.nomeArquivo) }
+                val isVideo = remember(arq.nomeArquivo) { ehArquivoVideo(arq.nomeArquivo) }
+
+                val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo) {
+                    miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
+                }
+
+                val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura) {
+                    if (temArquivoMiniatura && thumbSafe.isNotBlank()) {
+                        val targetUri = obterUriCapaMidia(thumbSafe)
+                        ImageRequest.Builder(context)
+                            .data(targetUri)
+                            .size(320, 320)
+                            .bitmapConfig(Bitmap.Config.ARGB_8888)
+                            .allowHardware(true)
+                            .memoryCachePolicy(CachePolicy.ENABLED)
+                            .diskCachePolicy(CachePolicy.ENABLED)
+                            .crossfade(false)
+                            .build()
+                    } else null
+                }
+
+                LaunchedEffect(arq.dataUpload, temArquivoMiniatura) {
+                    if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
+                        NexusThumbCache.emProgresso.add(arq.dataUpload)
+                        try {
+                            NexusThumbCache.downloadSemaphore.withPermit {
+                                carregarMiniaturaIndividualDaNuvem(
+                                    context = context,
+                                    client = client,
+                                    usuarioAtivo = usuarioAtivo,
+                                    arq = arq,
+                                    vm = vm,
+                                    atualizarSubBarra = false
+                                )
                             }
+                        } finally {
+                            NexusThumbCache.emProgresso.remove(arq.dataUpload)
                         }
                     }
                 }
 
                 Box(
-                    modifier = Modifier
+                    Modifier
                         .aspectRatio(1f)
-                        .clip(RoundedCornerShape(10.dp))
                         .background(SurfaceDark)
                         .border(
-                            width = if (isSelected) 2.5.dp else 1.dp,
-                            color = if (isSelected) Gold else Color(0xFF25252B),
-                            shape = RoundedCornerShape(10.dp)
+                            width = if (estaSelecionado) 3.dp else 0.dp,
+                            color = if (estaSelecionado) Gold else Color.Transparent
                         )
                         .combinedClickable(
-                            onClick = { onClickArquivo(arq) },
-                            onLongClick = { onLongClickArquivo(arq) }
-                        )
+                            onClick = { onFileClick(arq) },
+                            onLongClick = { onFileLongClick(arq) }
+                        ),
+                    contentAlignment = Alignment.Center
                 ) {
-                    if (bitmapCapa != null) {
-                        Image(
-                            bitmap = bitmapCapa!!.asImageBitmap(),
-                            contentDescription = arq.nomeArquivo,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .padding(8.dp),
-                            verticalArrangement = Arrangement.Center,
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                imageVector = when {
-                                    isVideo -> Icons.Default.Videocam
-                                    isPdf -> Icons.Default.PictureAsPdf
-                                    else -> Icons.Default.InsertDriveFile
-                                },
-                                contentDescription = null,
-                                tint = Gold,
-                                modifier = Modifier.size(32.dp)
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = arq.nomeArquivo,
-                                color = Color.White,
-                                fontSize = 10.sp,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis,
-                                textAlign = TextAlign.Center
-                            )
+                    when {
+                        isImage -> {
+                            if (thumbModelRequest != null) {
+                                AsyncImage(
+                                    model = thumbModelRequest,
+                                    contentDescription = arq.nomeArquivo,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            } else {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                                }
+                            }
+                        }
+                        isVideo -> {
+                            Box(Modifier.fillMaxSize()) {
+                                if (thumbModelRequest != null) {
+                                    AsyncImage(
+                                        model = thumbModelRequest,
+                                        contentDescription = "Video Preview",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Column(
+                                        modifier = Modifier.align(Alignment.Center),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                                        Spacer(Modifier.height(28.dp))
+                                        Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                                    }
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .size(38.dp)
+                                        .align(Alignment.Center)
+                                        .background(BgBlack.copy(alpha = 0.45f), CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.PlayArrow,
+                                        null,
+                                        tint = Color.White,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomEnd)
+                                        .padding(4.dp)
+                                        .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                ) {
+                                    Text("VÍDEO", color = Gold, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                        ext == "PDF" -> {
+                            val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                            if (possuiCapa && thumbModelRequest != null) {
+                                Box(Modifier.fillMaxSize()) {
+                                    AsyncImage(
+                                        model = thumbModelRequest,
+                                        contentDescription = arq.nomeArquivo,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    Box(
+                                        Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(4.dp)
+                                            .background(DangerRed, RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                                    ) {
+                                        Text("PDF", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            } else {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                    Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
+                                    Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+                        }
+                        ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                            Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
+                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                        else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                            Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp))
+                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
 
-                    if (isVideo) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .size(32.dp)
-                                .background(Color.Black.copy(alpha = 0.55f), CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.PlayArrow,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .fillMaxWidth()
-                            .background(Color.Black.copy(alpha = 0.65f))
-                            .padding(horizontal = 6.dp, vertical = 3.dp)
-                    ) {
-                        Text(
-                            text = formatarTamanhoNuvem(arq.tamanhoBytes),
-                            color = Color.White,
-                            fontSize = 9.sp,
-                            maxLines = 1
-                        )
+                    if (estaSelecionado) {
+                        Box(Modifier.fillMaxSize().background(Gold.copy(alpha = 0.22f)))
                     }
 
                     if (modoSelecao) {
@@ -1214,18 +2987,26 @@ fun GrelhaArquivos(
                             modifier = Modifier
                                 .align(Alignment.TopEnd)
                                 .padding(6.dp)
-                                .size(22.dp)
-                                .background(if (isSelected) Gold else Color.Black.copy(alpha = 0.6f), CircleShape),
+                                .size(24.dp)
+                                .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
+                                .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
-                            if (isSelected) {
-                                Icon(
-                                    imageVector = Icons.Default.Check,
-                                    contentDescription = null,
-                                    tint = Color.Black,
-                                    modifier = Modifier.size(15.dp)
-                                )
+                            if (estaSelecionado) {
+                                Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(16.dp))
                             }
+                        }
+                    }
+
+                    if (!pasta.isNullOrBlank()) {
+                        Box(
+                            Modifier
+                                .align(Alignment.TopStart)
+                                .padding(4.dp)
+                                .background(BgBlack.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
+                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                        ) {
+                            Text(pasta, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                         }
                     }
                 }
@@ -1233,267 +3014,942 @@ fun GrelhaArquivos(
         }
     }
 }
-// === FIM DA PARTE 1 (COLE A PARTE 2 LOGO ABAIXO DESTA LINHA) ===
+// === FIM DA PARTE 1 (ENVIE "parte 2" PARA RECEBER O RESTANTE DO CÓDIGO) ===
 // === CONTINUAÇÃO: PARTE 2 DE 2 (COLE LOGO ABAIXO DA PARTE 1) ===
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
-    val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val vm = remember(dao) { UIViewModel(dao) }
-
+    val vm: UIViewModel = viewModel(factory = object : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(mClass: Class<T>) = UIViewModel(dao) as T
+    })
     val todosArquivos by vm.arquivos.collectAsState()
     val todasPastas by vm.pastas.collectAsState()
+    val loginStep by TelegramAuth.step.collectAsState()
+    val statusText by TelegramAuth.statusText.collectAsState()
+    val errorText by TelegramAuth.errorText.collectAsState()
 
-    // === ESTADOS DE AUTENTICAÇÃO E ISOLAMENTO DE COFRE ===
-    var cofreDestrancado by remember { mutableStateOf(false) }
-    var pinDigitado by remember { mutableStateOf("") }
-    var cofreTagAtual by remember { mutableStateOf("") }
-    var telefoneMascarado by remember { mutableStateOf("Carregando...") }
+    val transferProgress by NexusTransfer.progress.collectAsState()
+    val transferLabel by NexusTransfer.label.collectAsState()
+    val transferPaused by NexusTransfer.pausado.collectAsState()
+    val transferIsUpload by NexusTransfer.ehUpload.collectAsState()
 
-    // === ESTADOS DE NAVEGAÇÃO, PASTAS E SELEÇÃO ===
-    var pastaSelecionada by remember { mutableStateOf("Geral") }
-    var buscaTexto by remember { mutableStateOf("") }
-    var modoSelecao by remember { mutableStateOf(false) }
-    var selecionados by remember { mutableStateOf(setOf<Int>()) }
-    var mapaPastas by remember { mutableStateOf(mapOf<String, String>()) }
+    val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
+    val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
+    val leituraTotal by NexusLeituraNuvem.total.collectAsState()
+    val leituraSubPct by NexusLeituraNuvem.subProgressoItem.collectAsState()
+    val leituraTitulo by NexusLeituraNuvem.titulo.collectAsState()
+    val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
 
-    // === ESTADOS DE TRANSFERÊNCIA (UPLOAD / DOWNLOAD / AUTO-SYNC) ===
-    var transferindo by remember { mutableStateOf(false) }
-    var statusTransferencia by remember { mutableStateOf("") }
-    var progressoTransferencia by remember { mutableStateOf(0f) }
-    var pausaEstadoUI by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val sheetState = rememberModalBottomSheetState()
+    var jobFilaMiniaturas by remember { mutableStateOf<Job?>(null) }
 
-    // === ESTADOS DE DIÁLOGOS E VISUALIZADOR INTERNO ===
-    var mostrarDialogNovaPasta by remember { mutableStateOf(false) }
-    var nomeNovaPasta by remember { mutableStateOf("") }
-    var mostrarDialogAutoSync by remember { mutableStateOf(false) }
-    var mostrarMenuCache by remember { mutableStateOf(false) }
-    var arquivoEmVisualizacao by remember { mutableStateOf<ArquivoNuvem?>(null) }
-
-    // Carregar telefone mascarado do usuário na TDLib
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val l = CountDownLatch(1)
-            client.send(TdApi.GetMe()) { res ->
-                if (res is TdApi.User) {
-                    telefoneMascarado = mascararNumeroComAsterisco(res.phoneNumber ?: "Privado")
+        NexusThumbCache.inicializar(context)
+    }
+
+    var phoneNumber by remember { mutableStateOf("+5585") }
+    var smsCode by remember { mutableStateOf("") }
+    var password2FA by remember { mutableStateOf("") }
+
+    var activeVaultUser by remember { mutableStateOf(obterUltimoUsuarioCofre(context)) }
+    var vaultUnlocked by remember { mutableStateOf(false) }
+    var isSwitchingUser by remember { mutableStateOf(activeVaultUser.isBlank()) }
+    // Abre sempre em "JÁ TENHO COFRE" (false) por padrão para evitar recriar perfil em nova instalação
+    var isCreatingNewVault by remember { mutableStateOf(false) }
+    var vaultNameInput by remember { mutableStateOf(activeVaultUser) }
+    var vaultPinInput by remember { mutableStateOf("") }
+    var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
+    var isCheckingVault by remember { mutableStateOf(false) }
+
+    var perfisExistentesNuvem by remember { mutableStateOf(listarPerfisSalvosLocalmente(context)) }
+    var procurandoPerfisNuvem by remember { mutableStateOf(false) }
+
+    // Assim que autenticar o SMS na nova instalação, procura automaticamente os perfis que já existem na nuvem SSD
+    LaunchedEffect(loginStep, vaultUnlocked) {
+        if (loginStep >= 3 && !vaultUnlocked) {
+            procurandoPerfisNuvem = true
+            descobrirPerfisExistentesNaNuvem(context, client) { encontrados ->
+                scope.launch(Dispatchers.Main) {
+                    procurandoPerfisNuvem = false
+                    if (encontrados.isNotEmpty()) {
+                        perfisExistentesNuvem = encontrados
+                        isCreatingNewVault = false
+                        if (vaultNameInput.isBlank()) {
+                            vaultNameInput = encontrados.first()
+                        }
+                        if (activeVaultUser.isBlank() && encontrados.size == 1) {
+                            activeVaultUser = encontrados.first()
+                        }
+                    }
                 }
-                l.countDown()
             }
-            l.await(6, TimeUnit.SECONDS)
         }
     }
 
-    // === FUNÇÃO CORRIGIDA DE UPLOADS EM LOTE ===
-    fun executarUploads(uris: List<Uri>, pastaDestino: String) {
-        if (uris.isEmpty() || cofreTagAtual.isBlank()) return
-        scope.launch(Dispatchers.IO) {
-            NexusTransfer.resetarParaNovoFluxo()
-            withContext(Dispatchers.Main) {
-                transferindo = true
-                pausaEstadoUI = false
-                progressoTransferencia = 0.01f
+    var mapaDonos by remember { mutableStateOf(carregarDonosFicheiros(context)) }
+    var mapaPastas by remember { mutableStateOf(carregarVinculosPastas(context)) }
+    var pastasDoUsuarioSet by remember(activeVaultUser) { mutableStateOf(carregarPastasDoUsuario(context, activeVaultUser)) }
+
+    var novosFicheirosSync by remember { mutableStateOf<List<NovoArquivoSync>>(emptyList()) }
+    var selecionadosSync by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showNovosSyncDialog by remember { mutableStateOf(false) }
+    var organizarPorPastaSync by remember { mutableStateOf(true) }
+
+    var isSelectionMode by remember { mutableStateOf(false) }
+    var selectedFileIds by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var filesToMoveBatch by remember { mutableStateOf<List<ArquivoNuvem>>(emptyList()) }
+    var filesToDeleteBatch by remember { mutableStateOf<List<ArquivoNuvem>>(emptyList()) }
+    var isDeletingFile by remember { mutableStateOf(false) }
+
+    var pastaSelecionadaMenu by remember { mutableStateOf<String?>(null) }
+    var pastaParaRenomear by remember { mutableStateOf<String?>(null) }
+    var novoNomePastaInput by remember { mutableStateOf("") }
+    var pastaParaApagar by remember { mutableStateOf<String?>(null) }
+    var isDeletingFolder by remember { mutableStateOf(false) }
+    var showAboutDialog by remember { mutableStateOf(false) }
+    var showCacheDialog by remember { mutableStateOf(false) }
+
+    val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
+        val chaveAtiva = normalizarUsuario(activeVaultUser)
+        if (chaveAtiva.isBlank()) emptyList()
+        else todosArquivos
+            .filter { mapaDonos[it.dataUpload] == chaveAtiva }
+            .distinctBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+    }
+
+    val pastas = remember(todasPastas, pastasDoUsuarioSet, arquivos, mapaPastas, activeVaultUser) {
+        if (activeVaultUser.isBlank()) emptyList()
+        else {
+            val pastasDosArquivos = arquivos.mapNotNull { arq ->
+                mapaPastas[arq.dataUpload]?.trim()?.takeIf { it.isNotBlank() }
+            }
+            val combinadas = (pastasDosArquivos + pastasDoUsuarioSet.map { it.trim() } +
+                todasPastas.map { it.nomePasta.trim() }.filter { p -> pastasDoUsuarioSet.any { it.equals(p, ignoreCase = true) } })
+                .filter { it.isNotBlank() }
+                .filterNot { p -> pastaFoiEliminadaPeloUsuario(context, activeVaultUser, p) }
+                .distinctBy { it.lowercase(Locale.ROOT) }
+                .sortedBy { it.lowercase(Locale.ROOT) }
+                .map { PastaNuvem(nomePasta = it) }
+            combinadas
+        }
+    }
+
+    val armazenamentoUsuario = remember(arquivos) {
+        arquivos.sumOf { it.tamanhoBytes }
+    }
+
+    // Fila contínua em segundo plano com suporte a Pausa/Retomada
+    fun processarFilaMiniaturasNuvem(listaArquivosCofre: List<ArquivoNuvem>) {
+        jobFilaMiniaturas?.cancel()
+        jobFilaMiniaturas = scope.launch(Dispatchers.IO) {
+            val pendentes = listaArquivosCofre
+                .sortedByDescending { it.dataUpload }
+                .filter { arq ->
+                    val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+                    val suportaCapa = ehArquivoImagem(arq.nomeArquivo) || ehArquivoVideo(arq.nomeArquivo) || ext == "PDF"
+                    suportaCapa && !miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(arq), arq.nomeArquivo)
+                }
+
+            if (pendentes.isEmpty()) {
+                NexusLeituraNuvem.encerrar()
+                return@launch
             }
 
-            vm.criarPasta(pastaDestino)
+            NexusLeituraNuvem.iniciar(pendentes.size, "Carregando miniaturas da nuvem SSD...")
+
+            for ((idx, arq) in pendentes.withIndex()) {
+                while (NexusLeituraNuvem.pausado.value) {
+                    delay(200)
+                }
+                if (!NexusLeituraNuvem.ativo.value) break
+
+                NexusLeituraNuvem.avancar(
+                    novoLido = idx,
+                    novoTotal = pendentes.size,
+                    texto = "Carregando preview: ${arq.nomeArquivo}"
+                )
+                if (!miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(arq), arq.nomeArquivo)) {
+                    NexusThumbCache.emProgresso.add(arq.dataUpload)
+                    try {
+                        NexusThumbCache.downloadSemaphore.withPermit {
+                            carregarMiniaturaIndividualDaNuvem(
+                                context = context,
+                                client = client,
+                                usuarioAtivo = activeVaultUser,
+                                arq = arq,
+                                vm = vm,
+                                atualizarSubBarra = true
+                            )
+                        }
+                    } catch (_: Exception) {
+                    } finally {
+                        NexusThumbCache.emProgresso.remove(arq.dataUpload)
+                    }
+                }
+                NexusLeituraNuvem.concluirItem()
+            }
+            NexusLeituraNuvem.encerrar()
+        }
+    }
+
+    fun verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio: Boolean) {
+        scope.launch {
+            val chaveAtiva = normalizarUsuario(activeVaultUser)
+            val listaReal = vm.obterArquivosReais()
+            val donosAtuais = carregarDonosFicheiros(context)
+            val arquivosAtuaisDoCofre = listaReal.filter { donosAtuais[it.dataUpload] == chaveAtiva }
+
+            arquivosAtuaisDoCofre.forEach { arq ->
+                marcarFicheiroComoSincronizado(context, activeVaultUser, arq.nomeArquivo, arq.tamanhoBytes)
+            }
+
+            val encontrados = withContext(Dispatchers.IO) {
+                procurarNovosFicheirosNasPastas(context, activeVaultUser, arquivosAtuaisDoCofre)
+            }
+            if (encontrados.isNotEmpty()) {
+                novosFicheirosSync = encontrados
+                selecionadosSync = encontrados.map { it.uri.toString() }.toSet()
+                showNovosSyncDialog = true
+            } else if (mostrarAvisoSeVazio) {
+                Toast.makeText(context, "Nenhum ficheiro novo nas pastas selecionadas.", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    LaunchedEffect(todosArquivos.size, vaultUnlocked) {
+        if (todosArquivos.isNotEmpty()) {
+            limparDuplicadosExistentes(context, todosArquivos, vm) {
+                mapaDonos = carregarDonosFicheiros(context)
+                mapaPastas = carregarVinculosPastas(context)
+                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+            }
+        }
+    }
+
+    LaunchedEffect(vaultUnlocked, activeVaultUser) {
+        if (vaultUnlocked && activeVaultUser.isNotBlank()) {
+            val arquivosIniciais = vm.obterArquivosReais()
+            val pastasIniciais = vm.obterPastasReais()
+            migrarDadosV11SeNecessario(context, activeVaultUser, arquivosIniciais, pastasIniciais)
+            limparDuplicadosExistentes(context, arquivosIniciais, vm) {}
+            mapaDonos = carregarDonosFicheiros(context)
+            mapaPastas = carregarVinculosPastas(context)
+            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+
+            val aposLimpeza = vm.obterArquivosReais()
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, aposLimpeza, vm) { qtd ->
+                scope.launch(Dispatchers.Main) {
+                    delay(250)
+                    val atualizados = vm.obterArquivosReais()
+                    limparDuplicadosExistentes(context, atualizados, vm) {}
+                    mapaDonos = carregarDonosFicheiros(context)
+                    mapaPastas = carregarVinculosPastas(context)
+                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                    val chaveAtiva = normalizarUsuario(activeVaultUser)
+                    val doUsuario = atualizados.filter { mapaDonos[it.dataUpload] == chaveAtiva }
+
+                    processarFilaMiniaturasNuvem(doUsuario)
+
+                    if (qtd > 0) {
+                        Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados na nuvem SSD!", Toast.LENGTH_SHORT).show()
+                    }
+                    delay(350)
+                    verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
+                }
+            }
+        }
+    }
+
+    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
+    var viewerFile by remember { mutableStateOf<ArquivoNuvem?>(null) }
+
+    var fileToRename by remember { mutableStateOf<ArquivoNuvem?>(null) }
+    var novoNomeInput by remember { mutableStateOf("") }
+
+    var searchQuery by remember { mutableStateOf("") }
+    var showSearchBar by remember { mutableStateOf(false) }
+
+    var pastaAberta by remember { mutableStateOf<String?>(null) }
+    var pendingUploadUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
+
+    var showStorage by remember { mutableStateOf(false) }
+    var showSync by remember { mutableStateOf(false) }
+    var showNewFolder by remember { mutableStateOf(false) }
+    var nomeNovaPasta by remember { mutableStateOf("") }
+
+    var pastasSync by remember(activeVaultUser) { mutableStateOf(carregarPastasSync(context, activeVaultUser)) }
+
+    var isUploading by remember { mutableStateOf(false) }
+    var cloudBannerText by remember(activeVaultUser) {
+        mutableStateOf(if (activeVaultUser.isNotBlank()) "Cofre: $activeVaultUser • Nuvem SSD Ativa" else "Nuvem SSD Ativa")
+    }
+
+    val listaVisivelAtual = remember(arquivos, selectedTab, pastaAberta, mapaPastas, searchQuery) {
+        if (selectedTab == 1) {
+            if (pastaAberta != null) {
+                arquivos.filter {
+                    mapaPastas[it.dataUpload]?.equals(pastaAberta, ignoreCase = true) == true &&
+                        (searchQuery.isBlank() || it.nomeArquivo.contains(searchQuery, ignoreCase = true))
+                }
+            } else {
+                emptyList()
+            }
+        } else {
+            val base = when (selectedTab) {
+                2 -> arquivos.filter { ehArquivoImagem(it.nomeArquivo) }
+                3 -> arquivos.filter { ehArquivoVideo(it.nomeArquivo) }
+                4 -> arquivos.filter { !ehArquivoImagem(it.nomeArquivo) && !ehArquivoVideo(it.nomeArquivo) }
+                else -> arquivos
+            }
+            if (searchQuery.isBlank()) base
+            else base.filter { it.nomeArquivo.contains(searchQuery, ignoreCase = true) }
+        }
+    }
+
+    fun alternarSelecaoFicheiro(arq: ArquivoNuvem) {
+        val novos = if (selectedFileIds.contains(arq.id)) {
+            selectedFileIds - arq.id
+        } else {
+            selectedFileIds + arq.id
+        }
+        selectedFileIds = novos
+        isSelectionMode = novos.isNotEmpty()
+    }
+
+    LaunchedEffect(isUploading, transferPaused) {
+        while (isUploading) {
+            delay(350)
+            if (!transferPaused) {
+                val atual = NexusTransfer.progress.value ?: 10
+                if (atual in 35..88) {
+                    NexusTransfer.progress.value = (atual + 4).coerceAtMost(90)
+                }
+            }
+        }
+    }
+
+    val responseHandler = remember {
+        Client.ResultHandler { obj ->
+            if (obj is TdApi.Error) TelegramAuth.errorText.value = "Erro SSD (${obj.code}): ${obj.message}"
+        }
+    }
+
+    // Upload com BARRA ÚNICA e suporte completo a Pausar / Continuar / Cancelar
+    fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
+        if (uris.isEmpty() || activeVaultUser.isBlank()) return
+        scope.launch {
+            isUploading = true
+            val total = uris.size
+            var enviados = 0
+            NexusTransfer.iniciar("Preparando envio (1/$total)...", upload = true)
 
             for ((index, uri) in uris.withIndex()) {
-                if (NexusTransfer.cancelado) break
+                if (NexusTransfer.cancelado.value) break
+                while (NexusTransfer.pausado.value) {
+                    delay(200)
+                    if (NexusTransfer.cancelado.value) break
+                }
+                if (NexusTransfer.cancelado.value) break
 
-                val (nomeOriginal, tamanhoUri) = obterDetalhesFicheiro(context, uri)
-                withContext(Dispatchers.Main) {
-                    statusTransferencia = "Enviando (${index + 1}/${uris.size}): $nomeOriginal"
-                    progressoTransferencia = 0.02f
+                val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
+                val nome = limparPrefixoTimestamp(nomeBruto)
+                val loteTag = "(${index + 1}/$total) "
+
+                NexusTransfer.progress.value = 8
+                NexusTransfer.label.value = "Preparando $loteTag'$nome'..."
+                cloudBannerText = "Enviando $loteTag'$nome'..."
+
+                val arqTemp = copiarUriParaCacheTDLib(context, uri, nome, tamanho, loteTag)
+                if (NexusTransfer.cancelado.value) {
+                    arqTemp?.delete()
+                    break
                 }
 
-                // 1. Gerar capa rápida local antes do envio
-                val caminhoThumb = salvarMiniaturaPrivada(context, uri, nomeOriginal)
+                val capaJpg = if (arqTemp != null) {
+                    withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome, arqTemp) }
+                } else ""
 
-                // 2. Copiar arquivo para o cache da TDLib (mantido após envio para leitura instantânea)
-                val arquivoCache = copiarUriParaCacheTDLib(context, uri, nomeOriginal)
-                if (arquivoCache == null || !arquivoCache.exists()) {
-                    continue
-                }
-
-                val tamanhoReal = max(tamanhoUri, arquivoCache.length())
-
-                // 3. Enviar para as Mensagens Salvas sem InputThumbnail (evita erro 400 da TDLib)
-                val fileIdRetornado = enviarParaMensagensSalvas(
-                    context = context,
-                    client = client,
-                    arquivoLocal = arquivoCache,
-                    nomeOriginal = nomeOriginal,
-                    cofreTag = cofreTagAtual,
-                    pastaDestino = pastaDestino,
-                    caminhoThumbLocal = caminhoThumb,
-                    onProgress = { prog ->
-                        progressoTransferencia = prog
+                if (arqTemp != null) {
+                    while (NexusTransfer.pausado.value) {
+                        delay(200)
+                        if (NexusTransfer.cancelado.value) break
                     }
-                )
+                    if (NexusTransfer.cancelado.value) {
+                        arqTemp.delete()
+                        break
+                    }
 
-                if (NexusTransfer.cancelado) break
+                    val tamFinal = if (tamanho > 0) tamanho else arqTemp.length()
+                    desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
+                    marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
 
-                // 4. Salvar imediatamente no banco local Room e atualizar vínculo da pasta
-                val fileIdSeguro = if (fileIdRetornado > 0) {
-                    fileIdRetornado
+                    NexusTransfer.progress.value = 40
+                    NexusTransfer.label.value = "Enviando para nuvem SSD $loteTag'$nome'..."
+
+                    val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
+                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, msg ->
+                        deferred.complete(Triple(ok, rId, msg))
+                    }
+                    val (ok, rId, msg) = deferred.await()
+
+                    val concluiuRede = if (ok && rId != 0) {
+                        aguardarUploadTDLibComPausa(client, rId, nome, loteTag)
+                    } else ok
+
+                    if (NexusTransfer.cancelado.value || !concluiuRede) {
+                        cloudBannerText = "Envio de '$nome' cancelado."
+                        break
+                    }
+
+                    cloudBannerText = msg
+                    if (ok) {
+                        enviados++
+                        val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        if (capaJpg.isNotBlank()) {
+                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                        }
+                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                        mapaDonos = carregarDonosFicheiros(context)
+                        if (pastaEscolhida.isNotBlank()) {
+                            vm.criarPasta(pastaEscolhida)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                            salvarVinculoPasta(context, ts, pastaEscolhida)
+                            mapaPastas = carregarVinculosPastas(context)
+                        }
+                        vm.salvarArquivo(
+                            ArquivoNuvem(
+                                fileId = rId,
+                                nomeArquivo = nome,
+                                tamanhoBytes = tamFinal,
+                                dataUpload = ts,
+                                caminhoMiniatura = capaJpg
+                            )
+                        )
+                    }
                 } else {
-                    (System.currentTimeMillis() and 0x7FFFFFFF).toInt()
+                    cloudBannerText = "Erro ao ler '$nome'."
                 }
-
-                salvarVinculoPasta(context, cofreTagAtual, nomeOriginal, pastaDestino)
-                val novoRegistro = ArquivoNuvem(
-                    fileId = fileIdSeguro,
-                    nomeArquivo = nomeOriginal,
-                    tamanhoBytes = tamanhoReal,
-                    dataUpload = System.currentTimeMillis(),
-                    caminhoMiniatura = caminhoThumb
-                )
-                vm.salvarArquivo(novoRegistro)
-
-                withContext(Dispatchers.Main) {
-                    mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
-                    progressoTransferencia = 1f
-                }
+                delay(120)
             }
 
-            withContext(Dispatchers.Main) {
-                transferindo = false
-                statusTransferencia = ""
-                progressoTransferencia = 0f
-                mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
-                if (!NexusTransfer.cancelado) {
-                    Toast.makeText(context, "Upload concluído com sucesso!", Toast.LENGTH_SHORT).show()
-                }
+            val foiCancelado = NexusTransfer.cancelado.value
+            isUploading = false
+            NexusTransfer.encerrar()
+            if (foiCancelado) {
+                cloudBannerText = "Envio cancelado ($enviados guardado(s))."
+                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+            } else if (total > 1) {
+                cloudBannerText = "$enviados de $total ficheiros guardados no cofre SSD de $activeVaultUser!"
             }
         }
     }
 
-    // Seletores de Arquivos e Pastas (SAF)
-    val seletorArquivosLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenMultipleDocuments()
-    ) { uris ->
+    // Sincronização de novos arquivos com BARRA ÚNICA e suporte a Pausar / Continuar / Cancelar
+    fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
+        if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
+        scope.launch {
+            isUploading = true
+            val total = itensParaEnviar.size
+            var enviados = 0
+            NexusTransfer.iniciar("Sincronizando novos arquivos (1/$total)...", upload = true)
+
+            for ((index, item) in itensParaEnviar.withIndex()) {
+                if (NexusTransfer.cancelado.value) break
+                while (NexusTransfer.pausado.value) {
+                    delay(200)
+                    if (NexusTransfer.cancelado.value) break
+                }
+                if (NexusTransfer.cancelado.value) break
+
+                val nomeLimpo = limparPrefixoTimestamp(item.nome)
+                desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
+                marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
+
+                val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
+                val loteTag = "(${index + 1}/$total) "
+                NexusTransfer.progress.value = 10
+                NexusTransfer.label.value = "Sincronizando $loteTag'$nomeLimpo'..."
+                cloudBannerText = "Sincronizando $loteTag'$nomeLimpo'..."
+
+                val arqTemp = copiarUriParaCacheTDLib(context, item.uri, nomeLimpo, item.tamanho, loteTag)
+                if (NexusTransfer.cancelado.value) {
+                    arqTemp?.delete()
+                    break
+                }
+
+                val capaJpg = if (arqTemp != null) {
+                    withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, nomeLimpo, arqTemp) }
+                } else ""
+
+                if (arqTemp != null) {
+                    while (NexusTransfer.pausado.value) {
+                        delay(200)
+                        if (NexusTransfer.cancelado.value) break
+                    }
+                    if (NexusTransfer.cancelado.value) {
+                        arqTemp.delete()
+                        break
+                    }
+
+                    val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
+                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
+
+                    val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
+                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, msg ->
+                        deferred.complete(Triple(ok, rId, msg))
+                    }
+                    val (ok, rId, msg) = deferred.await()
+
+                    val concluiuRede = if (ok && rId != 0) {
+                        aguardarUploadTDLibComPausa(client, rId, nomeLimpo, loteTag)
+                    } else ok
+
+                    if (NexusTransfer.cancelado.value || !concluiuRede) {
+                        cloudBannerText = "Sincronização cancelada."
+                        break
+                    }
+
+                    cloudBannerText = msg
+                    if (ok) {
+                        enviados++
+                        val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        if (capaJpg.isNotBlank()) {
+                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                        }
+                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                        mapaDonos = carregarDonosFicheiros(context)
+                        if (pastaAlvo.isNotBlank()) {
+                            vm.criarPasta(pastaAlvo)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                            salvarVinculoPasta(context, ts, pastaAlvo)
+                            mapaPastas = carregarVinculosPastas(context)
+                        }
+                        vm.salvarArquivo(
+                            ArquivoNuvem(
+                                fileId = rId,
+                                nomeArquivo = nomeLimpo,
+                                tamanhoBytes = tamFinal,
+                                dataUpload = ts,
+                                caminhoMiniatura = capaJpg
+                            )
+                        )
+                    }
+                }
+                delay(120)
+            }
+
+            val foiCancelado = NexusTransfer.cancelado.value
+            isUploading = false
+            NexusTransfer.encerrar()
+            cloudBannerText = if (foiCancelado) {
+                "Sincronização interrompida ($enviados enviado(s))."
+            } else {
+                "$enviados novo(s) ficheiro(s) sincronizados na nuvem SSD!"
+            }
+            Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
-            executarUploads(uris, pastaSelecionada)
+            uris.forEach { u ->
+                try { context.contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            }
+            if (pastaAberta != null) executarUploads(uris, pastaAberta!!)
+            else if (pastas.isNotEmpty()) pendingUploadUris = uris
+            else executarUploads(uris, "")
         }
     }
 
-    val seletorPastaSyncLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocumentTree()
-    ) { treeUri ->
-        if (treeUri != null && cofreTagAtual.isNotBlank()) {
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        uri?.let {
             try {
-                context.contentResolver.takePersistableUriPermission(
-                    treeUri,
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION
-                )
-            } catch (_: Exception) {}
-            salvarPastaSync(context, cofreTagAtual, treeUri.toString())
-            Toast.makeText(context, "Pasta adicionada à sincronização automática!", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    // Sincronizar cofre ao destrancar
-    LaunchedEffect(cofreDestrancado, cofreTagAtual) {
-        if (cofreDestrancado && cofreTagAtual.isNotBlank()) {
-            mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
-            vm.criarPasta("Geral")
-            sincronizarCofreDaNuvem(context, client, vm, cofreTagAtual, todosArquivos)
-            mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
-
-            val nomesSalvos = todosArquivos.map { it.nomeArquivo }.toSet()
-            val novosAutoSync = procurarNovosFicheirosNasPastas(context, cofreTagAtual, nomesSalvos)
-            if (novosAutoSync.isNotEmpty()) {
-                val agrupadosPorPasta = novosAutoSync.groupBy({ it.second }, { it.first })
-                for ((pastaSync, listaUris) in agrupadosPorPasta) {
-                    executarUploads(listaUris, pastaSync)
-                }
+                context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                salvarPastaSync(context, activeVaultUser, it.toString(), true)
+                pastasSync = carregarPastasSync(context, activeVaultUser)
+                verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
+            } catch (e: Exception) {
+                Toast.makeText(context, "Erro ao guardar permissão da pasta.", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    // === TELA DE BLOQUEIO DO COFRE (PIN ISOLADO SEM EXIBIR PERFIS ANTERIORES) ===
-    if (!cofreDestrancado) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(BgBlack)
-                .padding(24.dp),
-            contentAlignment = Alignment.Center
+    // 1. ECRÃ DE AUTENTICAÇÃO DO NÚMERO SSD (COM ASTERISCOS NA PARTE VISUAL)
+    if (loginStep < 3) {
+        val statusFormatadoSSD = remember(statusText) {
+            statusText.replace("Telegram", "SSD", ignoreCase = true)
+                .replace("TDLib", "SSD", ignoreCase = true)
+        }
+        val erroFormatadoSSD = remember(errorText) {
+            errorText?.replace("Telegram", "SSD", ignoreCase = true)
+                ?.replace("TDLib", "SSD", ignoreCase = true)
+        }
+
+        Column(Modifier.fillMaxSize().background(BgBlack).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+            Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(80.dp))
+            Spacer(Modifier.height(16.dp))
+            Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 26.sp, fontWeight = FontWeight.Black)
+            Text("SSD SOLUÇÕES", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            Text(statusFormatadoSSD, color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+            if (erroFormatadoSSD != null) Text(erroFormatadoSSD, color = DangerRed, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 12.dp))
+            Spacer(Modifier.height(32.dp))
+            when (loginStep) {
+                0 -> {
+                    OutlinedTextField(
+                        value = phoneNumber,
+                        onValueChange = { phoneNumber = it },
+                        label = { Text("Número SSD (********)", color = Color.Gray) },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation('*'),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = {
+                        TelegramAuth.errorText.value = null
+                        val clean = phoneNumber.replace(" ", "").replace("-", "")
+                        val cfg = TdApi.PhoneNumberAuthenticationSettings(false, false, false, false, false, null, emptyArray())
+                        client.send(TdApi.SetAuthenticationPhoneNumber(clean, cfg), responseHandler)
+                    }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENVIAR CÓDIGO SSD", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+                1 -> {
+                    OutlinedTextField(value = smsCode, onValueChange = { smsCode = it }, label = { Text("Código SMS / SSD", color = Color.Gray) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = { client.send(TdApi.CheckAuthenticationCode(smsCode.trim()), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("CONFIRMAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+                2 -> {
+                    OutlinedTextField(value = password2FA, onValueChange = { password2FA = it }, label = { Text("Senha 2FA SSD", color = Color.Gray) }, singleLine = true, visualTransformation = PasswordVisualTransformation('*'), colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(24.dp))
+                    Button(onClick = { client.send(TdApi.CheckAuthenticationPassword(password2FA), responseHandler) }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(56.dp)) { Text("ENTRAR", color = Color.White, fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+        return
+    }
+
+    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (COM DETECÇÃO AUTOMÁTICA DE PERFIS NA NUVEM)
+    if (!vaultUnlocked) {
+        Column(
+            modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
         ) {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = SurfaceDark),
-                shape = RoundedCornerShape(18.dp)
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp),
+                    modifier = Modifier.padding(24.dp).verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Lock,
-                        contentDescription = null,
-                        tint = Gold,
-                        modifier = Modifier.size(48.dp)
-                    )
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "SSD NEXUS CLOUD $NEXUS_VERSION",
-                        color = Gold,
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "Conta: $telefoneMascarado",
-                        color = TextGrey,
-                        fontSize = 12.sp
-                    )
-                    Spacer(modifier = Modifier.height(20.dp))
-                    OutlinedTextField(
-                        value = pinDigitado,
-                        onValueChange = { novo ->
-                            if (novo.length <= 8 && novo.all { it.isDigit() }) {
-                                pinDigitado = novo
-                            }
-                        },
-                        label = { Text("PIN do Cofre (4 a 8 dígitos)", color = TextGrey) },
-                        singleLine = true,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = Gold,
-                            unfocusedBorderColor = TextGrey,
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White
-                        )
-                    )
-                    Spacer(modifier = Modifier.height(20.dp))
-                    Button(
-                        onClick = {
-                            if (pinDigitado.length < 4) {
-                                Toast.makeText(context, "Digite um PIN de pelo menos 4 dígitos", Toast.LENGTH_SHORT).show()
-                            } else {
-                                cofreTagAtual = "PIN_${pinDigitado.trim()}"
-                                mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
-                                cofreDestrancado = true
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Gold),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
+                    Icon(Icons.Default.Lock, null, tint = Gold, modifier = Modifier.size(56.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 20.sp, fontWeight = FontWeight.Black)
+                    Text("SSD SOLUÇÕES", color = TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+
+                    if (procurandoPerfisNuvem) {
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Sincronizando perfis existentes na nuvem SSD...", color = Gold, fontSize = 11.sp)
+                        }
+                    }
+
+                    if (!isSwitchingUser && activeVaultUser.isNotBlank()) {
+                        Spacer(Modifier.height(8.dp))
                         Text(
-                            text = "ACESSAR COFRE PRIVADO",
-                            color = Color.Black,
+                            "COFRE DE ${activeVaultUser.uppercase(Locale.getDefault())}",
+                            color = Color.White,
+                            fontSize = 16.sp,
                             fontWeight = FontWeight.Bold
                         )
+                        Text(
+                            "Digite o seu PIN para desbloquear os seus ficheiros",
+                            color = TextGrey,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                        Spacer(Modifier.height(20.dp))
+
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN de Acesso", color = TextGrey) },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation('*'),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (vaultErrorMsg != null) {
+                            Text(
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
+
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val pinDigitado = vaultPinInput.trim()
+                                if (pinDigitado.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
+                                val pinLocal = obterPinCofreLocal(context, activeVaultUser)
+                                if (pinLocal != null && pinLocal == pinDigitado) {
+                                    salvarCredenciaisCofreLocal(context, activeVaultUser, pinDigitado)
+                                    vaultPinInput = ""
+                                    vaultUnlocked = true
+                                } else {
+                                    isCheckingVault = true
+                                    verificarOuRegistarCofreNuvem(client, activeVaultUser, pinDigitado, false) { ok, nomeReal, msg ->
+                                        scope.launch(Dispatchers.Main) {
+                                            isCheckingVault = false
+                                            if (ok) {
+                                                salvarCredenciaisCofreLocal(context, nomeReal, pinDigitado)
+                                                activeVaultUser = nomeReal
+                                                vaultPinInput = ""
+                                                vaultUnlocked = true
+                                            } else {
+                                                vaultErrorMsg = msg
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text("DESBLOQUEAR COFRE", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(onClick = {
+                            vaultErrorMsg = null
+                            vaultPinInput = ""
+                            vaultNameInput = ""
+                            isSwitchingUser = true
+                            isCreatingNewVault = false
+                        }) {
+                            Text("Trocar de utilizador / Criar novo cofre", color = Gold, fontSize = 12.sp)
+                        }
+                    } else {
+                        Spacer(Modifier.height(12.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        // Lista de perfis encontrados automaticamente na nuvem SSD para entrar com 1 toque
+                        if (perfisExistentesNuvem.isNotEmpty() && !isCreatingNewVault) {
+                            Spacer(Modifier.height(14.dp))
+                            Text(
+                                "Perfis encontrados na sua nuvem SSD (toque para selecionar):",
+                                color = Gold,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                perfisExistentesNuvem.forEach { nomePerfil ->
+                                    val selecionado = normalizarUsuario(vaultNameInput) == normalizarUsuario(nomePerfil)
+                                    OutlinedButton(
+                                        onClick = {
+                                            vaultNameInput = nomePerfil
+                                            vaultErrorMsg = null
+                                        },
+                                        border = BorderStroke(1.dp, if (selecionado) Gold else TextGrey),
+                                        colors = ButtonDefaults.outlinedButtonColors(
+                                            containerColor = if (selecionado) Gold.copy(alpha = 0.2f) else SurfaceDark
+                                        ),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                    ) {
+                                        Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text(nomePerfil, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros na nuvem SSD."
+                            else "Digite o seu Nome e PIN para restaurar e abrir o seu cofre da nuvem SSD.",
+                            color = TextGrey,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = vaultNameInput,
+                            onValueChange = { vaultNameInput = it },
+                            label = { Text("Nome do Utilizador (ex: Carlos_85)", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
+                            visualTransformation = PasswordVisualTransformation('*'),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (vaultErrorMsg != null) {
+                            Text(
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
+
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val nomeLimpo = vaultNameInput.trim()
+                                val pinLimpo = vaultPinInput.trim()
+
+                                if (nomeLimpo.length < 3) {
+                                    vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
+                                    return@Button
+                                }
+                                if (pinLimpo.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
+
+                                val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
+                                if (pinLocalExistente != null && pinLocalExistente == pinLimpo) {
+                                    salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo)
+                                    activeVaultUser = nomeLimpo
+                                    isSwitchingUser = false
+                                    vaultPinInput = ""
+                                    vaultUnlocked = true
+                                    Toast.makeText(context, "Cofre '$nomeLimpo' desbloqueado!", Toast.LENGTH_SHORT).show()
+                                    return@Button
+                                }
+
+                                isCheckingVault = true
+                                verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        isCheckingVault = false
+                                        if (ok) {
+                                            salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
+                                            activeVaultUser = nomeConfirmado
+                                            isSwitchingUser = false
+                                            vaultPinInput = ""
+                                            vaultUnlocked = true
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            vaultErrorMsg = msg
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text(
+                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        if (activeVaultUser.isNotBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            TextButton(onClick = {
+                                vaultErrorMsg = null
+                                vaultPinInput = ""
+                                isSwitchingUser = false
+                            }) {
+                                Text("Voltar para o cofre de $activeVaultUser", color = TextGrey, fontSize = 12.sp)
+                            }
+                        }
                     }
                 }
             }
@@ -1501,661 +3957,2045 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
-    // Filtrar arquivos exclusivos do cofre atual e da pasta selecionada
-    val arquivosDoCofre = remember(todosArquivos, mapaPastas, pastaSelecionada, buscaTexto) {
-        todosArquivos.filter { arq ->
-            val pastaDoArq = mapaPastas[arq.nomeArquivo]
-            val pertenceAoCofre = pastaDoArq != null
-            val pertenceAPasta = pastaSelecionada == "Geral" || pastaDoArq == pastaSelecionada
-            val bateBusca = buscaTexto.isBlank() || arq.nomeArquivo.contains(buscaTexto, ignoreCase = true)
-            pertenceAoCofre && pertenceAPasta && bateBusca
-        }
-    }
+    // === JANELA DE CACHE DO SSD NEXUS ===
+    if (showCacheDialog) {
+        var statsCache by remember { mutableStateOf(calcularUsoCacheLocal(context)) }
+        val (bytesCache, qtdCapas, qtdTemps) = statsCache
 
-    val bytesCofreAtual = remember(todosArquivos, mapaPastas) {
-        todosArquivos.filter { mapaPastas.containsKey(it.nomeArquivo) }
-            .sumOf { it.tamanhoBytes }
-    }
-
-    val listaNomesPastas = remember(todasPastas, mapaPastas) {
-        val nomes = mutableSetOf("Geral")
-        todasPastas.forEach { nomes.add(it.nomePasta) }
-        mapaPastas.values.forEach { nomes.add(it) }
-        nomes.toList()
-    }
-
-    BackHandler(enabled = modoSelecao || pastaSelecionada != "Geral") {
-        if (modoSelecao) {
-            modoSelecao = false
-            selecionados = emptySet()
-        } else if (pastaSelecionada != "Geral") {
-            pastaSelecionada = "Geral"
-        }
-    }
-
-    // === ESTRUTURA PRINCIPAL DO COFRE ===
-    Scaffold(
-        containerColor = BgBlack,
-        topBar = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(SurfaceDarker)
-                    .padding(top = 12.dp, bottom = 8.dp, start = 14.dp, end = 14.dp)
+        Dialog(onDismissRequest = { showCacheDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.5.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Column {
+                    Icon(Icons.Default.Storage, null, tint = Gold, modifier = Modifier.size(52.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text("CACHE DO SSD NEXUS", color = Gold, fontWeight = FontWeight.Black, fontSize = 20.sp)
+                    Text("Gestão de Miniaturas e Arquivos Locais", color = TextGrey, fontSize = 11.sp)
+
+                    Spacer(Modifier.height(18.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SurfaceDark, RoundedCornerShape(14.dp))
+                            .border(1.dp, Gold.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("ESPAÇO OCUPADO PELO CACHE", color = TextGrey, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(formatarTamanhoNuvem(bytesCache), color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Black)
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("$qtdCapas", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp)
+                                Text("Capas (.jpg)", color = TextGrey, fontSize = 10.sp)
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("$qtdTemps", color = Color.White, fontWeight = FontWeight.Black, fontSize = 16.sp)
+                                Text("Temporários", color = TextGrey, fontSize = 10.sp)
+                            }
+                        }
+                    }
+
+                    Spacer(Modifier.height(18.dp))
+
+                    Button(
+                        onClick = {
+                            val qtdRemovida = NexusThumbCache.limparCapasDeVideos(context, arquivos)
+                            statsCache = calcularUsoCacheLocal(context)
+                            showCacheDialog = false
+                            Toast.makeText(context, "Regenerando $qtdRemovida capa(s) de vídeo com brilho otimizado...", Toast.LENGTH_SHORT).show()
+                            processarFilaMiniaturasNuvem(arquivos)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, null, tint = BgBlack, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("RECARREGAR CAPAS DE VÍDEOS", color = BgBlack, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            val liberado = limparCacheUploadsTemporarios(context)
+                            statsCache = calcularUsoCacheLocal(context)
+                            Toast.makeText(
+                                context,
+                                "Cache temporário limpo (${formatarTamanhoNuvem(liberado)} liberados)!",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                        border = BorderStroke(1.dp, Gold),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, null, tint = Gold, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("LIMPAR ARQUIVOS TEMPORÁRIOS", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+
+                    Button(
+                        onClick = {
+                            NexusThumbCache.limparTodoCacheLocal(context)
+                            statsCache = calcularUsoCacheLocal(context)
+                            showCacheDialog = false
+                            Toast.makeText(context, "Cache SSD Nexus limpo! Recarregando capas da nuvem...", Toast.LENGTH_SHORT).show()
+                            processarFilaMiniaturasNuvem(arquivos)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.DeleteForever, null, tint = Color.White, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("LIMPAR TODO O CACHE LOCAL", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    TextButton(onClick = { showCacheDialog = false }) {
+                        Text("FECHAR", color = TextGrey, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
+    // === JANELA DE OPÇÕES RÁPIDAS DA PASTA ===
+    if (pastaSelecionadaMenu != null) {
+        val nomeP = pastaSelecionadaMenu!!
+        val qtdItens = arquivos.count { mapaPastas[it.dataUpload]?.equals(nomeP, ignoreCase = true) == true }
+        Dialog(onDismissRequest = { pastaSelecionadaMenu = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text(nomeP, color = Color.White, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Text("$qtdItens ficheiro(s) nesta pasta", color = TextGrey, fontSize = 12.sp)
+                    Spacer(Modifier.height(20.dp))
+
+                    Button(
+                        onClick = {
+                            pastaSelecionadaMenu = null
+                            selectedTab = 1
+                            pastaAberta = nomeP
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.FolderOpen, null, tint = Gold)
+                        Spacer(Modifier.width(8.dp))
+                        Text("ABRIR PASTA", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            pastaSelecionadaMenu = null
+                            novoNomePastaInput = nomeP
+                            pastaParaRenomear = nomeP
+                        },
+                        border = BorderStroke(1.dp, Gold),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.Edit, null, tint = Gold)
+                        Spacer(Modifier.width(8.dp))
+                        Text("RENOMEAR PASTA", color = Gold, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = {
+                            pastaSelecionadaMenu = null
+                            pastaParaApagar = nomeP
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, null, tint = Color.White)
+                        Spacer(Modifier.width(8.dp))
+                        Text("APAGAR PASTA", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { pastaSelecionadaMenu = null }) {
+                        Text("FECHAR", color = TextGrey, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
+    // === JANELA PARA RENOMEAR PASTA ===
+    if (pastaParaRenomear != null) {
+        val nomeAntigo = pastaParaRenomear!!
+        Dialog(onDismissRequest = { pastaParaRenomear = null }) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(24.dp)) {
+                    Text("RENOMEAR PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text("Pasta atual: $nomeAntigo", color = TextGrey, fontSize = 12.sp)
+                    Spacer(Modifier.height(14.dp))
+                    OutlinedTextField(
+                        value = novoNomePastaInput,
+                        onValueChange = { novoNomePastaInput = it },
+                        label = { Text("Novo nome da pasta", color = TextGrey) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { pastaParaRenomear = null },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CANCELAR", color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                val limpo = novoNomePastaInput.trim()
+                                if (limpo.isNotBlank() && !limpo.equals(nomeAntigo, ignoreCase = true)) {
+                                    renomearPastaCompleta(context, activeVaultUser, nomeAntigo, limpo, vm)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    if (pastaAberta?.equals(nomeAntigo, ignoreCase = true) == true) {
+                                        pastaAberta = limpo
+                                    }
+                                    Toast.makeText(context, "Pasta renomeada para '$limpo'!", Toast.LENGTH_SHORT).show()
+                                }
+                                pastaParaRenomear = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("SALVAR", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // === JANELA DE CONFIRMAÇÃO PARA APAGAR PASTA ===
+    if (pastaParaApagar != null) {
+        val nomePastaDel = pastaParaApagar!!
+        val arquivosDaPastaDel = remember(arquivos, mapaPastas, nomePastaDel) {
+            arquivos.filter { mapaPastas[it.dataUpload]?.equals(nomePastaDel, ignoreCase = true) == true }
+        }
+        Dialog(onDismissRequest = { if (!isDeletingFolder) pastaParaApagar = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, DangerRed),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.FolderDelete, null, tint = DangerRed, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("ELIMINAR PASTA?", color = Color.White, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text(nomePastaDel, color = Gold, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        if (arquivosDaPastaDel.isEmpty()) "Esta pasta está vazia."
+                        else "Esta pasta contém ${arquivosDaPastaDel.size} ficheiro(s). Escolha como deseja apagar:",
+                        color = TextGrey,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(20.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            isDeletingFolder = true
+                            eliminarPastaCompleta(context, client, activeVaultUser, nomePastaDel, false, arquivosDaPastaDel, vm) { msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isDeletingFolder = false
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    if (pastaAberta?.equals(nomePastaDel, ignoreCase = true) == true) pastaAberta = null
+                                    pastaParaApagar = null
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isDeletingFolder,
+                        border = BorderStroke(1.dp, Gold),
+                        modifier = Modifier.fillMaxWidth().height(50.dp)
+                    ) {
                         Text(
-                            text = "NEXUS CLOUD $NEXUS_VERSION",
+                            if (arquivosDaPastaDel.isEmpty()) "APAGAR PASTA" else "APAGAR SÓ A PASTA (MANTER FICHEIROS)",
                             color = Gold,
-                            fontSize = 18.sp,
-                            fontWeight = FontWeight.ExtraBold
-                        )
-                        Text(
-                            text = "$telefoneMascarado • ${formatarTamanhoNuvem(bytesCofreAtual)} usados",
-                            color = TextGrey,
+                            fontWeight = FontWeight.Bold,
                             fontSize = 11.sp
                         )
                     }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = {
-                            scope.launch {
-                                Toast.makeText(context, "Sincronizando Mensagens Salvas...", Toast.LENGTH_SHORT).show()
-                                sincronizarCofreDaNuvem(context, client, vm, cofreTagAtual, todosArquivos)
-                                mapaPastas = carregarVinculosPastas(context, cofreTagAtual)
+
+                    if (arquivosDaPastaDel.isNotEmpty()) {
+                        Spacer(Modifier.height(10.dp))
+                        Button(
+                            onClick = {
+                                isDeletingFolder = true
+                                eliminarPastaCompleta(context, client, activeVaultUser, nomePastaDel, true, arquivosDaPastaDel, vm) { msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        isDeletingFolder = false
+                                        pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                        mapaPastas = carregarVinculosPastas(context)
+                                        mapaDonos = carregarDonosFicheiros(context)
+                                        if (pastaAberta?.equals(nomePastaDel, ignoreCase = true) == true) pastaAberta = null
+                                        pastaParaApagar = null
+                                        cloudBannerText = msg
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            enabled = !isDeletingFolder,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(50.dp)
+                        ) {
+                            if (isDeletingFolder) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                            } else {
+                                Icon(Icons.Default.DeleteForever, null, tint = Color.White)
+                                Spacer(Modifier.width(8.dp))
+                                Text("APAGAR PASTA + FICHEIROS (${arquivosDaPastaDel.size})", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
-                        }) {
-                            Icon(Icons.Default.Refresh, contentDescription = "Sincronizar", tint = Gold)
-                        }
-                        IconButton(onClick = { mostrarDialogAutoSync = true }) {
-                            Icon(Icons.Default.Sync, contentDescription = "Auto-Sync", tint = Color.White)
-                        }
-                        IconButton(onClick = { mostrarMenuCache = true }) {
-                            Icon(Icons.Default.Storage, contentDescription = "Cache SSD", tint = Color.White)
-                        }
-                        IconButton(onClick = {
-                            cofreDestrancado = false
-                            pinDigitado = ""
-                            cofreTagAtual = ""
-                            modoSelecao = false
-                            selecionados = emptySet()
-                        }) {
-                            Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = DangerRed)
                         }
                     }
+
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { if (!isDeletingFolder) pastaParaApagar = null },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("CANCELAR", color = TextGrey, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
+            }
+        }
+    }
 
-                Spacer(modifier = Modifier.height(8.dp))
-
-                // Barra de pesquisa rápida
-                OutlinedTextField(
-                    value = buscaTexto,
-                    onValueChange = { buscaTexto = it },
-                    placeholder = { Text("Buscar arquivo em $pastaSelecionada...", color = TextGrey, fontSize = 13.sp) },
-                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = Gold) },
-                    trailingIcon = {
-                        if (buscaTexto.isNotEmpty()) {
-                            IconButton(onClick = { buscaTexto = "" }) {
-                                Icon(Icons.Default.Close, contentDescription = "Limpar", tint = TextGrey)
-                            }
-                        }
-                    },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(50.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Gold,
-                        unfocusedBorderColor = Color(0xFF282830),
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    )
-                )
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Barra de Pastas Horizontal
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+    // === JANELA SOBRE (DESENVOLVEDOR E SSD SOLUÇÕES 2026) ===
+    if (showAboutDialog) {
+        Dialog(onDismissRequest = { showAboutDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(20.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.5.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    items(listaNomesPastas) { nomePasta ->
-                        val ativa = pastaSelecionada == nomePasta
-                        FilterChip(
-                            selected = ativa,
-                            onClick = { pastaSelecionada = nomePasta },
-                            label = {
-                                Text(
-                                    text = nomePasta,
-                                    color = if (ativa) Color.Black else Color.White,
-                                    fontWeight = if (ativa) FontWeight.Bold else FontWeight.Normal
-                                )
-                            },
-                            leadingIcon = {
-                                Icon(
-                                    imageVector = Icons.Default.Folder,
-                                    contentDescription = null,
-                                    tint = if (ativa) Color.Black else Gold,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = Gold,
-                                containerColor = SurfaceDark
-                            )
-                        )
-                    }
-                    item {
-                        AssistChip(
-                            onClick = { mostrarDialogNovaPasta = true },
-                            label = { Text("+ Pasta", color = Gold) },
-                            colors = AssistChipDefaults.assistChipColors(containerColor = SurfaceDark)
-                        )
-                    }
-                }
+                    Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(60.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontWeight = FontWeight.Black, fontSize = 22.sp)
+                    Text("Armazenamento & Cofres Seguros", color = TextGrey, fontSize = 12.sp)
 
-                // Barra de Ações em Lote quando o modo seleção está ativo
-                AnimatedVisibility(visible = modoSelecao) {
-                    Row(
+                    Spacer(Modifier.height(20.dp))
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(top = 8.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(SurfaceDark)
-                            .padding(horizontal = 12.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                            .background(SurfaceDark, RoundedCornerShape(14.dp))
+                            .border(1.dp, Gold.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                            .padding(16.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text(
-                            text = "${selecionados.size} selecionado(s)",
-                            color = Gold,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
-                        )
-                        Row {
-                            TextButton(onClick = {
-                                selecionados = arquivosDoCofre.map { it.fileId }.toSet()
-                            }) {
-                                Text("Todos", color = Color.White, fontSize = 12.sp)
-                            }
-                            IconButton(onClick = {
-                                val paraApagar = arquivosDoCofre.filter { selecionados.contains(it.fileId) }
-                                paraApagar.forEach { vm.apagar(it.id) }
-                                selecionados = emptySet()
-                                modoSelecao = false
-                                Toast.makeText(context, "${paraApagar.size} arquivo(s) removido(s) da galeria", Toast.LENGTH_SHORT).show()
-                            }) {
-                                Icon(Icons.Default.Delete, contentDescription = "Excluir Selecionados", tint = DangerRed)
-                            }
-                            IconButton(onClick = {
-                                modoSelecao = false
-                                selecionados = emptySet()
-                            }) {
-                                Icon(Icons.Default.Close, contentDescription = "Sair da Seleção", tint = TextGrey)
-                            }
-                        }
+                        Text("DESENVOLVEDOR", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text("Josimar Sousa", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Black)
+                        Spacer(Modifier.height(14.dp))
+                        Divider(color = SurfaceDarker, thickness = 1.dp)
+                        Spacer(Modifier.height(14.dp))
+                        Text("EMPRESA & TECNOLOGIA", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text("SSD Soluções 2026", color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                     }
-                }
-            }
-        },
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = {
-                    seletorArquivosLauncher.launch(arrayOf("*/*"))
-                },
-                containerColor = Gold,
-                contentColor = Color.Black,
-                icon = { Icon(Icons.Default.Add, contentDescription = "Enviar") },
-                text = { Text("ENVIAR ARQUIVOS", fontWeight = FontWeight.Bold) }
-            )
-        }
-    ) { paddingValues ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(paddingValues)
-        ) {
-            LinhaSincronizacao(
-                visivel = transferindo,
-                textoStatus = statusTransferencia,
-                progresso = progressoTransferencia,
-                pausado = pausaEstadoUI,
-                onTogglePausa = {
-                    NexusTransfer.pausado = !NexusTransfer.pausado
-                    pausaEstadoUI = NexusTransfer.pausado
-                },
-                onCancelar = {
-                    NexusTransfer.cancelarTudo(client)
-                    transferindo = false
-                    pausaEstadoUI = false
-                    Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
-                }
-            )
 
-            GrelhaArquivos(
-                arquivos = arquivosDoCofre,
-                selecionados = selecionados,
-                modoSelecao = modoSelecao,
-                onClickArquivo = { arq ->
-                    if (modoSelecao) {
-                        selecionados = if (selecionados.contains(arq.fileId)) {
-                            selecionados - arq.fileId
-                        } else {
-                            selecionados + arq.fileId
-                        }
-                        if (selecionados.isEmpty()) modoSelecao = false
-                    } else {
-                        arquivoEmVisualizacao = arq
-                    }
-                },
-                onLongClickArquivo = { arq ->
-                    modoSelecao = true
-                    selecionados = selecionados + arq.fileId
-                }
-            )
-        }
-    }
-
-    // === DIÁLOGO: CRIAR NOVA PASTA ===
-    if (mostrarDialogNovaPasta) {
-        AlertDialog(
-            onDismissRequest = { mostrarDialogNovaPasta = false },
-            containerColor = SurfaceDark,
-            title = { Text("Criar Nova Pasta", color = Gold, fontWeight = FontWeight.Bold) },
-            text = {
-                OutlinedTextField(
-                    value = nomeNovaPasta,
-                    onValueChange = { nomeNovaPasta = it },
-                    label = { Text("Nome da pasta", color = TextGrey) },
-                    singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Gold,
-                        unfocusedBorderColor = TextGrey,
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White
-                    )
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val limpo = nomeNovaPasta.trim()
-                        if (limpo.isNotEmpty()) {
-                            vm.criarPasta(limpo)
-                            pastaSelecionada = limpo
-                            nomeNovaPasta = ""
-                            mostrarDialogNovaPasta = false
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Gold)
-                ) {
-                    Text("CRIAR", color = Color.Black, fontWeight = FontWeight.Bold)
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { mostrarDialogNovaPasta = false }) {
-                    Text("Cancelar", color = TextGrey)
-                }
-            }
-        )
-    }
-
-    // === DIÁLOGO: GERENCIADOR DE AUTO-SYNC DE PASTAS LOCAIS ===
-    if (mostrarDialogAutoSync) {
-        var pastasAtuais by remember { mutableStateOf(carregarPastasSync(context, cofreTagAtual).toList()) }
-        AlertDialog(
-            onDismissRequest = { mostrarDialogAutoSync = false },
-            containerColor = SurfaceDark,
-            title = { Text("Auto-Sync de Pastas", color = Gold, fontWeight = FontWeight.Bold) },
-            text = {
-                Column(modifier = Modifier.fillMaxWidth()) {
+                    Spacer(Modifier.height(16.dp))
                     Text(
-                        text = "Pastas monitoradas enviam novos arquivos automaticamente ao abrir este cofre:",
+                        "© 2026 SSD Soluções • Todos os direitos reservados.",
                         color = TextGrey,
-                        fontSize = 12.sp
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center
                     )
-                    Spacer(modifier = Modifier.height(10.dp))
-                    if (pastasAtuais.isEmpty()) {
-                        Text("Nenhuma pasta vinculada.", color = Color.White, fontSize = 13.sp)
-                    } else {
-                        LazyColumn(modifier = Modifier.heightIn(max = 200.dp)) {
-                            items(pastasAtuais) { uriStr ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 4.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
+
+                    Spacer(Modifier.height(20.dp))
+                    Button(
+                        onClick = { showAboutDialog = false },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
+    // JANELA DE CONFIRMAÇÃO PARA DELETAR / REMOVER FICHEIROS (1 OU LOTE)
+    if (filesToDeleteBatch.isNotEmpty()) {
+        val listaParaDeletar = filesToDeleteBatch
+        val tituloDel = if (listaParaDeletar.size == 1) listaParaDeletar.first().nomeArquivo else "${listaParaDeletar.size} ficheiros selecionados"
+        Dialog(onDismissRequest = { if (!isDeletingFile) filesToDeleteBatch = emptyList() }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, DangerRed),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.DeleteForever, null, tint = DangerRed, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("REMOVER OU DELETAR?", color = Color.White, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        tituloDel,
+                        color = Gold,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Escolha se deseja apagar também da Nuvem SSD ou remover apenas da galeria do aplicativo.",
+                        color = TextGrey,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(20.dp))
+
+                    Button(
+                        onClick = {
+                            isDeletingFile = true
+                            val idsApagados = listaParaDeletar.map { it.id }.toSet()
+                            eliminarMultiplosFicheiros(context, client, activeVaultUser, listaParaDeletar, true, vm) { msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isDeletingFile = false
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    if (viewerFile != null && idsApagados.contains(viewerFile!!.id)) viewerFile = null
+                                    filesToDeleteBatch = emptyList()
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isDeletingFile,
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(50.dp)
+                    ) {
+                        if (isDeletingFile) {
+                            CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                        } else {
+                            Icon(Icons.Default.DeleteForever, null, tint = Color.White)
+                            Spacer(Modifier.width(8.dp))
+                            Text("DELETAR TUDO (APP + NUVEM SSD)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = {
+                            isDeletingFile = true
+                            val idsApagados = listaParaDeletar.map { it.id }.toSet()
+                            eliminarMultiplosFicheiros(context, client, activeVaultUser, listaParaDeletar, false, vm) { msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isDeletingFile = false
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    if (viewerFile != null && idsApagados.contains(viewerFile!!.id)) viewerFile = null
+                                    filesToDeleteBatch = emptyList()
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        },
+                        enabled = !isDeletingFile,
+                        border = BorderStroke(1.dp, Gold),
+                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                    ) {
+                        Text("REMOVER SÓ DO APP", color = Gold, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(
+                        onClick = { if (!isDeletingFile) filesToDeleteBatch = emptyList() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("CANCELAR", color = TextGrey, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+    }
+
+    // JANELA AUTOMÁTICA DE NOVOS FICHEIROS NAS PASTAS DE SINCRONIZAÇÃO
+    if (showNovosSyncDialog && novosFicheirosSync.isNotEmpty()) {
+        Dialog(onDismissRequest = { showNovosSyncDialog = false }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.dp, Gold),
+                modifier = Modifier.fillMaxWidth().heightIn(max = 560.dp)
+            ) {
+                Column(Modifier.padding(20.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.CloudUpload, null, tint = Gold, modifier = Modifier.size(28.dp))
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("NOVOS FICHEIROS", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                            Text(
+                                "${novosFicheirosSync.size} ficheiro(s) novo(s) nas pastas sincronizadas",
+                                color = TextGrey,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = {
+                            selecionadosSync = if (selecionadosSync.size == novosFicheirosSync.size) {
+                                emptySet()
+                            } else {
+                                novosFicheirosSync.map { it.uri.toString() }.toSet()
+                            }
+                        }) {
+                            Text(
+                                if (selecionadosSync.size == novosFicheirosSync.size) "Desmarcar todos" else "Selecionar todos",
+                                color = Gold,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = organizarPorPastaSync,
+                                onCheckedChange = { organizarPorPastaSync = it },
+                                colors = CheckboxDefaults.colors(checkedColor = Gold, checkmarkColor = BgBlack)
+                            )
+                            Text("Manter pasta", color = Color.White, fontSize = 11.sp)
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .weight(1f, fill = false)
+                            .fillMaxWidth()
+                            .background(SurfaceDark, RoundedCornerShape(12.dp))
+                            .padding(8.dp)
+                            .verticalScroll(rememberScrollState())
+                    ) {
+                        novosFicheirosSync.forEach { item ->
+                            val chaveUri = item.uri.toString()
+                            val marcado = selecionadosSync.contains(chaveUri)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        selecionadosSync = if (marcado) selecionadosSync - chaveUri else selecionadosSync + chaveUri
+                                    }
+                                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = marcado,
+                                    onCheckedChange = {
+                                        selecionadosSync = if (it) selecionadosSync + chaveUri else selecionadosSync - chaveUri
+                                    },
+                                    colors = CheckboxDefaults.colors(checkedColor = Gold, checkmarkColor = BgBlack)
+                                )
+                                Column(Modifier.weight(1f).padding(start = 6.dp)) {
                                     Text(
-                                        text = Uri.parse(uriStr).lastPathSegment ?: uriStr,
+                                        item.nome,
                                         color = Color.White,
-                                        fontSize = 12.sp,
-                                        modifier = Modifier.weight(1f),
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
                                         maxLines = 1,
                                         overflow = TextOverflow.Ellipsis
                                     )
-                                    IconButton(onClick = {
-                                        removerPastaSync(context, cofreTagAtual, uriStr)
-                                        pastasAtuais = carregarPastasSync(context, cofreTagAtual).toList()
-                                    }) {
-                                        Icon(Icons.Default.Delete, contentDescription = "Remover", tint = DangerRed)
-                                    }
+                                    Text(
+                                        "📁 ${item.nomePastaOrigem} • ${formatarTamanhoNuvem(item.tamanho)}",
+                                        color = TextGrey,
+                                        fontSize = 10.sp,
+                                        maxLines = 1
+                                    )
                                 }
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Button(
-                        onClick = {
-                            mostrarDialogAutoSync = false
-                            seletorPastaSyncLauncher.launch(null)
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Gold)
-                    ) {
-                        Text("ADICIONAR PASTA LOCAL", color = Color.Black, fontWeight = FontWeight.Bold)
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { mostrarDialogAutoSync = false }) {
-                    Text("Fechar", color = Gold)
-                }
-            }
-        )
-    }
 
-    // === DIÁLOGO: MENU DE GESTÃO DE CACHE SSD NEXUS (v1.9) ===
-    if (mostrarMenuCache) {
-        val dirCacheUpload = File(context.cacheDir, "tdlib_upload_cache")
-        val dirThumbs = File(context.cacheDir, "thumbs_privadas")
-        var bytesUpload by remember {
-            mutableStateOf(dirCacheUpload.walkTopDown().filter { it.isFile }.sumOf { it.length() })
-        }
-        var bytesThumbs by remember {
-            mutableStateOf(dirThumbs.walkTopDown().filter { it.isFile }.sumOf { it.length() })
-        }
-
-        AlertDialog(
-            onDismissRequest = { mostrarMenuCache = false },
-            containerColor = SurfaceDark,
-            title = { Text("Gestão de Cache SSD Nexus", color = Gold, fontWeight = FontWeight.Bold) },
-            text = {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Text(
-                        text = "Cache de Arquivos: ${formatarTamanhoNuvem(bytesUpload)}",
-                        color = Color.White,
-                        fontSize = 14.sp
-                    )
-                    Text(
-                        text = "Cache de Miniaturas: ${formatarTamanhoNuvem(bytesThumbs)}",
-                        color = Color.White,
-                        fontSize = 14.sp
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Button(
-                        onClick = {
-                            dirCacheUpload.deleteRecursively()
-                            dirCacheUpload.mkdirs()
-                            bytesUpload = 0L
-                            Toast.makeText(context, "Cache de arquivos temporários limpo!", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceDarker)
-                    ) {
-                        Text("LIMPAR CACHE DE ARQUIVOS", color = Gold)
-                    }
-                    Button(
-                        onClick = {
-                            dirThumbs.deleteRecursively()
-                            dirThumbs.mkdirs()
-                            bytesThumbs = 0L
-                            Toast.makeText(context, "Miniaturas reiniciadas!", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = SurfaceDarker)
-                    ) {
-                        Text("RECRIAR MINIATURAS DE VÍDEO/FOTO", color = Color.White)
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { mostrarMenuCache = false }) {
-                    Text("Concluir", color = Gold)
-                }
-            }
-        )
-    }
-
-    // === VISUALIZADOR INTERNO MULTIMÍDIA (FOTOS COM ZOOM, VÍDEOS, PDF E TEXTO) ===
-    val arqVisual = arquivoEmVisualizacao
-    if (arqVisual != null) {
-        Dialog(
-            onDismissRequest = { arquivoEmVisualizacao = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            var carregandoArquivo by remember(arqVisual.fileId) { mutableStateOf(true) }
-            var progressoDownload by remember(arqVisual.fileId) { mutableStateOf(0f) }
-            var ficheiroLocal by remember(arqVisual.fileId) { mutableStateOf<File?>(null) }
-
-            val ext = arqVisual.nomeArquivo.substringAfterLast('.', "").lowercase(Locale.getDefault())
-            val isImage = ext in listOf("jpg", "jpeg", "png", "webp", "bmp", "heic")
-            val isVideo = ext in listOf("mp4", "mkv", "mov", "avi", "webm", "3gp")
-            val isPdf = ext == "pdf"
-            val isText = ext in listOf("txt", "log", "json", "xml", "csv", "md", "kt")
-
-            LaunchedEffect(arqVisual) {
-                carregandoArquivo = true
-                val baixado = garantirFicheiroLocal(context, client, arqVisual) { p ->
-                    progressoDownload = p
-                }
-                if (baixado != null && baixado.exists()) {
-                    if (arqVisual.caminhoMiniatura.isNullOrBlank()) {
-                        val novaCapa = prepararMiniaturaDeFicheiroBaixado(context, baixado, arqVisual.nomeArquivo)
-                        if (!novaCapa.isNullOrBlank()) {
-                            vm.salvarArquivo(arqVisual.copy(caminhoMiniatura = novaCapa))
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { showNovosSyncDialog = false },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f).height(48.dp)
+                        ) {
+                            Text("AGORA NÃO", color = Color.White, fontSize = 12.sp)
+                        }
+                        Button(
+                            onClick = {
+                                val escolhidos = novosFicheirosSync.filter { selecionadosSync.contains(it.uri.toString()) }
+                                showNovosSyncDialog = false
+                                executarUploadsNovosSync(escolhidos, organizarPorPastaSync)
+                            },
+                            enabled = selecionadosSync.isNotEmpty(),
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1.3f).height(48.dp)
+                        ) {
+                            Text(
+                                "UPLOAD (${selecionadosSync.size})",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 12.sp
+                            )
                         }
                     }
                 }
-                ficheiroLocal = baixado
-                carregandoArquivo = false
             }
+        }
+    }
 
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(BgBlack)
-            ) {
-                if (carregandoArquivo) {
-                    Column(
-                        modifier = Modifier.align(Alignment.Center),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        CircularProgressIndicator(color = Gold)
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "Carregando ${arqVisual.nomeArquivo} (${(progressoDownload * 100).toInt()}%)",
-                            color = Color.White,
-                            fontSize = 13.sp
-                        )
+    if (fileToRename != null) {
+        val arqR = fileToRename!!
+        val extOriginal = arqR.nomeArquivo.substringAfterLast('.', "")
+        Dialog(onDismissRequest = { fileToRename = null }) {
+            Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(24.dp)) {
+                    Text("RENOMEAR FICHEIRO", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(8.dp))
+                    if (extOriginal.isNotBlank()) {
+                        Text("Formato mantido automaticamente: .$extOriginal", color = TextGrey, fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
                     }
-                } else if (ficheiroLocal == null || !ficheiroLocal!!.exists()) {
-                    Column(
-                        modifier = Modifier
-                            .align(Alignment.Center)
-                            .padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = "Arquivo ainda em processamento na nuvem ou indisponível offline.",
-                            color = Color.White,
-                            textAlign = TextAlign.Center
-                        )
+                    OutlinedTextField(
+                        value = novoNomeInput,
+                        onValueChange = { novoNomeInput = it },
+                        label = { Text("Novo nome", color = TextGrey) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { fileToRename = null },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CANCELAR", color = Color.White)
+                        }
+                        Button(
+                            onClick = {
+                                val limpo = novoNomeInput.trim()
+                                if (limpo.isNotBlank()) {
+                                    val nomeFinal = if (extOriginal.isNotBlank() && !limpo.endsWith(".$extOriginal", ignoreCase = true)) {
+                                        "$limpo.$extOriginal"
+                                    } else {
+                                        limpo
+                                    }
+                                    vm.renomearArquivo(arqR, nomeFinal)
+                                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeFinal, arqR.tamanhoBytes)
+                                    if (viewerFile?.dataUpload == arqR.dataUpload) {
+                                        viewerFile = arqR.copy(nomeArquivo = nomeFinal)
+                                    }
+                                    Toast.makeText(context, "Renomeado para $nomeFinal", Toast.LENGTH_SHORT).show()
+                                }
+                                fileToRename = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("SALVAR", color = Color.White, fontWeight = FontWeight.Bold)
+                        }
                     }
-                } else {
-                    val file = ficheiroLocal!!
-                    when {
-                        isImage -> {
-                            val bmp = remember(file.absolutePath) { BitmapFactory.decodeFile(file.absolutePath) }
-                            var escala by remember { mutableStateOf(1f) }
-                            var offsetX by remember { mutableStateOf(0f) }
-                            var offsetY by remember { mutableStateOf(0f) }
+                }
+            }
+        }
+    }
 
-                            if (bmp != null) {
-                                Image(
-                                    bitmap = bmp.asImageBitmap(),
-                                    contentDescription = arqVisual.nomeArquivo,
-                                    contentScale = ContentScale.Fit,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .pointerInput(Unit) {
-                                            detectTransformGestures { _, pan, zoom, _ ->
-                                                escala = (escala * zoom).coerceIn(1f, 5f)
-                                                if (escala > 1f) {
-                                                    offsetX += pan.x
-                                                    offsetY += pan.y
-                                                } else {
-                                                    offsetX = 0f
-                                                    offsetY = 0f
-                                                }
+    if (pendingUploadUris.isNotEmpty()) {
+        val listaAtual = pendingUploadUris
+        Dialog(onDismissRequest = { pendingUploadUris = emptyList() }) {
+            Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(24.dp)) {
+                    Text("GUARDAR ${listaAtual.size} FICHEIRO(S)", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(onClick = { pendingUploadUris = emptyList(); executarUploads(listaAtual, "") }, border = BorderStroke(1.dp, TextGrey), modifier = Modifier.fillMaxWidth()) {
+                        Text("Galeria Geral (Sem pasta)", color = Color.White)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    pastas.forEach { p ->
+                        Button(onClick = { pendingUploadUris = emptyList(); executarUploads(listaAtual, p.nomePasta) }, colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark), modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MOVER PARA PASTA (SUPORTA 1 OU MÚLTIPLOS FICHEIROS)
+    if (filesToMoveBatch.isNotEmpty()) {
+        val listaMover = filesToMoveBatch
+        Dialog(onDismissRequest = { filesToMoveBatch = emptyList() }) {
+            Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(24.dp)) {
+                    Text(
+                        if (listaMover.size == 1) "MOVER PARA PASTA" else "MOVER ${listaMover.size} FICHEIROS",
+                        color = Gold,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 18.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedButton(
+                        onClick = {
+                            listaMover.forEach { salvarVinculoPasta(context, it.dataUpload, "") }
+                            mapaPastas = carregarVinculosPastas(context)
+                            filesToMoveBatch = emptyList()
+                            selectedFileIds = emptySet()
+                            isSelectionMode = false
+                            Toast.makeText(context, "Movido(s) para a Galeria Geral!", Toast.LENGTH_SHORT).show()
+                        },
+                        border = BorderStroke(1.dp, TextGrey),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Remover da Pasta (Galeria Geral)", color = Color.White)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    if (pastas.isEmpty()) {
+                        Text("Nenhuma pasta criada ainda.", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(vertical = 8.dp))
+                    } else {
+                        pastas.forEach { p ->
+                            Button(
+                                onClick = {
+                                    associarPastaAoUsuario(context, activeVaultUser, p.nomePasta)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                    listaMover.forEach { salvarVinculoPasta(context, it.dataUpload, p.nomePasta) }
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    filesToMoveBatch = emptyList()
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                    Toast.makeText(context, "Movido(s) para a pasta '${p.nomePasta}'!", Toast.LENGTH_SHORT).show()
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = SurfaceDark),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(20.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text(p.nomePasta, color = Color.White, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // VISUALIZADOR EM ECRÃ INTEIRO COM ZOOM INTERATIVO
+    if (viewerFile != null) {
+        val cur = viewerFile!!
+        val curMediaPath = NexusThumbCache.obterArquivoCompleto(cur).ifBlank { NexusThumbCache.obterMiniatura(cur) }
+        val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+        val isImage = ehArquivoImagem(cur.nomeArquivo)
+        val isVideo = ehArquivoVideo(cur.nomeArquivo)
+        val isPdf = ext == "PDF"
+        val isText = ext in listOf("TXT", "CSV", "LOG", "JSON", "XML", "MD")
+
+        var zoomScale by remember(cur.id) { mutableFloatStateOf(1f) }
+        var zoomOffset by remember(cur.id) { mutableStateOf(Offset.Zero) }
+        val transformableState = rememberTransformableState { zoomChange, panChange, _ ->
+            val novoScale = (zoomScale * zoomChange).coerceIn(1f, 5f)
+            zoomScale = novoScale
+            if (novoScale > 1f) {
+                zoomOffset += panChange
+            } else {
+                zoomOffset = Offset.Zero
+            }
+        }
+
+        var videoViewRef by remember { mutableStateOf<android.widget.VideoView?>(null) }
+        var isPlaying by remember { mutableStateOf(true) }
+        var currentPos by remember { mutableIntStateOf(0) }
+        var duration by remember { mutableIntStateOf(0) }
+
+        var pdfPages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
+        var isLoadingDoc by remember { mutableStateOf(false) }
+        var textContent by remember { mutableStateOf<String?>(null) }
+
+        LaunchedEffect(curMediaPath, ext) {
+            if (isPdf) {
+                isLoadingDoc = true
+                pdfPages = withContext(Dispatchers.IO) { renderizarPaginasPdf(curMediaPath) }
+                isLoadingDoc = false
+            } else if (isText) {
+                isLoadingDoc = true
+                textContent = withContext(Dispatchers.IO) { lerTextoDocumento(curMediaPath) }
+                isLoadingDoc = false
+            }
+        }
+
+        LaunchedEffect(videoViewRef, isPlaying) {
+            while (videoViewRef != null) {
+                try {
+                    val vv = videoViewRef!!
+                    if (vv.isPlaying) {
+                        currentPos = vv.currentPosition
+                        val dur = vv.duration
+                        if (dur > 0) duration = dur
+                    }
+                    isPlaying = vv.isPlaying
+                } catch (_: Exception) {}
+                delay(250)
+            }
+        }
+
+        Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Box(Modifier.fillMaxSize().background(Color.Black).clipToBounds()) {
+                when {
+                    isImage -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onDoubleTap = {
+                                            if (zoomScale > 1.05f) {
+                                                zoomScale = 1f
+                                                zoomOffset = Offset.Zero
+                                            } else {
+                                                zoomScale = 2.5f
                                             }
                                         }
+                                    )
+                                }
+                                .transformable(state = transformableState),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            AsyncImage(
+                                model = Uri.parse(curMediaPath),
+                                contentDescription = cur.nomeArquivo,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer(
+                                        scaleX = zoomScale,
+                                        scaleY = zoomScale,
+                                        translationX = zoomOffset.x,
+                                        translationY = zoomOffset.y
+                                    ),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+                    }
+                    isVideo -> {
+                        AndroidView(
+                            factory = { ctx ->
+                                android.widget.VideoView(ctx).apply {
+                                    setVideoURI(Uri.parse(curMediaPath))
+                                    setOnPreparedListener { mp ->
+                                        duration = mp.duration.coerceAtLeast(0)
+                                        start()
+                                        isPlaying = true
+                                    }
+                                    setOnCompletionListener {
+                                        isPlaying = false
+                                        currentPos = duration
+                                    }
+                                    videoViewRef = this
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize().align(Alignment.Center)
+                        )
+                    }
+                    isPdf -> {
+                        if (isLoadingDoc) {
+                            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                                CircularProgressIndicator(color = Gold)
+                                Spacer(Modifier.height(12.dp))
+                                Text("A renderizar páginas do PDF...", color = Color.White, fontSize = 13.sp)
+                            }
+                        } else if (pdfPages.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(top = 72.dp, bottom = 72.dp)
+                                    .pointerInput(Unit) {
+                                        detectTapGestures(
+                                            onDoubleTap = {
+                                                if (zoomScale > 1.05f) {
+                                                    zoomScale = 1f
+                                                    zoomOffset = Offset.Zero
+                                                } else {
+                                                    zoomScale = 2.2f
+                                                }
+                                            }
+                                        )
+                                    }
+                                    .transformable(state = transformableState)
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(horizontal = 12.dp)
                                         .graphicsLayer(
-                                            scaleX = escala,
-                                            scaleY = escala,
-                                            translationX = offsetX,
-                                            translationY = offsetY
+                                            scaleX = zoomScale,
+                                            scaleY = zoomScale,
+                                            translationX = zoomOffset.x,
+                                            translationY = zoomOffset.y
+                                        ),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    pdfPages.forEachIndexed { idx, paginaBmp ->
+                                        Text(
+                                            "Página ${idx + 1} de ${pdfPages.size}",
+                                            color = Gold,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                        )
+                                        Image(
+                                            bitmap = paginaBmp.asImageBitmap(),
+                                            contentDescription = "Página ${idx + 1}",
+                                            contentScale = ContentScale.FillWidth,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .background(Color.White, RoundedCornerShape(6.dp))
+                                        )
+                                        Spacer(Modifier.height(12.dp))
+                                    }
+                                }
+                            }
+                        } else {
+                            Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(64.dp))
+                                Spacer(Modifier.height(16.dp))
+                                Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                                Spacer(Modifier.height(20.dp))
+                                Button(
+                                    onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Gold)
+                                ) {
+                                    Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("ABRIR NO LEITOR DE PDF", color = BgBlack, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                    isText && !textContent.isNullOrBlank() -> {
+                        val tamanhoFonteTexto = (13f * zoomScale).coerceIn(11f, 32f).sp
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(top = 76.dp, bottom = 76.dp, start = 16.dp, end = 16.dp)
+                                .background(SurfaceDark, RoundedCornerShape(12.dp))
+                                .padding(16.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(textContent!!, color = Color.White, fontSize = tamanhoFonteTexto)
+                        }
+                    }
+                    else -> {
+                        Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(72.dp))
+                            Spacer(Modifier.height(16.dp))
+                            Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Tamanho: ${formatarTamanhoNuvem(cur.tamanhoBytes)}", color = TextGrey, fontSize = 12.sp)
+                            Spacer(Modifier.height(24.dp))
+                            Button(
+                                onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                                modifier = Modifier.fillMaxWidth(0.8f).height(50.dp)
+                            ) {
+                                Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
+                                Spacer(Modifier.width(8.dp))
+                                Text("ABRIR DOCUMENTO", color = BgBlack, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+
+                Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.85f)).padding(12.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
+                    Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
+                        Text(cur.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
+                    }
+                    IconButton(onClick = {
+                        novoNomeInput = cur.nomeArquivo.substringBeforeLast('.')
+                        fileToRename = cur
+                    }) {
+                        Icon(Icons.Default.Edit, contentDescription = "Renomear", tint = Color.White)
+                    }
+                    IconButton(onClick = { compartilharFicheiroNativo(context, curMediaPath, cur.nomeArquivo) }) {
+                        Icon(Icons.Default.Share, contentDescription = "Compartilhar", tint = Gold)
+                    }
+                    IconButton(onClick = { filesToDeleteBatch = listOf(cur) }) {
+                        Icon(Icons.Default.Delete, contentDescription = "Deletar", tint = DangerRed)
+                    }
+                }
+
+                if (!isVideo) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(BgBlack.copy(alpha = 0.9f))
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                            .align(Alignment.BottomCenter),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    val novo = (zoomScale - 0.5f).coerceAtLeast(1f)
+                                    zoomScale = novo
+                                    if (novo <= 1f) zoomOffset = Offset.Zero
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.height(38.dp)
+                            ) {
+                                Icon(Icons.Default.ZoomOut, null, tint = Gold, modifier = Modifier.size(18.dp))
+                            }
+                            TextButton(
+                                onClick = {
+                                    zoomScale = 1f
+                                    zoomOffset = Offset.Zero
+                                }
+                            ) {
+                                Text(
+                                    "${(zoomScale * 100).toInt()}%",
+                                    color = Gold,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    zoomScale = (zoomScale + 0.5f).coerceAtMost(5f)
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                modifier = Modifier.height(38.dp)
+                            ) {
+                                Icon(Icons.Default.ZoomIn, null, tint = Gold, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
+                            border = BorderStroke(1.dp, Gold),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            modifier = Modifier.height(38.dp)
+                        ) {
+                            Icon(Icons.Default.OpenInNew, null, tint = Gold, modifier = Modifier.size(16.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text("APP EXTERNA", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        }
+                    }
+                }
+
+                if (isVideo) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(BgBlack.copy(alpha = 0.85f))
+                            .padding(horizontal = 16.dp, vertical = 12.dp)
+                            .align(Alignment.BottomCenter)
+                    ) {
+                        Slider(
+                            value = currentPos.toFloat().coerceIn(0f, duration.coerceAtLeast(1).toFloat()),
+                            onValueChange = { novoValor ->
+                                val pos = novoValor.toInt()
+                                currentPos = pos
+                                videoViewRef?.seekTo(pos)
+                            },
+                            valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
+                            colors = SliderDefaults.colors(
+                                thumbColor = Gold,
+                                activeTrackColor = Gold,
+                                inactiveTrackColor = SurfaceDark
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(formatarTempoVideo(currentPos), color = TextGrey, fontSize = 11.sp)
+                            Text(formatarTempoVideo(duration), color = TextGrey, fontSize = 11.sp)
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        val novo = (vv.currentPosition - 10000).coerceAtLeast(0)
+                                        vv.seekTo(novo)
+                                        currentPos = novo
+                                    }
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Default.FastRewind, null, tint = Gold, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("-10s", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            FloatingActionButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        if (vv.isPlaying) {
+                                            vv.pause()
+                                            isPlaying = false
+                                        } else {
+                                            vv.start()
+                                            isPlaying = true
+                                        }
+                                    }
+                                },
+                                containerColor = Gold,
+                                contentColor = BgBlack,
+                                shape = CircleShape,
+                                modifier = Modifier.size(52.dp)
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (isPlaying) "Pausar" else "Reproduzir",
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    videoViewRef?.let { vv ->
+                                        val maxDur = if (duration > 0) duration else vv.duration.coerceAtLeast(0)
+                                        val novo = (vv.currentPosition + 10000).coerceAtMost(maxDur)
+                                        vv.seekTo(novo)
+                                        currentPos = novo
+                                    }
+                                },
+                                border = BorderStroke(1.dp, Gold),
+                                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                            ) {
+                                Text("+10s", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Spacer(Modifier.width(4.dp))
+                                Icon(Icons.Default.FastForward, null, tint = Gold, modifier = Modifier.size(18.dp))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
+                Column(Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
+                    Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Text("Cofre: $activeVaultUser", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
+                    Text("Nexus Cloud $NEXUS_VERSION • SSD ${mascararNumeroComAsterisco(phoneNumber)}", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Storage, null) },
+                    label = { Text("Armazenamento do Cofre") },
+                    selected = false,
+                    onClick = { showStorage = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Refresh, null) },
+                    label = { Text("Cache do SSD Nexus") },
+                    selected = false,
+                    onClick = { showCacheDialog = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Sync, null) },
+                    label = { Text("Sincronização Auto") },
+                    selected = false,
+                    onClick = { showSync = true; scope.launch { drawerState.close() } },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.CloudDownload, null) },
+                    label = { Text("Restaurar Cofre da Nuvem SSD") },
+                    selected = false,
+                    onClick = {
+                        scope.launch {
+                            drawerState.close()
+                            cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD..."
+                            val atuaisReais = vm.obterArquivosReais()
+                            sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, vm) { qtd ->
+                                scope.launch(Dispatchers.Main) {
+                                    delay(250)
+                                    val aposSync = vm.obterArquivosReais()
+                                    limparDuplicadosExistentes(context, aposSync, vm) {}
+                                    mapaDonos = carregarDonosFicheiros(context)
+                                    mapaPastas = carregarVinculosPastas(context)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                    val chaveAtiva = normalizarUsuario(activeVaultUser)
+                                    val doUsuario = aposSync.filter { mapaDonos[it.dataUpload] == chaveAtiva }
+                                    processarFilaMiniaturasNuvem(doUsuario)
+                                    cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD!" else "Cofre SSD de $activeVaultUser atualizado!"
+                                    Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        }
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Info, null) },
+                    label = { Text("Sobre") },
+                    selected = false,
+                    onClick = {
+                        showAboutDialog = true
+                        scope.launch { drawerState.close() }
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.Lock, null) },
+                    label = { Text("Trancar / Trocar Cofre") },
+                    selected = false,
+                    onClick = {
+                        scope.launch { drawerState.close() }
+                        jobFilaMiniaturas?.cancel()
+                        NexusLeituraNuvem.encerrar()
+                        NexusTransfer.cancelar(client)
+                        pastaAberta = null
+                        selectedFileIds = emptySet()
+                        isSelectionMode = false
+                        vaultPinInput = ""
+                        vaultErrorMsg = null
+                        isSwitchingUser = false
+                        vaultUnlocked = false
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
+                )
+            }
+        }
+    ) {
+        Scaffold(
+            topBar = {
+                Column(Modifier.background(BgBlack)) {
+                    if (isSelectionMode) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .background(SurfaceDarker)
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(onClick = {
+                                selectedFileIds = emptySet()
+                                isSelectionMode = false
+                            }) {
+                                Icon(Icons.Default.Close, contentDescription = "Cancelar seleção", tint = Color.White)
+                            }
+                            Text(
+                                "${selectedFileIds.size} selecionado(s)",
+                                color = Gold,
+                                fontWeight = FontWeight.Black,
+                                fontSize = 16.sp,
+                                modifier = Modifier.weight(1f).padding(start = 4.dp)
+                            )
+                            TextButton(onClick = {
+                                val todosIdsVisiveis = listaVisivelAtual.map { it.id }.toSet()
+                                if (selectedFileIds.containsAll(todosIdsVisiveis) && todosIdsVisiveis.isNotEmpty()) {
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                } else {
+                                    selectedFileIds = todosIdsVisiveis
+                                }
+                            }) {
+                                val todosMarcados = listaVisivelAtual.isNotEmpty() && selectedFileIds.containsAll(listaVisivelAtual.map { it.id })
+                                Text(
+                                    if (todosMarcados) "DESMARCAR TUDO" else "SELECIONAR TUDO",
+                                    color = Gold,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                            }
+                        }
+                    } else {
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }
+                            Column(Modifier.weight(1f)) {
+                                Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                                Text(
+                                    text = if (transferProgress != null) {
+                                        if (transferPaused) "⏸ PAUSADO • $transferLabel" else transferLabel
+                                    } else cloudBannerText,
+                                    color = if (transferProgress != null) Gold else TextGrey,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (listaVisivelAtual.isNotEmpty()) {
+                                IconButton(onClick = { isSelectionMode = true }) {
+                                    Icon(Icons.Default.CheckCircle, contentDescription = "Selecionar vários", tint = Gold)
+                                }
+                            }
+                            IconButton(onClick = {
+                                showSearchBar = !showSearchBar
+                                if (!showSearchBar) searchQuery = ""
+                            }) {
+                                Icon(if (showSearchBar) Icons.Default.Close else Icons.Default.Search, contentDescription = "Pesquisar", tint = Gold)
+                            }
+                            if (transferProgress != null || isUploading) {
+                                Text("${transferProgress ?: 10}%", color = Gold, fontWeight = FontWeight.Black, fontSize = 13.sp, modifier = Modifier.padding(end = 6.dp))
+                                if (!transferPaused) {
+                                    CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                                } else {
+                                    Icon(Icons.Default.Pause, contentDescription = "Pausado", tint = Gold, modifier = Modifier.size(18.dp))
+                                }
+                            } else {
+                                IconButton(onClick = {
+                                    jobFilaMiniaturas?.cancel()
+                                    NexusLeituraNuvem.encerrar()
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                    vaultPinInput = ""
+                                    vaultErrorMsg = null
+                                    isSwitchingUser = false
+                                    vaultUnlocked = false
+                                }) {
+                                    Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
+                                }
+                            }
+                        }
+                    }
+
+                    // === BARRA ÚNICA DE DOWNLOAD / ENVIO (UPLOAD) COM PAUSAR / CONTINUAR / CANCELAR ===
+                    if (transferProgress != null || isUploading) {
+                        val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
+                        val fra = pctAtual / 100f
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 4.dp)
+                                .background(SurfaceDarker, RoundedCornerShape(10.dp))
+                                .border(1.dp, if (transferPaused) DangerRed else Gold, RoundedCornerShape(10.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                    Text(
+                                        text = when {
+                                            transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO ($pctAtual%)"
+                                            transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO ($pctAtual%)"
+                                            transferIsUpload -> "⬆️ ENVIANDO ARQUIVO ($pctAtual%)"
+                                            else -> "⬇️ BAIXANDO ARQUIVO ($pctAtual%)"
+                                        },
+                                        color = if (transferPaused) DangerRed else Gold,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                    Text(
+                                        text = transferLabel.ifBlank { "Processando transferência..." },
+                                        color = Color.White,
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Button(
+                                        onClick = { NexusTransfer.alternarPausa(client) },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (transferPaused) Gold else SurfaceDark
+                                        ),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                        modifier = Modifier.height(32.dp)
+                                    ) {
+                                        Icon(
+                                            imageVector = if (transferPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                            contentDescription = if (transferPaused) "Continuar" else "Pausar",
+                                            tint = if (transferPaused) BgBlack else Gold,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        Text(
+                                            text = if (transferPaused) "CONTINUAR" else "PAUSAR",
+                                            color = if (transferPaused) BgBlack else Gold,
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Black
+                                        )
+                                    }
+
+                                    IconButton(
+                                        onClick = {
+                                            NexusTransfer.cancelar(client)
+                                            isUploading = false
+                                        },
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .background(DangerRed.copy(alpha = 0.2f), CircleShape)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Close,
+                                            contentDescription = "Cancelar transferência",
+                                            tint = DangerRed,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Spacer(Modifier.height(6.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(SurfaceDark)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(fra)
+                                        .height(6.dp)
+                                        .background(
+                                            if (transferPaused) Brush.horizontalGradient(listOf(DangerRed, DangerRed))
+                                            else Brush.horizontalGradient(listOf(Gold, DangerRed))
                                         )
                                 )
                             }
                         }
-                        isVideo -> {
-                            AndroidView(
-                                factory = { ctx ->
-                                    android.widget.VideoView(ctx).apply {
-                                        val controller = android.widget.MediaController(ctx)
-                                        controller.setAnchorView(this)
-                                        setMediaController(controller)
-                                        setVideoPath(file.absolutePath)
-                                        setOnPreparedListener { mp ->
-                                            mp.isLooping = false
-                                            start()
-                                        }
-                                    }
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .align(Alignment.Center)
-                            )
-                        }
-                        isPdf -> {
-                            val paginas = remember(file.absolutePath) { renderizarPaginasPdf(context, file) }
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(top = 64.dp, bottom = 64.dp),
-                                verticalArrangement = Arrangement.spacedBy(12.dp),
-                                contentPadding = PaddingValues(12.dp)
+                    } else if (leituraAtiva && leituraTotal > 0) {
+                        val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
+                        val avancoSuave = (lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()
+                        val fracaoLeitura = avancoSuave.coerceIn(0.02f, 1f)
+                        val pctLeitura = (fracaoLeitura * 100).toInt().coerceIn(1, 100)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 4.dp)
+                                .background(SurfaceDarker, RoundedCornerShape(10.dp))
+                                .border(1.dp, Gold.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                items(paginas) { pgBmp ->
-                                    Image(
-                                        bitmap = pgBmp.asImageBitmap(),
-                                        contentDescription = null,
-                                        contentScale = ContentScale.FillWidth,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(RoundedCornerShape(8.dp))
+                                Text(
+                                    text = if (leituraPausada) "⏸ PAUSADO: ${leituraTitulo.ifBlank { "Leitura da nuvem SSD" }}"
+                                    else leituraTitulo.ifBlank { "Lendo arquivos da nuvem SSD..." },
+                                    color = if (leituraPausada) Gold else Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                                )
+                                Text(
+                                    text = "${(lidosSafe + 1).coerceAtMost(leituraTotal)} / $leituraTotal ($pctLeitura%)",
+                                    color = Gold,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Black,
+                                    modifier = Modifier.padding(end = 6.dp)
+                                )
+                                IconButton(
+                                    onClick = { NexusLeituraNuvem.alternarPausa() },
+                                    modifier = Modifier.size(26.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (leituraPausada) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                        contentDescription = if (leituraPausada) "Continuar leitura" else "Pausar leitura",
+                                        tint = Gold,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
+                                IconButton(
+                                    onClick = {
+                                        jobFilaMiniaturas?.cancel()
+                                        NexusLeituraNuvem.encerrar()
+                                    },
+                                    modifier = Modifier.size(26.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = "Fechar barra de leitura",
+                                        tint = TextGrey,
+                                        modifier = Modifier.size(16.dp)
                                     )
                                 }
                             }
-                        }
-                        isText -> {
-                            val conteudoTxt = remember(file.absolutePath) { lerTextoDocumento(file) }
-                            Column(
+                            Spacer(Modifier.height(6.dp))
+                            Box(
                                 modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(top = 70.dp, bottom = 70.dp, start = 16.dp, end = 16.dp)
-                                    .verticalScroll(rememberScrollState())
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(SurfaceDark)
                             ) {
-                                Text(text = conteudoTxt, color = Color.White, fontSize = 13.sp)
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth(fracaoLeitura)
+                                        .height(6.dp)
+                                        .background(Brush.horizontalGradient(listOf(Gold, DangerRed)))
+                                )
                             }
                         }
-                        else -> {
-                            Column(
-                                modifier = Modifier.align(Alignment.Center),
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.InsertDriveFile,
-                                    contentDescription = null,
-                                    tint = Gold,
-                                    modifier = Modifier.size(64.dp)
-                                )
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text(text = arqVisual.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Button(
-                                    onClick = { abrirFicheiroExterno(context, file, arqVisual.nomeArquivo) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Gold)
-                                ) {
-                                    Text("ABRIR EM APLICATIVO EXTERNO", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+
+                    if (showSearchBar) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("Pesquisar no cofre SSD de $activeVaultUser...", color = TextGrey, fontSize = 13.sp) },
+                            leadingIcon = { Icon(Icons.Default.Search, null, tint = Gold) },
+                            trailingIcon = {
+                                if (searchQuery.isNotBlank()) {
+                                    IconButton(onClick = { searchQuery = "" }) {
+                                        Icon(Icons.Default.Close, null, tint = TextGrey)
+                                    }
                                 }
+                            },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = SurfaceDark,
+                                focusedContainerColor = SurfaceDarker,
+                                unfocusedContainerColor = SurfaceDarker
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp, top = 4.dp)
+                        )
+                    }
+
+                    TabRow(selectedTabIndex = selectedTab, containerColor = BgBlack, indicator = { TabRowDefaults.Indicator(Modifier.tabIndicatorOffset(it[selectedTab]), color = Gold) }, divider = {}) {
+                        listOf("GALERIA", "PASTAS", "FOTOS", "VÍDEOS", "DOCS").forEachIndexed { i, t ->
+                            Tab(selected = selectedTab == i, onClick = {
+                                selectedTab = i
+                                if (i != 1) pastaAberta = null
+                            }) {
+                                val labelTab = if (i == 1 && pastas.isNotEmpty()) "PASTAS (${pastas.size})" else t
+                                Text(labelTab, color = if (selectedTab == i) Gold else TextGrey, modifier = Modifier.padding(vertical = 12.dp, horizontal = 2.dp), fontWeight = FontWeight.Bold, fontSize = 10.sp, maxLines = 1)
                             }
                         }
                     }
                 }
-
-                // Barra Superior do Visualizador
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.TopCenter)
-                        .background(Color.Black.copy(alpha = 0.75f))
-                        .padding(horizontal = 12.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = arqVisual.nomeArquivo,
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = "${formatarTamanhoNuvem(arqVisual.tamanhoBytes)} • ${formatarDataCurta(arqVisual.dataUpload)}",
-                            color = Gold,
-                            fontSize = 11.sp
-                        )
+            },
+            bottomBar = {
+                if (isSelectionMode && selectedFileIds.isNotEmpty()) {
+                    val arquivosSelecionados = remember(arquivos, selectedFileIds) {
+                        arquivos.filter { selectedFileIds.contains(it.id) }
                     }
-                    Row {
-                        if (ficheiroLocal != null && ficheiroLocal!!.exists()) {
-                            IconButton(onClick = {
-                                compartilharFicheiroNativo(context, ficheiroLocal!!, arqVisual.nomeArquivo)
-                            }) {
-                                Icon(Icons.Default.Share, contentDescription = "Compartilhar", tint = Color.White)
+                    Surface(
+                        color = SurfaceDarker,
+                        border = BorderStroke(1.dp, Gold.copy(alpha = 0.4f)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 8.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier
+                                    .clickable {
+                                        val lote = arquivosSelecionados
+                                        selectedFileIds = emptySet()
+                                        isSelectionMode = false
+                                        compartilharMultiplosFicheirosNativo(context, client, activeVaultUser, lote, vm)
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Share, null, tint = Gold, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.height(2.dp))
+                                Text("Compartilhar", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier
+                                    .clickable {
+                                        filesToMoveBatch = arquivosSelecionados
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.height(2.dp))
+                                Text("Mover / Pasta", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier
+                                    .clickable {
+                                        val lote = arquivosSelecionados
+                                        selectedFileIds = emptySet()
+                                        isSelectionMode = false
+                                        copiarLoteParaDownloads(context, client, activeVaultUser, lote, vm) { msg ->
+                                            scope.launch(Dispatchers.Main) {
+                                                cloudBannerText = msg
+                                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.ContentCopy, null, tint = Color.White, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.height(2.dp))
+                                Text("Copiar / Baixar", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier
+                                    .clickable {
+                                        filesToDeleteBatch = arquivosSelecionados
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                            ) {
+                                Icon(Icons.Default.Delete, null, tint = DangerRed, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.height(2.dp))
+                                Text("Remover", color = DangerRed, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                             }
                         }
-                        IconButton(onClick = {
-                            vm.apagar(arqVisual.id)
-                            arquivoEmVisualizacao = null
-                            Toast.makeText(context, "Arquivo removido do cofre.", Toast.LENGTH_SHORT).show()
-                        }) {
-                            Icon(Icons.Default.Delete, contentDescription = "Excluir", tint = DangerRed)
+                    }
+                }
+            },
+            floatingActionButton = {
+                if (!isSelectionMode) {
+                    FloatingActionButton(onClick = { filePicker.launch(arrayOf("*/*")) }, containerColor = DangerRed, contentColor = Color.White, shape = CircleShape, modifier = Modifier.shadow(16.dp, CircleShape)) {
+                        Icon(Icons.Default.CloudUpload, null)
+                    }
+                }
+            },
+            containerColor = BgBlack
+        ) { innerPadding ->
+            Box(Modifier.padding(innerPadding).fillMaxSize()) {
+                if (selectedTab == 1) {
+                    if (pastaAberta != null) {
+                        val nomePastaAtual = pastaAberta!!
+                        Column(Modifier.fillMaxSize()) {
+                            Row(Modifier.fillMaxWidth().background(SurfaceDarker).padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = {
+                                    pastaAberta = null
+                                    selectedFileIds = emptySet()
+                                    isSelectionMode = false
+                                }) {
+                                    Icon(Icons.Default.ArrowBack, null, tint = Gold)
+                                }
+                                Icon(Icons.Default.FolderOpen, null, tint = Gold, modifier = Modifier.size(22.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(nomePastaAtual, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    Text("${listaVisivelAtual.size} arquivo(s) na pasta", color = TextGrey, fontSize = 10.sp)
+                                }
+                                IconButton(onClick = {
+                                    novoNomePastaInput = nomePastaAtual
+                                    pastaParaRenomear = nomePastaAtual
+                                }) {
+                                    Icon(Icons.Default.Edit, contentDescription = "Renomear Pasta", tint = Gold)
+                                }
+                                IconButton(onClick = {
+                                    pastaParaApagar = nomePastaAtual
+                                }) {
+                                    Icon(Icons.Default.Delete, contentDescription = "Apagar Pasta", tint = DangerRed)
+                                }
+                            }
+                            GrelhaArquivos(
+                                context = context,
+                                client = client,
+                                usuarioAtivo = activeVaultUser,
+                                vm = vm,
+                                lista = listaVisivelAtual,
+                                mapaPastas = mapaPastas,
+                                modoSelecao = isSelectionMode,
+                                idsSelecionados = selectedFileIds,
+                                onFileClick = { arq ->
+                                    if (isSelectionMode) alternarSelecaoFicheiro(arq)
+                                    else selectedFile = arq
+                                },
+                                onFileLongClick = { arq ->
+                                    alternarSelecaoFicheiro(arq)
+                                }
+                            )
                         }
-                        IconButton(onClick = { arquivoEmVisualizacao = null }) {
-                            Icon(Icons.Default.Close, contentDescription = "Fechar", tint = Gold)
+                    } else {
+                        val pastasFiltradas = remember(pastas, searchQuery) {
+                            if (searchQuery.isBlank()) pastas
+                            else pastas.filter { it.nomePasta.contains(searchQuery, ignoreCase = true) }
+                        }
+                        Column(Modifier.fillMaxSize().padding(14.dp)) {
+                            OutlinedButton(onClick = { showNewFolder = true }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(50.dp)) {
+                                Icon(Icons.Default.CreateNewFolder, null, tint = Gold)
+                                Spacer(Modifier.width(8.dp))
+                                Text("CRIAR NOVA PASTA", color = Gold, fontWeight = FontWeight.Bold)
+                            }
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "Pastas do cofre ($activeVaultUser) • Toque numa pasta para ver os arquivos ou nos 3 pontos para editar:",
+                                color = TextGrey,
+                                fontSize = 11.sp,
+                                modifier = Modifier.padding(bottom = 10.dp)
+                            )
+                            LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                items(pastasFiltradas, key = { it.nomePasta.trim().lowercase(Locale.ROOT) }) { p ->
+                                    val arquivosDaPasta = remember(arquivos, mapaPastas, p.nomePasta) {
+                                        arquivos.filter { mapaPastas[it.dataUpload]?.equals(p.nomePasta, ignoreCase = true) == true }
+                                    }
+                                    val qtd = arquivosDaPasta.size
+                                    val tamanhoPasta = remember(arquivosDaPasta) { arquivosDaPasta.sumOf { it.tamanhoBytes } }
+                                    val arqCapa = remember(arquivosDaPasta) {
+                                        arquivosDaPasta.firstOrNull { miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(it), it.nomeArquivo) }
+                                            ?: arquivosDaPasta.firstOrNull()
+                                    }
+                                    val thumbCapa = arqCapa?.let { NexusThumbCache.mapaMiniaturas[it.dataUpload] ?: it.caminhoMiniatura ?: "" } ?: ""
+
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .background(SurfaceDark, RoundedCornerShape(14.dp))
+                                            .border(1.dp, Gold.copy(alpha = 0.28f), RoundedCornerShape(14.dp))
+                                            .combinedClickable(
+                                                onClick = { pastaAberta = p.nomePasta },
+                                                onLongClick = { pastaSelecionadaMenu = p.nomePasta }
+                                            )
+                                            .padding(10.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .height(92.dp)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(SurfaceDarker),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            if (thumbCapa.isNotBlank() && miniaturaExisteLocalmente(thumbCapa, arqCapa?.nomeArquivo ?: "")) {
+                                                AsyncImage(
+                                                    model = ImageRequest.Builder(context)
+                                                        .data(obterUriCapaMidia(thumbCapa))
+                                                        .size(240, 240)
+                                                        .bitmapConfig(Bitmap.Config.ARGB_8888)
+                                                        .build(),
+                                                    contentDescription = p.nomePasta,
+                                                    contentScale = ContentScale.Crop,
+                                                    modifier = Modifier.fillMaxSize()
+                                                )
+                                                Box(Modifier.fillMaxSize().background(BgBlack.copy(alpha = 0.25f)))
+                                            } else {
+                                                Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(44.dp))
+                                            }
+                                            Box(
+                                                modifier = Modifier
+                                                    .align(Alignment.TopStart)
+                                                    .padding(6.dp)
+                                                    .background(BgBlack.copy(alpha = 0.8f), RoundedCornerShape(6.dp))
+                                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                                            ) {
+                                                Text("$qtd arq.", color = Gold, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                            IconButton(
+                                                onClick = { pastaSelecionadaMenu = p.nomePasta },
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .size(28.dp)
+                                            ) {
+                                                Icon(Icons.Default.MoreVert, contentDescription = "Opções da pasta", tint = Color.White, modifier = Modifier.size(18.dp))
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(8.dp))
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Folder, null, tint = Gold, modifier = Modifier.size(18.dp))
+                                            Spacer(Modifier.width(6.dp))
+                                            Text(
+                                                p.nomePasta,
+                                                color = Color.White,
+                                                fontWeight = FontWeight.Bold,
+                                                fontSize = 14.sp,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
+                                        Text(
+                                            "$qtd item(ns) • ${formatarTamanhoNuvem(tamanhoPasta)}",
+                                            color = TextGrey,
+                                            fontSize = 10.sp,
+                                            maxLines = 1,
+                                            modifier = Modifier.padding(top = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    GrelhaArquivos(
+                        context = context,
+                        client = client,
+                        usuarioAtivo = activeVaultUser,
+                        vm = vm,
+                        lista = listaVisivelAtual,
+                        mapaPastas = mapaPastas,
+                        modoSelecao = isSelectionMode,
+                        idsSelecionados = selectedFileIds,
+                        onFileClick = { arq ->
+                            if (isSelectionMode) alternarSelecaoFicheiro(arq)
+                            else selectedFile = arq
+                        },
+                        onFileLongClick = { arq ->
+                            alternarSelecaoFicheiro(arq)
+                        }
+                    )
+                }
+            }
+
+            if (selectedFile != null) {
+                val arq = selectedFile!!
+                ModalBottomSheet(onDismissRequest = { selectedFile = null }, sheetState = sheetState, containerColor = SurfaceDark) {
+                    Column(Modifier.padding(bottom = 24.dp)) {
+                        Text(arq.nomeArquivo, color = Gold, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp), fontWeight = FontWeight.Bold)
+                        Text("Cofre SSD: $activeVaultUser • Tamanho: ${formatarTamanhoNuvem(arq.tamanhoBytes)} • Pasta: ${mapaPastas[arq.dataUpload] ?: "Geral"}\nAdicionado em: ${formatarDataNuvem(arq.dataUpload)}", color = TextGrey, fontSize = 12.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp))
+                        ListItem(
+                            headlineContent = { Text("Abrir no Nexus Cloud (Com Zoom)", color = Color.White) },
+                            leadingContent = { Icon(Icons.Default.Fullscreen, null, tint = Color.White) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, activeVaultUser, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { viewerFile = arqPronto }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(
+                            headlineContent = { Text("Selecionar vários ficheiros...", color = Gold) },
+                            leadingContent = { Icon(Icons.Default.CheckCircle, null, tint = Gold) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                isSelectionMode = true
+                                selectedFileIds = setOf(arq.id)
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(
+                            headlineContent = { Text("Abrir em App Externa...", color = Gold) },
+                            leadingContent = { Icon(Icons.Default.OpenInNew, null, tint = Gold) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, activeVaultUser, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { abrirFicheiroExterno(context, arqPronto.caminhoMiniatura, arqPronto.nomeArquivo) }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(headlineContent = { Text("Renomear ficheiro...", color = Color.White) }, leadingContent = { Icon(Icons.Default.Edit, null, tint = Color.White) }, modifier = Modifier.clickable { novoNomeInput = arq.nomeArquivo.substringBeforeLast('.'); fileToRename = arq; selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(headlineContent = { Text("Mover para Pasta...", color = Gold) }, leadingContent = { Icon(Icons.Default.Folder, null, tint = Gold) }, modifier = Modifier.clickable { filesToMoveBatch = listOf(arq); selectedFile = null }, colors = ListItemDefaults.colors(containerColor = Color.Transparent))
+                        ListItem(
+                            headlineContent = { Text("Compartilhar...", color = Color.White) },
+                            leadingContent = { Icon(Icons.Default.Share, null, tint = Color.White) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                garantirFicheiroLocal(context, client, activeVaultUser, arq, vm) { arqPronto ->
+                                    scope.launch(Dispatchers.Main) { compartilharFicheiroNativo(context, arqPronto.caminhoMiniatura, arqPronto.nomeArquivo) }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(
+                            headlineContent = { Text("Copiar / Baixar da Nuvem SSD", color = Gold) },
+                            leadingContent = { Icon(Icons.Default.CloudDownload, null, tint = Gold) },
+                            modifier = Modifier.clickable {
+                                selectedFile = null
+                                baixarFicheiroDaNuvem(context, client, activeVaultUser, arq, vm) { m ->
+                                    scope.launch(Dispatchers.Main) { Toast.makeText(context, m, Toast.LENGTH_LONG).show() }
+                                }
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                        ListItem(
+                            headlineContent = { Text("Deletar / Remover ficheiro...", color = DangerRed, fontWeight = FontWeight.Bold) },
+                            leadingContent = { Icon(Icons.Default.Delete, null, tint = DangerRed) },
+                            modifier = Modifier.clickable {
+                                filesToDeleteBatch = listOf(arq)
+                                selectedFile = null
+                            },
+                            colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                        )
+                    }
+                }
+            }
+
+            if (showNewFolder) {
+                Dialog(onDismissRequest = { showNewFolder = false }) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(24.dp)) {
+                            Text("NOVA PASTA", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                            Spacer(Modifier.height(16.dp))
+                            OutlinedTextField(value = nomeNovaPasta, onValueChange = { nomeNovaPasta = it }, label = { Text("Nome", color = TextGrey) }, singleLine = true, colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = Gold, unfocusedBorderColor = Color.Gray), modifier = Modifier.fillMaxWidth())
+                            Spacer(Modifier.height(16.dp))
+                            Button(onClick = {
+                                val n = nomeNovaPasta.trim()
+                                if (n.isNotBlank()) {
+                                    vm.criarPasta(n)
+                                    associarPastaAoUsuario(context, activeVaultUser, n)
+                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                }
+                                nomeNovaPasta = ""
+                                showNewFolder = false
+                            }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth()) { Text("CRIAR", color = Color.White) }
+                        }
+                    }
+                }
+            }
+
+            if (showStorage) {
+                Dialog(onDismissRequest = { showStorage = false }) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth()) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            Text("COFRE SSD: ${activeVaultUser.uppercase(Locale.getDefault())}", color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(6.dp))
+                            Text(formatarTamanhoNuvem(armazenamentoUsuario), color = Color.White, fontSize = 32.sp, fontWeight = FontWeight.Black)
+                            Text("${arquivos.size} ficheiro(s) neste perfil", color = TextGrey, fontSize = 12.sp)
+                            Spacer(Modifier.height(16.dp))
+                            Box(Modifier.fillMaxWidth().height(6.dp).background(Brush.horizontalGradient(listOf(Gold, DangerRed)), RoundedCornerShape(3.dp)))
+                            Spacer(Modifier.height(24.dp))
+                            Button(onClick = { showStorage = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth()) { Text("FECHAR", color = Color.White) }
+                        }
+                    }
+                }
+            }
+
+            if (showSync) {
+                Dialog(onDismissRequest = { showSync = false }) {
+                    Surface(shape = RoundedCornerShape(16.dp), color = SurfaceDarker, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().heightIn(max = 540.dp)) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                            Text("BACKUP AUTOMÁTICO SSD ($activeVaultUser)", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(8.dp))
+                            Text("Ao abrir o cofre, a app verifica estas pastas e mostra os ficheiros novos para upload.", color = TextGrey, fontSize = 12.sp, textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(16.dp))
+
+                            if (pastasSync.isEmpty()) {
+                                Text("Nenhuma pasta selecionada.", color = TextGrey, fontSize = 14.sp, modifier = Modifier.padding(vertical = 16.dp))
+                            } else {
+                                Column(modifier = Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState())) {
+                                    pastasSync.forEach { p ->
+                                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                            IconButton(onClick = { removerPastaSync(context, activeVaultUser, p.uri); pastasSync = carregarPastasSync(context, activeVaultUser) }) {
+                                                Icon(Icons.Default.Delete, null, tint = DangerRed, modifier = Modifier.size(20.dp))
+                                            }
+                                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                                Text(p.nome, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            }
+                                            Switch(
+                                                checked = p.ativa,
+                                                onCheckedChange = { salvarPastaSync(context, activeVaultUser, p.uri, it); pastasSync = carregarPastasSync(context, activeVaultUser) },
+                                                colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = DangerRed, uncheckedThumbColor = TextGrey, uncheckedTrackColor = SurfaceDark)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            Spacer(Modifier.height(16.dp))
+                            OutlinedButton(onClick = { folderPicker.launch(null) }, border = BorderStroke(1.dp, Gold), modifier = Modifier.fillMaxWidth().height(46.dp)) {
+                                Icon(Icons.Default.CreateNewFolder, null, tint = Gold)
+                                Spacer(Modifier.width(8.dp))
+                                Text("ADICIONAR PASTA", color = Gold, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                            if (pastasSync.any { it.ativa }) {
+                                Spacer(Modifier.height(8.dp))
+                                OutlinedButton(
+                                    onClick = {
+                                        showSync = false
+                                        verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = true)
+                                    },
+                                    border = BorderStroke(1.dp, Color.White),
+                                    modifier = Modifier.fillMaxWidth().height(46.dp)
+                                ) {
+                                    Icon(Icons.Default.Search, null, tint = Color.White)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("PROCURAR NOVOS AGORA", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+                            }
+                            Spacer(Modifier.height(8.dp))
+                            Button(onClick = { showSync = false }, colors = ButtonDefaults.buttonColors(containerColor = DangerRed), modifier = Modifier.fillMaxWidth().height(46.dp)) {
+                                Text("CONCLUÍDO", color = Color.White, fontWeight = FontWeight.Bold)
+                            }
                         }
                     }
                 }
