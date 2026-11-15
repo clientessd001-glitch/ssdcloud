@@ -12,6 +12,7 @@ import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import android.widget.Toast
@@ -63,7 +64,6 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.FileProvider
-import androidx.documentfile.provider.DocumentFile
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.*
@@ -79,12 +79,13 @@ import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.math.min
 
-// === CORES E TEMA NEXUS CLOUD v1.9 ===
+// === VERSÃO GLOBAL E TEMA NEXUS CLOUD v1.9 ===
+const val NEXUS_VERSION = "v1.9"
+
 val BgBlack = Color(0xFF0A0A0C)
 val SurfaceDark = Color(0xFF16161A)
 val SurfaceDarker = Color(0xFF101014)
@@ -140,9 +141,15 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         }
     }
 
+    fun apagar(id: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.apagarArquivo(id)
+        }
+    }
+
     fun apagar(arq: ArquivoNuvem) {
         viewModelScope.launch(Dispatchers.IO) {
-            dao.apagarArquivo(arq)
+            dao.apagarArquivo(arq.id)
         }
     }
 }
@@ -476,12 +483,14 @@ fun salvarMiniaturaPrivada(context: Context, uri: Uri, nome: String): String? {
         val tempVid = copiarUriParaCacheTDLib(context, uri, "tmp_thumb_$nome")
         if (tempVid != null) {
             val ok = extrairCapaVideoParaArquivo(context, tempVid, destino)
+            tempVid.delete()
             if (ok) return destino.absolutePath
         }
     } else if (isImage) {
         val tempImg = copiarUriParaCacheTDLib(context, uri, "tmp_img_$nome")
         if (tempImg != null) {
             val ok = gerarMiniaturaImagemLeve(tempImg, destino, 360)
+            tempImg.delete()
             if (ok) return destino.absolutePath
         }
     }
@@ -612,7 +621,7 @@ fun compartilharFicheiroNativo(context: Context, file: File, nome: String) {
     }
 }
 
-// === ENVIO REAL PARA MENSAGENS SALVAS (CORRIGIDO: SEM INPUTTHUMBNAIL REJEITADO PELA TDLIB) ===
+// === ENVIO REAL PARA MENSAGENS SALVAS (COMPATÍVEL COM TDLIB 1.8+ VIA APPLY) ===
 suspend fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -655,19 +664,23 @@ suspend fun enviarParaMensagensSalvas(
     val legendaTexto = "NEXUS_VAULT:$cofreTag|FOLDER:$pastaDestino|FILE:$nomeOriginal"
     val legendaFormatada = TdApi.FormattedText(legendaTexto, emptyArray())
 
-    // IMPORTANTE: InputThumbnail enviado como null para evitar Erro 400 (Thumbnail dimensions/size limit) da TDLib.
-    // A miniatura de alta qualidade permanece salva em caminhoThumbLocal no aparelho!
-    val conteudoDoc = TdApi.InputMessageDocument(
-        TdApi.InputFileLocal(arquivoLocal.absolutePath),
-        null,
-        true,
-        legendaFormatada
-    )
+    // Usa construtor vazio + apply para compatibilidade total e thumbnail = null para evitar Erro 400
+    val conteudoDoc = TdApi.InputMessageDocument().apply {
+        document = TdApi.InputFileLocal(arquivoLocal.absolutePath)
+        thumbnail = null
+        disableContentTypeDetection = true
+        caption = legendaFormatada
+    }
 
     val msgEnviadaRef = AtomicReference<TdApi.Message?>(null)
     val sendLatch = CountDownLatch(1)
 
-    client.send(TdApi.SendMessage(savedMessagesChatId, 0, null, null, null, conteudoDoc)) { res ->
+    val reqEnvio = TdApi.SendMessage().apply {
+        chatId = savedMessagesChatId
+        inputMessageContent = conteudoDoc
+    }
+
+    client.send(reqEnvio) { res ->
         if (res is TdApi.Message) {
             msgEnviadaRef.set(res)
         }
@@ -718,7 +731,6 @@ suspend fun enviarParaMensagensSalvas(
 
             if (remote != null && !remote.isUploadingActive && !remote.isUploadingCompleted) {
                 tentativasSemAtividade++
-                // Aguarda até ~15 segundos de oscilação de rede antes de desistir
                 if (tentativasSemAtividade > 60) {
                     break
                 }
@@ -891,6 +903,7 @@ suspend fun sincronizarCofreDaNuvem(
     }
 }
 
+// === AUTO-SYNC COM DOCUMENTSCONTRACT NATIVO (SEM PRECISAR DE DOCUMENTFILE) ===
 suspend fun procurarNovosFicheirosNasPastas(
     context: Context,
     cofreTag: String,
@@ -901,13 +914,28 @@ suspend fun procurarNovosFicheirosNasPastas(
     for (uriStr in pastasSync) {
         try {
             val treeUri = Uri.parse(uriStr)
-            val docDir = DocumentFile.fromTreeUri(context, treeUri) ?: continue
-            val nomePasta = docDir.name ?: "AutoSync"
-            for (arq in docDir.listFiles()) {
-                if (arq.isFile) {
-                    val nome = arq.name ?: continue
-                    if (!nomesJaSalvos.contains(nome)) {
-                        encontrados.add(Pair(arq.uri, nomePasta))
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            val nomePasta = docId.substringAfterLast(':').substringAfterLast('/').ifBlank { "AutoSync" }
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, docId)
+
+            context.contentResolver.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE
+                ),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val childId = cursor.getString(0) ?: continue
+                    val nome = cursor.getString(1) ?: continue
+                    val mime = cursor.getString(2) ?: ""
+                    if (mime != DocumentsContract.Document.MIME_TYPE_DIR && !nomesJaSalvos.contains(nome)) {
+                        val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, childId)
+                        encontrados.add(Pair(fileUri, nomePasta))
                     }
                 }
             }
@@ -1381,7 +1409,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "SSD NEXUS CLOUD v1.9",
+                        text = "SSD NEXUS CLOUD $NEXUS_VERSION",
                         color = Gold,
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold
@@ -1490,7 +1518,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 ) {
                     Column {
                         Text(
-                            text = "NEXUS CLOUD v1.9",
+                            text = "NEXUS CLOUD $NEXUS_VERSION",
                             color = Gold,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.ExtraBold
@@ -1621,11 +1649,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             TextButton(onClick = {
                                 selecionados = arquivosDoCofre.map { it.fileId }.toSet()
                             }) {
-                                Text("Todos", color = Color.White, fontSize = 12.dp)
+                                Text("Todos", color = Color.White, fontSize = 12.sp)
                             }
                             IconButton(onClick = {
                                 val paraApagar = arquivosDoCofre.filter { selecionados.contains(it.fileId) }
-                                paraApagar.forEach { vm.apagar(it) }
+                                paraApagar.forEach { vm.apagar(it.id) }
                                 selecionados = emptySet()
                                 modoSelecao = false
                                 Toast.makeText(context, "${paraApagar.size} arquivo(s) removido(s) da galeria", Toast.LENGTH_SHORT).show()
@@ -1899,7 +1927,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     progressoDownload = p
                 }
                 if (baixado != null && baixado.exists()) {
-                    // Se ainda não tinha capa salva, gera automaticamente
                     if (arqVisual.caminhoMiniatura.isNullOrBlank()) {
                         val novaCapa = prepararMiniaturaDeFicheiroBaixado(context, baixado, arqVisual.nomeArquivo)
                         if (!novaCapa.isNullOrBlank()) {
@@ -2089,7 +2116,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                         }
                         IconButton(onClick = {
-                            vm.apagar(arqVisual)
+                            vm.apagar(arqVisual.id)
                             arquivoEmVisualizacao = null
                             Toast.makeText(context, "Arquivo removido do cofre.", Toast.LENGTH_SHORT).show()
                         }) {
