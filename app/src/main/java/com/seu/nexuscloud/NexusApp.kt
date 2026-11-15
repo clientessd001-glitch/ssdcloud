@@ -2,7 +2,10 @@ package com.seu.nexuscloud
 
 import android.app.Application
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -22,6 +25,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.io.File
+import java.lang.reflect.Modifier as JavaModifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -49,8 +53,11 @@ class NexusApp : Application() {
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e("NexusCloud", "Exceção capturada na thread ${thread.name}", throwable)
-            val resumoErro = "${throwable.javaClass.simpleName}: ${throwable.message}\n" +
-                throwable.stackTrace.take(8).joinToString("\n") { "at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})" }
+            val causaReal = throwable.cause ?: throwable
+            val resumoErro = "${causaReal.javaClass.simpleName}: ${causaReal.message}\n" +
+                causaReal.stackTrace.take(10).joinToString("\n") {
+                    "at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})"
+                }
 
             try {
                 getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
@@ -59,10 +66,9 @@ class NexusApp : Application() {
                     .commit()
             } catch (_: Throwable) {}
 
-            // Se o erro veio de uma thread secundária (ex: TDLib), não fecha o aplicativo
             if (thread.name != "main") {
                 startupError = resumoErro
-                TelegramAuth.errorText.value = "Aviso interno: ${throwable.localizedMessage}"
+                TelegramAuth.errorText.value = "Aviso interno: ${causaReal.localizedMessage}"
             } else {
                 defaultHandler?.uncaughtException(thread, throwable)
             }
@@ -70,19 +76,28 @@ class NexusApp : Application() {
     }
 
     @Synchronized
-    fun iniciarClienteTDLib(): Client? {
+    fun carregarBibliotecasNativas(): String? {
+        return try {
+            try { System.loadLibrary("cryptox") } catch (_: Throwable) {}
+            try { System.loadLibrary("sslx") } catch (_: Throwable) {}
+            System.loadLibrary("tdjni")
+            File(filesDir, "tdlib").apply { if (!exists()) mkdirs() }
+            File(filesDir, "tdlib_files").apply { if (!exists()) mkdirs() }
+            null
+        } catch (e: Throwable) {
+            val msg = "${e.javaClass.simpleName}: ${e.message}"
+            startupError = msg
+            msg
+        }
+    }
+
+    @Synchronized
+    fun criarClienteTDLib(): Client? {
         if (client != null) return client
         return try {
-            try {
-                System.loadLibrary("tdjni")
-            } catch (_: Throwable) {}
-
-            File(filesDir, "tdlib").apply { if (!exists()) mkdirs() }
-
             val handler = TelegramHandler(this)
             val novo = Client.create(handler, null, null)
             client = novo
-            novo?.send(TdApi.GetAuthorizationState(), handler)
             startupError = null
             novo
         } catch (e: Throwable) {
@@ -93,8 +108,13 @@ class NexusApp : Application() {
     }
 }
 
-class TelegramHandler(private val app: Application) : Client.ResultHandler {
-    override fun onResult(obj: TdApi.Object) {
+class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    @Volatile
+    private var parametrosEnviados = false
+
+    override fun onResult(obj: TdApi.Object?) {
+        if (obj == null) return
         try {
             when (obj) {
                 is TdApi.UpdateAuthorizationState -> handleAuthState(obj.authorizationState)
@@ -102,7 +122,7 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
                 is TdApi.UpdateFile -> handleFileProgress(obj.file)
                 is TdApi.Error -> {
                     Log.e("NexusCloud", "Erro TDLib [${obj.code}]: ${obj.message}")
-                    if (obj.code != 400) {
+                    if (obj.code != 400 && !obj.message.orEmpty().contains("already", ignoreCase = true)) {
                         TelegramAuth.errorText.value = "Erro SSD (${obj.code}): ${obj.message}"
                     }
                 }
@@ -112,7 +132,8 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
         }
     }
 
-    private fun handleFileProgress(file: TdApi.File) {
+    private fun handleFileProgress(file: TdApi.File?) {
+        if (file == null) return
         val totalBytes = if (file.expectedSize.toLong() > 0L) file.expectedSize.toLong() else file.size.toLong()
         val remote = file.remote
         val local = file.local
@@ -138,45 +159,82 @@ class TelegramHandler(private val app: Application) : Client.ResultHandler {
         }
     }
 
-    private fun handleAuthState(state: TdApi.AuthorizationState) {
+    private fun handleAuthState(state: TdApi.AuthorizationState?) {
+        if (state == null) return
         when (state) {
             is TdApi.AuthorizationStateWaitTdlibParameters -> {
+                if (parametrosEnviados) return
+                parametrosEnviados = true
                 TelegramAuth.statusText.value = "Configurando cofre na nuvem SSD..."
+
                 if (BuildConfig.TELEGRAM_API_ID == 0 || BuildConfig.TELEGRAM_API_HASH.isBlank()) {
                     TelegramAuth.errorText.value = "TELEGRAM_API_ID ou API_HASH vazios nos Secrets!"
+                    parametrosEnviados = false
                     return
                 }
-                val request = TdApi.SetTdlibParameters().apply {
-                    databaseDirectory = app.filesDir.absolutePath + "/tdlib"
-                    useMessageDatabase = true
-                    useSecretChats = false
-                    apiId = BuildConfig.TELEGRAM_API_ID
-                    apiHash = BuildConfig.TELEGRAM_API_HASH
-                    systemLanguageCode = "pt"
-                    deviceModel = "Android"
-                    applicationVersion = "1.9"
-                }
-                (app as NexusApp).client?.send(request, this)
+
+                val dirDb = File(app.filesDir, "tdlib").apply { if (!exists()) mkdirs() }.absolutePath
+                val dirFiles = File(app.filesDir, "tdlib_files").apply { if (!exists()) mkdirs() }.absolutePath
+                val modelo = (Build.MODEL ?: "Android").ifBlank { "Android" }
+                val versaoSO = (Build.VERSION.RELEASE ?: "13").ifBlank { "13" }
+
+                // Envia a partir da Main Thread para evitar bloqueio/crash na thread nativa C++
+                mainHandler.postDelayed({
+                    try {
+                        val request = TdApi.SetTdlibParameters().apply {
+                            databaseDirectory = dirDb
+                            useMessageDatabase = true
+                            useSecretChats = false
+                            apiId = BuildConfig.TELEGRAM_API_ID
+                            apiHash = BuildConfig.TELEGRAM_API_HASH
+                            systemLanguageCode = "pt"
+                            deviceModel = modelo
+                            applicationVersion = "1.9"
+
+                            for (f in javaClass.declaredFields) {
+                                if (JavaModifier.isStatic(f.modifiers)) continue
+                                f.isAccessible = true
+                                when (f.name) {
+                                    "filesDirectory" -> f.set(this, dirFiles)
+                                    "databaseEncryptionKey" -> f.set(this, ByteArray(0))
+                                    "systemVersion" -> f.set(this, versaoSO)
+                                    "useFileDatabase", "useChatInfoDatabase", "enableStorageOptimizer" -> f.setBoolean(this, true)
+                                }
+                            }
+                        }
+                        app.client?.send(request, this@TelegramHandler)
+                    } catch (e: Throwable) {
+                        parametrosEnviados = false
+                        TelegramAuth.errorText.value = "Erro config SSD: ${e.message}"
+                    }
+                }, 120L)
             }
             is TdApi.AuthorizationStateWaitPhoneNumber -> {
+                parametrosEnviados = false
                 TelegramAuth.errorText.value = null
                 TelegramAuth.statusText.value = "Pronto! Digite seu número SSD com DDI (+55...)"
                 TelegramAuth.step.value = 0
             }
             is TdApi.AuthorizationStateWaitCode -> {
+                parametrosEnviados = false
                 TelegramAuth.errorText.value = null
                 TelegramAuth.statusText.value = "Código solicitado! Verifique o código recebido."
                 TelegramAuth.step.value = 1
             }
             is TdApi.AuthorizationStateWaitPassword -> {
+                parametrosEnviados = false
                 TelegramAuth.errorText.value = null
                 TelegramAuth.statusText.value = "Conta protegida com 2FA."
                 TelegramAuth.step.value = 2
             }
             is TdApi.AuthorizationStateReady -> {
+                parametrosEnviados = false
                 TelegramAuth.errorText.value = null
                 TelegramAuth.statusText.value = "Conectado à Nuvem SSD!"
                 TelegramAuth.step.value = 3
+            }
+            is TdApi.AuthorizationStateClosed -> {
+                parametrosEnviados = false
             }
         }
     }
@@ -186,40 +244,72 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val nexusApp = application as NexusApp
-        val prefsCrash = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
+        val prefs = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
+
+        // Se a execução anterior fechou sozinha no meio de uma etapa nativa, bloqueia o loop e mostra na tela
+        val etapaInterrompida = prefs.getString("etapa_em_curso", null)
+        val crashSalvo = prefs.getString("last_crash", null)
+        val diagnosticoInicial = when {
+            !crashSalvo.isNullOrBlank() -> crashSalvo
+            !etapaInterrompida.isNullOrBlank() -> "O aplicativo fechou inesperadamente durante a etapa:\n👉 $etapaInterrompida"
+            else -> null
+        }
 
         setContent {
             MaterialTheme(colorScheme = darkColorScheme()) {
-                var crashAnterior by remember { mutableStateOf(prefsCrash.getString("last_crash", null)) }
+                var erroVisivel by remember { mutableStateOf(diagnosticoInicial) }
+                var etapaTexto by remember { mutableStateOf("Iniciando Nexus Cloud $NEXUS_VERSION...") }
                 var daoPronto by remember { mutableStateOf<NexusDao?>(null) }
                 var clientPronto by remember { mutableStateOf<Client?>(null) }
-                var erroArranque by remember { mutableStateOf<String?>(null) }
-                var carregandoMotor by remember { mutableStateOf(true) }
+                var carregando by remember { mutableStateOf(diagnosticoInicial == null) }
 
-                LaunchedEffect(crashAnterior) {
-                    if (crashAnterior == null) {
-                        carregandoMotor = true
-                        // Aguarda a janela abrir na tela antes de carregar o C++ e o banco Room
-                        delay(300)
+                LaunchedEffect(erroVisivel) {
+                    if (erroVisivel == null) {
+                        carregando = true
                         try {
+                            etapaTexto = "Etapa 1/3: A iniciar base de dados local..."
+                            prefs.edit().putString("etapa_em_curso", "Etapa 1: Base de dados Room (NexusDB)").commit()
+                            delay(250)
                             val db = withContext(Dispatchers.IO) { NexusDB.get(this@MainActivity) }
-                            val cli = withContext(Dispatchers.IO) { nexusApp.iniciarClienteTDLib() }
+                            val dao = db.dao()
+
+                            etapaTexto = "Etapa 2/3: A carregar bibliotecas nativas SSD..."
+                            prefs.edit().putString("etapa_em_curso", "Etapa 2: System.loadLibrary(tdjni)").commit()
+                            delay(250)
+                            val erroLib = nexusApp.carregarBibliotecasNativas()
+                            if (erroLib != null) {
+                                prefs.edit().remove("etapa_em_curso").commit()
+                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib"
+                                carregando = false
+                                return@LaunchedEffect
+                            }
+
+                            etapaTexto = "Etapa 3/3: A iniciar cliente de nuvem SSD..."
+                            prefs.edit().putString("etapa_em_curso", "Etapa 3: Client.create / SetTdlibParameters").commit()
+                            delay(250)
+                            val cli = nexusApp.criarClienteTDLib()
                             if (cli != null) {
-                                daoPronto = db.dao()
+                                daoPronto = dao
                                 clientPronto = cli
+                                carregando = false
+                                // Se permaneceu aberto por 1.5s após abrir a UI, limpa o marcador de etapa
+                                delay(1500)
+                                prefs.edit().remove("etapa_em_curso").commit()
                             } else {
-                                erroArranque = nexusApp.startupError ?: "Não foi possível iniciar o motor TDLib."
+                                prefs.edit().remove("etapa_em_curso").commit()
+                                erroVisivel = nexusApp.startupError ?: "Não foi possível criar o cliente TDLib."
+                                carregando = false
                             }
                         } catch (e: Throwable) {
-                            erroArranque = "${e.javaClass.simpleName}: ${e.message}"
-                        } finally {
-                            carregandoMotor = false
+                            prefs.edit().remove("etapa_em_curso").commit()
+                            erroVisivel = "${e.javaClass.simpleName}: ${e.message}"
+                            carregando = false
                         }
                     }
                 }
 
                 when {
-                    crashAnterior != null || erroArranque != null -> {
+                    erroVisivel != null -> {
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -232,12 +322,12 @@ class MainActivity : ComponentActivity() {
                             Text("DIAGNÓSTICO NEXUS SSD", color = Color(0xFFFFD700), fontSize = 18.sp, fontWeight = FontWeight.Black)
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                "O aplicativo detectou um erro de inicialização:",
+                                "O modo de proteção impediu o fechamento automático:",
                                 color = Color(0xFFA0AABF),
                                 fontSize = 12.sp,
                                 textAlign = TextAlign.Center
                             )
-                            Spacer(modifier = Modifier.height(12.dp))
+                            Spacer(modifier = Modifier.height(14.dp))
                             Surface(
                                 color = Color(0xFF161A25),
                                 shape = RoundedCornerShape(12.dp),
@@ -245,53 +335,41 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Text(
-                                    text = crashAnterior ?: erroArranque ?: "Erro desconhecido",
+                                    text = erroVisivel ?: "Erro desconhecido",
                                     color = Color(0xFFE53935),
-                                    fontSize = 11.sp,
-                                    modifier = Modifier.padding(14.dp)
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(16.dp)
                                 )
                             }
                             Spacer(modifier = Modifier.height(20.dp))
                             Button(
                                 onClick = {
-                                    prefsCrash.edit().remove("last_crash").commit()
-                                    erroArranque = null
-                                    crashAnterior = null
-                                },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
-                            ) {
-                                Text("TENTAR ABRIR NOVAMENTE", color = Color(0xFF05070A), fontWeight = FontWeight.Black)
-                            }
-                            Spacer(modifier = Modifier.height(10.dp))
-                            OutlinedButton(
-                                onClick = {
                                     try {
                                         File(filesDir, "tdlib").deleteRecursively()
-                                        File(filesDir, "nexus_thumbs").deleteRecursively()
+                                        File(filesDir, "tdlib_files").deleteRecursively()
                                     } catch (_: Throwable) {}
-                                    prefsCrash.edit().remove("last_crash").commit()
-                                    erroArranque = null
-                                    crashAnterior = null
+                                    prefs.edit().clear().commit()
+                                    erroVisivel = null
                                 },
-                                border = BorderStroke(1.dp, Color(0xFFE53935)),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
+                                modifier = Modifier.fillMaxWidth().height(50.dp)
                             ) {
-                                Text("LIMPAR CACHE NATIVO E ABRIR", color = Color(0xFFE53935), fontWeight = FontWeight.Bold)
+                                Text("LIMPAR PASTA TDLIB E TENTAR NOVAMENTE", color = Color(0xFF05070A), fontWeight = FontWeight.Black, fontSize = 11.sp)
                             }
                         }
                     }
-                    carregandoMotor -> {
+                    carregando -> {
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .background(Color(0xFF05070A)),
+                                .background(Color(0xFF05070A))
+                                .padding(24.dp),
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             CircularProgressIndicator(color = Color(0xFFFFD700))
                             Spacer(modifier = Modifier.height(16.dp))
-                            Text("Iniciando Nexus Cloud $NEXUS_VERSION...", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text(etapaTexto, color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 14.sp, textAlign = TextAlign.Center)
                         }
                     }
                     clientPronto != null && daoPronto != null -> {
