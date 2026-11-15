@@ -51,7 +51,14 @@ object TelegramAuth {
 fun recolherDiagnosticoNativo(context: Context): String {
     val sb = StringBuilder()
 
-    // 1. Captura o motivo oficial do Android para o encerramento anterior (API 30+)
+    // 1. Lista os ficheiros .so reais empacotados no APK
+    try {
+        val libDir = File(context.applicationInfo.nativeLibraryDir)
+        val libs = libDir.listFiles()?.joinToString(", ") { "${it.name} (${it.length() / 1024}KB)" } ?: "pasta vazia"
+        sb.append("• Libs Nativas: $libs\n")
+    } catch (_: Throwable) {}
+
+    // 2. Extrai todas as strings legíveis do Tombstone Protobuf (sem bytes nulos \0 que cortam o texto)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         try {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
@@ -60,43 +67,67 @@ fun recolherDiagnosticoNativo(context: Context): String {
                 val ult = exits.first()
                 sb.append("• Sinal SO: reason=${ult.reason} | status=${ult.status} | desc=${ult.description ?: "sem desc"}\n")
                 try {
-                    ult.traceInputStream?.bufferedReader()?.use { reader ->
-                        val linhasTrace = reader.readLines()
-                            .filter {
-                                it.contains("Abort message", true) ||
-                                    it.contains("signal", true) ||
-                                    it.contains("tdjni", true) ||
-                                    it.contains("CheckJNI", true) ||
-                                    it.contains("#00", true) ||
-                                    it.contains("#01", true)
+                    val rawBytes = ult.traceInputStream?.use { it.readBytes() } ?: ByteArray(0)
+                    if (rawBytes.isNotEmpty()) {
+                        val extraidas = mutableListOf<String>()
+                        val seq = StringBuilder()
+                        for (b in rawBytes) {
+                            val v = b.toInt() and 0xFF
+                            if (v in 32..126) {
+                                seq.append(v.toChar())
+                            } else {
+                                if (seq.length >= 5) {
+                                    extraidas.add(seq.toString().trim())
+                                }
+                                seq.setLength(0)
                             }
-                            .take(8)
-                        if (linhasTrace.isNotEmpty()) {
-                            sb.append(linhasTrace.joinToString("\n")).append("\n")
                         }
+                        if (seq.length >= 5) extraidas.add(seq.toString().trim())
+
+                        val cabecalho = extraidas.take(25)
+                        val palavrasChave = extraidas.filter { s ->
+                            s.contains("Abort", true) ||
+                                s.contains("FATAL", true) ||
+                                s.contains("JNI", true) ||
+                                s.contains("tdjni", true) ||
+                                s.contains("td_jni", true) ||
+                                s.contains("drinkless", true) ||
+                                s.contains("TdApi", true) ||
+                                s.contains("Client", true) ||
+                                s.contains("Failed", true) ||
+                                s.contains("NoSuch", true) ||
+                                s.contains("ClassNotFound", true) ||
+                                s.contains("Unsatisfied", true) ||
+                                s.contains("dlopen", true) ||
+                                s.contains("cannot", true) ||
+                                s.contains("Error", true)
+                        }.take(30)
+
+                        val combinadas = (cabecalho + palavrasChave).distinct()
+                        sb.append("\n• Trace Extraído (Sem bytes nulos):\n")
+                        sb.append(combinadas.joinToString("\n")).append("\n")
                     }
-                } catch (_: Throwable) {}
+                } catch (e: Throwable) {
+                    sb.append("Erro ao ler trace: ${e.message}\n")
+                }
             }
         } catch (_: Throwable) {}
     }
 
-    // 2. Lê as últimas linhas de erro do Logcat do próprio aplicativo
+    // 3. Lê o buffer de crash do Logcat sem caracteres nulos
     try {
-        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "300"))
+        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-b", "all", "-d", "-t", "400"))
         val reader = BufferedReader(InputStreamReader(proc.inputStream))
         val relevantes = mutableListOf<String>()
         var line: String? = reader.readLine()
         while (line != null) {
-            val l = line
+            val l = line.replace("\u0000", "")
             if (l.contains("FATAL", true) ||
                 l.contains("tdjni", true) ||
                 l.contains("TDLib", true) ||
                 l.contains("CheckJNI", true) ||
-                l.contains("UnsatisfiedLink", true) ||
-                l.contains("NoSuch", true) ||
-                l.contains("ClassNotFound", true) ||
-                l.contains("dlopen", true) ||
                 l.contains("Abort", true) ||
+                l.contains("drinkless", true) ||
                 l.contains("AndroidRuntime", true)
             ) {
                 relevantes.add(l)
@@ -105,11 +136,11 @@ fun recolherDiagnosticoNativo(context: Context): String {
         }
         if (relevantes.isNotEmpty()) {
             sb.append("\n• Logcat:\n")
-            sb.append(relevantes.takeLast(12).joinToString("\n"))
+            sb.append(relevantes.takeLast(15).joinToString("\n"))
         }
     } catch (_: Throwable) {}
 
-    return sb.toString().trim().ifBlank { "Sem detalhes adicionais no Logcat." }
+    return sb.toString().replace("\u0000", "").trim()
 }
 
 class NexusApp : Application() {
@@ -132,7 +163,7 @@ class NexusApp : Application() {
             try {
                 getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
                     .edit()
-                    .putString("last_crash", resumoErro)
+                    .putString("last_crash", resumoErro.replace("\u0000", ""))
                     .commit()
             } catch (_: Throwable) {}
 
@@ -385,7 +416,7 @@ class MainActivity : ComponentActivity() {
 
                 when {
                     erroVisivel != null -> {
-                        val textoErro = erroVisivel ?: "Erro desconhecido"
+                        val textoErro = (erroVisivel ?: "Erro desconhecido").replace("\u0000", "")
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
@@ -422,7 +453,7 @@ class MainActivity : ComponentActivity() {
                                 onClick = {
                                     val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     cm.setPrimaryClip(ClipData.newPlainText("Erro Nexus", textoErro))
-                                    Toast.makeText(this@MainActivity, "Relatório copiado!", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(this@MainActivity, "Relatório completo copiado!", Toast.LENGTH_SHORT).show()
                                 },
                                 border = BorderStroke(1.dp, Color(0xFFFFD700)),
                                 modifier = Modifier.fillMaxWidth().height(46.dp)
