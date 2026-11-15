@@ -101,7 +101,7 @@ fun mascararNumeroComAsterisco(numero: String): String {
     return "*".repeat(limpo.length.coerceAtLeast(8))
 }
 
-// === CONTROLADOR DE DOWNLOAD E ENVIO COM PAUSAR / CONTINUAR / CANCELAR ===
+// === CONTROLADOR DE DOWNLOAD E ENVIO COM PAUSAR / CONTINUAR / CANCELAR REAL ===
 object NexusTransfer {
     val progress = MutableStateFlow<Int?>(null)
     val label = MutableStateFlow("")
@@ -110,11 +110,17 @@ object NexusTransfer {
     val fileIdAtivo = MutableStateFlow(0)
     val ehUpload = MutableStateFlow(false)
 
+    @Volatile var jobAtivo: Job? = null
+    @Volatile var chatIdUploadAtivo: Long = 0L
+    @Volatile var msgIdUploadAtivo: Long = 0L
+
     fun iniciar(texto: String, upload: Boolean, fileId: Int = 0) {
         pausado.value = false
         cancelado.value = false
         ehUpload.value = upload
         fileIdAtivo.value = fileId
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
         progress.value = 5
         label.value = texto
     }
@@ -142,29 +148,64 @@ object NexusTransfer {
     }
 
     fun cancelar(client: Client? = null) {
+        // Mantém cancelado.value = true para interromper imediatamente os loops e corrotinas
         cancelado.value = true
         pausado.value = false
         val fId = fileIdAtivo.value
-        if (client != null && fId != 0) {
-            if (ehUpload.value) {
-                client.send(TdApi.DeleteFile().apply { this.fileId = fId }) {}
-            } else {
-                client.send(TdApi.CancelDownloadFile().apply {
-                    this.fileId = fId
-                    this.onlyIfPending = false
-                }) {}
+        val cId = chatIdUploadAtivo
+        val mId = msgIdUploadAtivo
+
+        if (client != null) {
+            if (cId != 0L && mId != 0L) {
+                try {
+                    client.send(TdApi.DeleteMessages().apply {
+                        this.chatId = cId
+                        this.messageIds = longArrayOf(mId)
+                        this.revoke = true
+                    }) {}
+                } catch (_: Exception) {}
+            }
+            if (fId != 0) {
+                try {
+                    client.send(TdApi.CancelDownloadFile().apply {
+                        this.fileId = fId
+                        this.onlyIfPending = false
+                    }) {}
+                } catch (_: Exception) {}
+                try {
+                    client.send(TdApi.CancelPreliminaryUploadFile().apply {
+                        this.fileId = fId
+                    }) {}
+                } catch (_: Exception) {}
+                try {
+                    client.send(TdApi.DeleteFile().apply {
+                        this.fileId = fId
+                    }) {}
+                } catch (_: Exception) {}
             }
         }
-        encerrar()
+
+        try {
+            jobAtivo?.cancel()
+        } catch (_: Exception) {}
+        jobAtivo = null
+
+        progress.value = null
+        label.value = ""
+        fileIdAtivo.value = 0
+        ehUpload.value = false
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
     }
 
     fun encerrar() {
         progress.value = null
         label.value = ""
         pausado.value = false
-        cancelado.value = false
         fileIdAtivo.value = 0
         ehUpload.value = false
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
     }
 }
 
@@ -557,7 +598,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA E RETOMADA ===
+// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA E CANCELAMENTO ===
 suspend fun obterInfoArquivoTDLib(client: Client, fileId: Int): TdApi.File? {
     if (fileId == 0) return null
     val def = CompletableDeferred<TdApi.File?>()
@@ -633,6 +674,14 @@ suspend fun baixarArquivoTDLibAssincrono(
         }
 
         delay(150)
+        if (controlarPausaTransfer && NexusTransfer.cancelado.value) {
+            client.send(TdApi.CancelDownloadFile().apply {
+                this.fileId = fileId
+                this.onlyIfPending = false
+            }) {}
+            return null
+        }
+
         tentativas++
         val info = obterInfoArquivoTDLib(client, fileId) ?: break
         val local = info.local
@@ -703,6 +752,11 @@ suspend fun aguardarUploadTDLibComPausa(
         }
 
         delay(150)
+        if (NexusTransfer.cancelado.value) {
+            client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return false
+        }
+
         tentativas++
         val info = obterInfoArquivoTDLib(client, fileId) ?: return true
         val remote = info.remote ?: return true
@@ -713,7 +767,7 @@ suspend fun aguardarUploadTDLibComPausa(
             else -> 0L
         }
 
-        if (remote.isUploadingCompleted) {
+        if (remote.isUploadingCompleted && !remote.id.isNullOrEmpty()) {
             NexusTransfer.progress.value = 100
             return true
         }
@@ -729,7 +783,7 @@ suspend fun aguardarUploadTDLibComPausa(
 
         if (!remote.isUploadingActive) {
             inativoCount++
-            if (inativoCount >= 4) return true
+            if (inativoCount >= 40) return true
         } else {
             inativoCount = 0
         }
@@ -1267,8 +1321,6 @@ fun extrairArrayMensagensTDLib(obj: TdApi.Object?): Array<TdApi.Message>? {
     }
 }
 
-// Busca diretamente no servidor da nuvem SSD por um termo (ex: "REGISTO_COFRE" ou nome do usuário),
-// funcionando imediatamente mesmo em uma instalação limpa com milhares de arquivos!
 fun buscarMensagensPorTermoNaNuvem(
     client: Client,
     chatId: Long,
@@ -1296,7 +1348,6 @@ fun buscarMensagensPorTermoNaNuvem(
     }
 }
 
-// Paginação robusta para novas instalações: aguarda sincronização inicial do servidor se o cache local vier vazio
 fun buscarHistoricoPaginado(
     client: Client,
     chatId: Long,
@@ -1332,7 +1383,6 @@ fun buscarHistoricoPaginado(
                 onComplete(acumulado.distinctBy { it.id })
             }
         } else if (acumulado.size <= 1 && tentativasVazio < 5) {
-            // Na nova instalação o TDLib busca do servidor em segundo plano na 1ª chamada; aguarda e tenta novamente
             kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
                 delay(550)
                 buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
@@ -1343,7 +1393,7 @@ fun buscarHistoricoPaginado(
     }
 }
 
-// Varre a nuvem SSD automaticamente após o login para descobrir cofres existentes em novas instalações
+// Sincroniza silenciosamente os PINs de cofres existentes sem revelar os nomes na interface
 fun descobrirPerfisExistentesNaNuvem(
     context: Context,
     client: Client,
@@ -1358,7 +1408,6 @@ fun descobrirPerfisExistentesNaNuvem(
                             val todas = (msgsBusca + msgsHist).distinctBy { it.id }
                             val nomesEncontrados = mutableMapOf<String, String>()
 
-                            // 1. Extrai todos os registos de cofre com PIN e salva localmente
                             for (msg in todas) {
                                 val texto = when (val c = msg.content) {
                                     is TdApi.MessageText -> c.text?.text ?: ""
@@ -1378,40 +1427,18 @@ fun descobrirPerfisExistentesNaNuvem(
                                             nomesEncontrados[chave] = exibicao
                                         }
                                         if (!pinPart.isNullOrBlank()) {
-                                            val definirAtivo = obterUltimoUsuarioCofre(context).isBlank()
-                                            salvarCredenciaisCofreLocal(context, exibicao, pinPart, definirComoAtivo = definirAtivo)
+                                            salvarCredenciaisCofreLocal(context, exibicao, pinPart, definirComoAtivo = false)
                                         }
                                     }
-                                }
-                            }
-
-                            // 2. Também reconhece perfis que já possuem arquivos "👤 [nome]" enviados na nuvem
-                            for (msg in todas) {
-                                val doc = msg.content as? TdApi.MessageDocument ?: continue
-                                val leg = doc.caption?.text ?: ""
-                                if (leg.contains("👤 [")) {
-                                    val bruto = leg.substringAfter("👤 [").substringBefore("]").trim()
-                                    val chave = normalizarUsuario(bruto)
-                                    if (chave.isNotBlank() && !nomesEncontrados.containsKey(chave)) {
-                                        nomesEncontrados[chave] = bruto
-                                    }
-                                }
-                            }
-
-                            val locais = listarPerfisSalvosLocalmente(context)
-                            locais.forEach { loc ->
-                                val ch = normalizarUsuario(loc)
-                                if (ch.isNotBlank() && !nomesEncontrados.containsKey(ch)) {
-                                    nomesEncontrados[ch] = loc
                                 }
                             }
 
                             onFound(nomesEncontrados.values.toList())
                         }
                     }
-                } else onFound(listarPerfisSalvosLocalmente(context))
+                } else onFound(emptyList())
             }
-        } else onFound(listarPerfisSalvosLocalmente(context))
+        } else onFound(emptyList())
     }
 }
 
@@ -1489,14 +1516,12 @@ fun verificarOuRegistarCofreNuvem(
                                 if (modoCriarNovo) {
                                     when {
                                         pinEncontrado != null && pinEncontrado == pinLimpo -> {
-                                            // O usuário já era dono deste cofre e digitou o PIN correto: entra direto sem erro!
                                             onResult(true, nomeOriginalEncontrado, "Cofre existente reconhecido e restaurado!")
                                         }
                                         pinEncontrado != null && pinEncontrado != pinLimpo -> {
                                             onResult(false, "", "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
                                         }
                                         temArquivosDoUsuarioNaNuvem -> {
-                                            // Já existiam arquivos desse perfil na nuvem sem registo recente: vincula o PIN e restaura
                                             gravarRegistoNaNuvem(nomeOriginalEncontrado, "Perfil existente vinculado e restaurado!")
                                         }
                                         else -> {
@@ -1512,7 +1537,6 @@ fun verificarOuRegistarCofreNuvem(
                                             onResult(false, "", "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
                                         }
                                         temArquivosDoUsuarioNaNuvem -> {
-                                            // Encontrou os arquivos do usuário na nuvem SSD (mesmo que o registo antigo tenha ficado para trás)
                                             gravarRegistoNaNuvem(nomeOriginalEncontrado, "Cofre '$nomeOriginalEncontrado' reconhecido na nuvem SSD!")
                                         }
                                         else -> {
@@ -2041,7 +2065,7 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     return@withContext miniaturaPronta
 }
 
-// === ABERTURA E DOWNLOAD DE FICHEIROS COM SUPORTE A PAUSAR E CONTINUAR ===
+// === ABERTURA E DOWNLOAD DE FICHEIROS COM SUPORTE A PAUSAR, CONTINUAR E CANCELAR NO "X" ===
 fun garantirFicheiroLocal(
     context: Context,
     client: Client,
@@ -2066,7 +2090,8 @@ fun garantirFicheiroLocal(
         }
     }
 
-    kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
+    NexusTransfer.jobAtivo?.cancel()
+    NexusTransfer.jobAtivo = kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
         var targetFileId = arq.fileId
         NexusTransfer.iniciar(
             texto = "Baixando '${arq.nomeArquivo}' (5%)...",
@@ -2083,13 +2108,15 @@ fun garantirFicheiroLocal(
                     maxTentativas = 800,
                     controlarPausaTransfer = true
                 ) { pct, baixadoBytes, totalBytes ->
-                    val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
-                    val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
-                    NexusTransfer.progress.value = pct
-                    NexusTransfer.label.value = if (totalBytes > 0) {
-                        "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
-                    } else {
-                        "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                    if (!NexusTransfer.cancelado.value) {
+                        val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
+                        val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                        NexusTransfer.progress.value = pct
+                        NexusTransfer.label.value = if (totalBytes > 0) {
+                            "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
+                        } else {
+                            "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                        }
                     }
                 }
             } else null
@@ -2101,7 +2128,7 @@ fun garantirFicheiroLocal(
             return@launch
         }
 
-        if (arquivoBaixado == null && usuarioAtivo.isNotBlank()) {
+        if (arquivoBaixado == null && usuarioAtivo.isNotBlank() && !NexusTransfer.cancelado.value) {
             NexusTransfer.label.value = "Localizando '${arq.nomeArquivo}' na nuvem SSD..."
             val (novoId, novoThumbId) = withContext(Dispatchers.IO) {
                 recuperarFileIdNaNuvemPorNome(client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
@@ -2120,13 +2147,15 @@ fun garantirFicheiroLocal(
                         maxTentativas = 800,
                         controlarPausaTransfer = true
                     ) { pct, baixadoBytes, totalBytes ->
-                        val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
-                        val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
-                        NexusTransfer.progress.value = pct
-                        NexusTransfer.label.value = if (totalBytes > 0) {
-                            "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
-                        } else {
-                            "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                        if (!NexusTransfer.cancelado.value) {
+                            val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
+                            val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                            NexusTransfer.progress.value = pct
+                            NexusTransfer.label.value = if (totalBytes > 0) {
+                                "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
+                            } else {
+                                "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                            }
                         }
                     }
                 }
@@ -2498,13 +2527,17 @@ suspend fun copiarUriParaCacheTDLib(
                     if (read == -1) break
                     out.write(buffer, 0, read)
                     lidosTotal += read
-                    if (tamanhoEsperado > 0L) {
+                    if (tamanhoEsperado > 0L && !NexusTransfer.cancelado.value) {
                         val pctCopia = ((lidosTotal * 35L) / tamanhoEsperado).toInt().coerceIn(5, 35)
                         NexusTransfer.progress.value = pctCopia
                         NexusTransfer.label.value = "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)..."
                     }
                 }
             }
+        }
+        if (NexusTransfer.cancelado.value) {
+            f.delete()
+            return@withContext null
         }
         if (f.exists() && f.length() > 0L) f else null
     } catch (_: Exception) {
@@ -2672,6 +2705,7 @@ fun copiarLoteParaDownloads(
     }
 }
 
+// === ENVIO PARA MENSAGENS SALVAS CORRIGIDO (SEM INPUTTHUMBNAIL REJEITADO E COM SUPORTE A CANCELAMENTO) ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -2682,31 +2716,100 @@ fun enviarParaMensagensSalvas(
     pastaDestino: String,
     onResult: (Boolean, Int, String) -> Unit
 ) {
+    if (NexusTransfer.cancelado.value) {
+        onResult(false, 0, "Envio cancelado.")
+        return
+    }
     val nomeLimpo = limparPrefixoTimestamp(nomeOriginal)
-    val pathThumbLimpo = if (caminhoCapaJpg.startsWith("file://")) {
-        Uri.parse(caminhoCapaJpg).path ?: caminhoCapaJpg.removePrefix("file://")
-    } else caminhoCapaJpg
-
-    val inputThumb = if (pathThumbLimpo.isNotBlank() && File(pathThumbLimpo).exists() && File(pathThumbLimpo).length() > 256L) {
-        TdApi.InputThumbnail(TdApi.InputFileLocal(pathThumbLimpo), 320, 320)
-    } else null
 
     client.send(TdApi.GetMe()) { meObj ->
+        if (NexusTransfer.cancelado.value) {
+            onResult(false, 0, "Envio cancelado.")
+            return@send
+        }
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (NexusTransfer.cancelado.value) {
+                    onResult(false, 0, "Envio cancelado.")
+                    return@send
+                }
                 if (chatObj is TdApi.Chat) {
+                    NexusTransfer.chatIdUploadAtivo = chatObj.id
                     val userTag = "👤 [$usuarioAtivo] • "
                     val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
                     val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
-                    val doc = TdApi.InputMessageDocument(TdApi.InputFileLocal(caminhoLocal), inputThumb, false, leg)
+                    val fileLocal = TdApi.InputFileLocal(caminhoLocal)
+
+                    val doc = TdApi.InputMessageDocument().apply {
+                        try {
+                            val capField = javaClass.getDeclaredField("caption")
+                            capField.isAccessible = true
+                            capField.set(this, leg)
+                        } catch (_: Exception) {}
+                        try {
+                            val docField = javaClass.getDeclaredField("document")
+                            docField.isAccessible = true
+                            if (docField.type.isAssignableFrom(fileLocal.javaClass)) {
+                                docField.set(this, fileLocal)
+                            } else {
+                                val inputDocClass = docField.type
+                                var inst: Any? = null
+                                for (ctor in inputDocClass.constructors) {
+                                    val p = ctor.parameterTypes
+                                    try {
+                                        if (p.size == 3 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                                            inst = ctor.newInstance(fileLocal, null, false)
+                                            break
+                                        } else if (p.size == 2 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                                            inst = ctor.newInstance(fileLocal, null)
+                                            break
+                                        } else if (p.size == 1 && p[0].isAssignableFrom(fileLocal.javaClass)) {
+                                            inst = ctor.newInstance(fileLocal)
+                                            break
+                                        }
+                                    } catch (_: Exception) {}
+                                }
+                                if (inst == null) {
+                                    inst = inputDocClass.getDeclaredConstructor().newInstance()
+                                    for (f in inputDocClass.declaredFields) {
+                                        f.isAccessible = true
+                                        if (f.type.isAssignableFrom(fileLocal.javaClass)) {
+                                            f.set(inst, fileLocal)
+                                        }
+                                    }
+                                }
+                                docField.set(this, inst)
+                            }
+                        } catch (_: Exception) {}
+                    }
+
                     val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
-                                registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
                                 val docResp = (msgObj.content as? TdApi.MessageDocument)?.document
                                 val rId = docResp?.document?.id ?: 0
                                 val tId = docResp?.thumbnail?.file?.id ?: 0
+
+                                NexusTransfer.msgIdUploadAtivo = msgObj.id
+                                if (rId != 0) {
+                                    NexusTransfer.fileIdAtivo.value = rId
+                                }
+
+                                if (NexusTransfer.cancelado.value) {
+                                    client.send(TdApi.DeleteMessages().apply {
+                                        this.chatId = chatObj.id
+                                        this.messageIds = longArrayOf(msgObj.id)
+                                        this.revoke = true
+                                    }) {}
+                                    if (rId != 0) {
+                                        client.send(TdApi.DeleteFile().apply { this.fileId = rId }) {}
+                                    }
+                                    onResult(false, 0, "Envio cancelado.")
+                                    return@send
+                                }
+
+                                registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
                                 if (rId != 0 && tId != 0) {
                                     NexusThumbCache.salvarThumbIdNuvem(context, rId, tId)
                                 }
@@ -3056,36 +3159,24 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
 
-    var activeVaultUser by remember { mutableStateOf(obterUltimoUsuarioCofre(context)) }
+    // Perfis iniciam sempre ocultos (campos em branco) por privacidade
+    var activeVaultUser by remember { mutableStateOf("") }
     var vaultUnlocked by remember { mutableStateOf(false) }
-    var isSwitchingUser by remember { mutableStateOf(activeVaultUser.isBlank()) }
-    // Abre sempre em "JÁ TENHO COFRE" (false) por padrão para evitar recriar perfil em nova instalação
+    var isSwitchingUser by remember { mutableStateOf(true) }
     var isCreatingNewVault by remember { mutableStateOf(false) }
-    var vaultNameInput by remember { mutableStateOf(activeVaultUser) }
+    var vaultNameInput by remember { mutableStateOf("") }
     var vaultPinInput by remember { mutableStateOf("") }
     var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
     var isCheckingVault by remember { mutableStateOf(false) }
-
-    var perfisExistentesNuvem by remember { mutableStateOf(listarPerfisSalvosLocalmente(context)) }
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
 
-    // Assim que autenticar o SMS na nova instalação, procura automaticamente os perfis que já existem na nuvem SSD
+    // Sincroniza silenciosamente os registos na nuvem sem exibir nomes de perfis na tela
     LaunchedEffect(loginStep, vaultUnlocked) {
         if (loginStep >= 3 && !vaultUnlocked) {
             procurandoPerfisNuvem = true
-            descobrirPerfisExistentesNaNuvem(context, client) { encontrados ->
+            descobrirPerfisExistentesNaNuvem(context, client) {
                 scope.launch(Dispatchers.Main) {
                     procurandoPerfisNuvem = false
-                    if (encontrados.isNotEmpty()) {
-                        perfisExistentesNuvem = encontrados
-                        isCreatingNewVault = false
-                        if (vaultNameInput.isBlank()) {
-                            vaultNameInput = encontrados.first()
-                        }
-                        if (activeVaultUser.isBlank() && encontrados.size == 1) {
-                            activeVaultUser = encontrados.first()
-                        }
-                    }
                 }
             }
         }
@@ -3325,7 +3416,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     LaunchedEffect(isUploading, transferPaused) {
         while (isUploading) {
             delay(350)
-            if (!transferPaused) {
+            if (!transferPaused && !NexusTransfer.cancelado.value) {
                 val atual = NexusTransfer.progress.value ?: 10
                 if (atual in 35..88) {
                     NexusTransfer.progress.value = (atual + 4).coerceAtMost(90)
@@ -3340,223 +3431,240 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Upload com BARRA ÚNICA e suporte completo a Pausar / Continuar / Cancelar
+    // Upload com BARRA ÚNICA e cancelamento imediato pelo botão "X"
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
-        scope.launch {
-            isUploading = true
-            val total = uris.size
+        NexusTransfer.jobAtivo?.cancel()
+        NexusTransfer.jobAtivo = scope.launch {
             var enviados = 0
-            NexusTransfer.iniciar("Preparando envio (1/$total)...", upload = true)
+            val total = uris.size
+            try {
+                isUploading = true
+                NexusTransfer.iniciar("Preparando envio (1/$total)...", upload = true)
 
-            for ((index, uri) in uris.withIndex()) {
-                if (NexusTransfer.cancelado.value) break
-                while (NexusTransfer.pausado.value) {
-                    delay(200)
+                for ((index, uri) in uris.withIndex()) {
                     if (NexusTransfer.cancelado.value) break
-                }
-                if (NexusTransfer.cancelado.value) break
-
-                val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
-                val nome = limparPrefixoTimestamp(nomeBruto)
-                val loteTag = "(${index + 1}/$total) "
-
-                NexusTransfer.progress.value = 8
-                NexusTransfer.label.value = "Preparando $loteTag'$nome'..."
-                cloudBannerText = "Enviando $loteTag'$nome'..."
-
-                val arqTemp = copiarUriParaCacheTDLib(context, uri, nome, tamanho, loteTag)
-                if (NexusTransfer.cancelado.value) {
-                    arqTemp?.delete()
-                    break
-                }
-
-                val capaJpg = if (arqTemp != null) {
-                    withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome, arqTemp) }
-                } else ""
-
-                if (arqTemp != null) {
                     while (NexusTransfer.pausado.value) {
                         delay(200)
                         if (NexusTransfer.cancelado.value) break
                     }
+                    if (NexusTransfer.cancelado.value) break
+
+                    val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
+                    val nome = limparPrefixoTimestamp(nomeBruto)
+                    val loteTag = "(${index + 1}/$total) "
+
+                    NexusTransfer.progress.value = 8
+                    NexusTransfer.label.value = "Preparando $loteTag'$nome'..."
+                    cloudBannerText = "Enviando $loteTag'$nome'..."
+
+                    val arqTemp = copiarUriParaCacheTDLib(context, uri, nome, tamanho, loteTag)
                     if (NexusTransfer.cancelado.value) {
-                        arqTemp.delete()
+                        arqTemp?.delete()
                         break
                     }
 
-                    val tamFinal = if (tamanho > 0) tamanho else arqTemp.length()
-                    desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
-                    marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
+                    val capaJpg = if (arqTemp != null) {
+                        withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome, arqTemp) }
+                    } else ""
 
-                    NexusTransfer.progress.value = 40
-                    NexusTransfer.label.value = "Enviando para nuvem SSD $loteTag'$nome'..."
-
-                    val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, msg ->
-                        deferred.complete(Triple(ok, rId, msg))
-                    }
-                    val (ok, rId, msg) = deferred.await()
-
-                    val concluiuRede = if (ok && rId != 0) {
-                        aguardarUploadTDLibComPausa(client, rId, nome, loteTag)
-                    } else ok
-
-                    if (NexusTransfer.cancelado.value || !concluiuRede) {
-                        cloudBannerText = "Envio de '$nome' cancelado."
-                        break
-                    }
-
-                    cloudBannerText = msg
-                    if (ok) {
-                        enviados++
-                        val ts = System.currentTimeMillis() + index
-                        salvarDonoFicheiro(context, ts, activeVaultUser)
-                        if (capaJpg.isNotBlank()) {
-                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                    if (arqTemp != null) {
+                        while (NexusTransfer.pausado.value) {
+                            delay(200)
+                            if (NexusTransfer.cancelado.value) break
                         }
-                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        mapaDonos = carregarDonosFicheiros(context)
-                        if (pastaEscolhida.isNotBlank()) {
-                            vm.criarPasta(pastaEscolhida)
-                            associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
-                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                            salvarVinculoPasta(context, ts, pastaEscolhida)
-                            mapaPastas = carregarVinculosPastas(context)
+                        if (NexusTransfer.cancelado.value) {
+                            arqTemp.delete()
+                            break
                         }
-                        vm.salvarArquivo(
-                            ArquivoNuvem(
-                                fileId = rId,
-                                nomeArquivo = nome,
-                                tamanhoBytes = tamFinal,
-                                dataUpload = ts,
-                                caminhoMiniatura = capaJpg
+
+                        val tamFinal = if (tamanho > 0) tamanho else arqTemp.length()
+                        desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
+                        marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
+
+                        NexusTransfer.progress.value = 40
+                        NexusTransfer.label.value = "Enviando para nuvem SSD $loteTag'$nome'..."
+
+                        val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
+                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, msg ->
+                            deferred.complete(Triple(ok, rId, msg))
+                        }
+                        val (ok, rId, msg) = deferred.await()
+
+                        if (NexusTransfer.cancelado.value) {
+                            arqTemp.delete()
+                            break
+                        }
+
+                        val concluiuRede = if (ok && rId != 0) {
+                            aguardarUploadTDLibComPausa(client, rId, nome, loteTag)
+                        } else ok
+
+                        if (NexusTransfer.cancelado.value || !concluiuRede) {
+                            arqTemp.delete()
+                            cloudBannerText = "Envio de '$nome' cancelado."
+                            break
+                        }
+
+                        cloudBannerText = msg
+                        if (ok) {
+                            enviados++
+                            val ts = System.currentTimeMillis() + index
+                            salvarDonoFicheiro(context, ts, activeVaultUser)
+                            if (capaJpg.isNotBlank()) {
+                                NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                            }
+                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                            mapaDonos = carregarDonosFicheiros(context)
+                            if (pastaEscolhida.isNotBlank()) {
+                                vm.criarPasta(pastaEscolhida)
+                                associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
+                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                salvarVinculoPasta(context, ts, pastaEscolhida)
+                                mapaPastas = carregarVinculosPastas(context)
+                            }
+                            vm.salvarArquivo(
+                                ArquivoNuvem(
+                                    fileId = rId,
+                                    nomeArquivo = nome,
+                                    tamanhoBytes = tamFinal,
+                                    dataUpload = ts,
+                                    caminhoMiniatura = capaJpg
+                                )
                             )
-                        )
+                        }
+                    } else {
+                        cloudBannerText = "Erro ao ler '$nome'."
                     }
-                } else {
-                    cloudBannerText = "Erro ao ler '$nome'."
+                    delay(120)
                 }
-                delay(120)
-            }
 
-            val foiCancelado = NexusTransfer.cancelado.value
-            isUploading = false
-            NexusTransfer.encerrar()
-            if (foiCancelado) {
-                cloudBannerText = "Envio cancelado ($enviados guardado(s))."
-                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
-            } else if (total > 1) {
-                cloudBannerText = "$enviados de $total ficheiros guardados no cofre SSD de $activeVaultUser!"
+                if (NexusTransfer.cancelado.value) {
+                    cloudBannerText = "Envio cancelado ($enviados guardado(s))."
+                } else if (total > 1) {
+                    cloudBannerText = "$enviados de $total ficheiros guardados no cofre SSD de $activeVaultUser!"
+                }
+            } finally {
+                isUploading = false
+                NexusTransfer.encerrar()
             }
         }
     }
 
-    // Sincronização de novos arquivos com BARRA ÚNICA e suporte a Pausar / Continuar / Cancelar
+    // Sincronização de novos arquivos com BARRA ÚNICA e cancelamento imediato pelo botão "X"
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
-        scope.launch {
-            isUploading = true
-            val total = itensParaEnviar.size
+        NexusTransfer.jobAtivo?.cancel()
+        NexusTransfer.jobAtivo = scope.launch {
             var enviados = 0
-            NexusTransfer.iniciar("Sincronizando novos arquivos (1/$total)...", upload = true)
+            val total = itensParaEnviar.size
+            try {
+                isUploading = true
+                NexusTransfer.iniciar("Sincronizando novos arquivos (1/$total)...", upload = true)
 
-            for ((index, item) in itensParaEnviar.withIndex()) {
-                if (NexusTransfer.cancelado.value) break
-                while (NexusTransfer.pausado.value) {
-                    delay(200)
+                for ((index, item) in itensParaEnviar.withIndex()) {
                     if (NexusTransfer.cancelado.value) break
-                }
-                if (NexusTransfer.cancelado.value) break
-
-                val nomeLimpo = limparPrefixoTimestamp(item.nome)
-                desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
-                marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
-
-                val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
-                val loteTag = "(${index + 1}/$total) "
-                NexusTransfer.progress.value = 10
-                NexusTransfer.label.value = "Sincronizando $loteTag'$nomeLimpo'..."
-                cloudBannerText = "Sincronizando $loteTag'$nomeLimpo'..."
-
-                val arqTemp = copiarUriParaCacheTDLib(context, item.uri, nomeLimpo, item.tamanho, loteTag)
-                if (NexusTransfer.cancelado.value) {
-                    arqTemp?.delete()
-                    break
-                }
-
-                val capaJpg = if (arqTemp != null) {
-                    withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, nomeLimpo, arqTemp) }
-                } else ""
-
-                if (arqTemp != null) {
                     while (NexusTransfer.pausado.value) {
                         delay(200)
                         if (NexusTransfer.cancelado.value) break
                     }
+                    if (NexusTransfer.cancelado.value) break
+
+                    val nomeLimpo = limparPrefixoTimestamp(item.nome)
+                    desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
+                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
+
+                    val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
+                    val loteTag = "(${index + 1}/$total) "
+                    NexusTransfer.progress.value = 10
+                    NexusTransfer.label.value = "Sincronizando $loteTag'$nomeLimpo'..."
+                    cloudBannerText = "Sincronizando $loteTag'$nomeLimpo'..."
+
+                    val arqTemp = copiarUriParaCacheTDLib(context, item.uri, nomeLimpo, item.tamanho, loteTag)
                     if (NexusTransfer.cancelado.value) {
-                        arqTemp.delete()
+                        arqTemp?.delete()
                         break
                     }
 
-                    val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
-                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
+                    val capaJpg = if (arqTemp != null) {
+                        withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, nomeLimpo, arqTemp) }
+                    } else ""
 
-                    val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                    enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, msg ->
-                        deferred.complete(Triple(ok, rId, msg))
-                    }
-                    val (ok, rId, msg) = deferred.await()
-
-                    val concluiuRede = if (ok && rId != 0) {
-                        aguardarUploadTDLibComPausa(client, rId, nomeLimpo, loteTag)
-                    } else ok
-
-                    if (NexusTransfer.cancelado.value || !concluiuRede) {
-                        cloudBannerText = "Sincronização cancelada."
-                        break
-                    }
-
-                    cloudBannerText = msg
-                    if (ok) {
-                        enviados++
-                        val ts = System.currentTimeMillis() + index
-                        salvarDonoFicheiro(context, ts, activeVaultUser)
-                        if (capaJpg.isNotBlank()) {
-                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                    if (arqTemp != null) {
+                        while (NexusTransfer.pausado.value) {
+                            delay(200)
+                            if (NexusTransfer.cancelado.value) break
                         }
-                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        mapaDonos = carregarDonosFicheiros(context)
-                        if (pastaAlvo.isNotBlank()) {
-                            vm.criarPasta(pastaAlvo)
-                            associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
-                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                            salvarVinculoPasta(context, ts, pastaAlvo)
-                            mapaPastas = carregarVinculosPastas(context)
+                        if (NexusTransfer.cancelado.value) {
+                            arqTemp.delete()
+                            break
                         }
-                        vm.salvarArquivo(
-                            ArquivoNuvem(
-                                fileId = rId,
-                                nomeArquivo = nomeLimpo,
-                                tamanhoBytes = tamFinal,
-                                dataUpload = ts,
-                                caminhoMiniatura = capaJpg
+
+                        val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
+                        marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
+
+                        val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
+                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, msg ->
+                            deferred.complete(Triple(ok, rId, msg))
+                        }
+                        val (ok, rId, msg) = deferred.await()
+
+                        if (NexusTransfer.cancelado.value) {
+                            arqTemp.delete()
+                            break
+                        }
+
+                        val concluiuRede = if (ok && rId != 0) {
+                            aguardarUploadTDLibComPausa(client, rId, nomeLimpo, loteTag)
+                        } else ok
+
+                        if (NexusTransfer.cancelado.value || !concluiuRede) {
+                            arqTemp.delete()
+                            cloudBannerText = "Sincronização cancelada."
+                            break
+                        }
+
+                        cloudBannerText = msg
+                        if (ok) {
+                            enviados++
+                            val ts = System.currentTimeMillis() + index
+                            salvarDonoFicheiro(context, ts, activeVaultUser)
+                            if (capaJpg.isNotBlank()) {
+                                NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                            }
+                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                            mapaDonos = carregarDonosFicheiros(context)
+                            if (pastaAlvo.isNotBlank()) {
+                                vm.criarPasta(pastaAlvo)
+                                associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
+                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                salvarVinculoPasta(context, ts, pastaAlvo)
+                                mapaPastas = carregarVinculosPastas(context)
+                            }
+                            vm.salvarArquivo(
+                                ArquivoNuvem(
+                                    fileId = rId,
+                                    nomeArquivo = nomeLimpo,
+                                    tamanhoBytes = tamFinal,
+                                    dataUpload = ts,
+                                    caminhoMiniatura = capaJpg
+                                )
                             )
-                        )
+                        }
                     }
+                    delay(120)
                 }
-                delay(120)
-            }
 
-            val foiCancelado = NexusTransfer.cancelado.value
-            isUploading = false
-            NexusTransfer.encerrar()
-            cloudBannerText = if (foiCancelado) {
-                "Sincronização interrompida ($enviados enviado(s))."
-            } else {
-                "$enviados novo(s) ficheiro(s) sincronizados na nuvem SSD!"
+                cloudBannerText = if (NexusTransfer.cancelado.value) {
+                    "Sincronização interrompida ($enviados enviado(s))."
+                } else {
+                    "$enviados novo(s) ficheiro(s) sincronizados na nuvem SSD!"
+                }
+                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+            } finally {
+                isUploading = false
+                NexusTransfer.encerrar()
             }
-            Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -3644,7 +3752,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
-    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (COM DETECÇÃO AUTOMÁTICA DE PERFIS NA NUVEM)
+    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (PERFIS OCULTOS POR PRIVACIDADE)
     if (!vaultUnlocked) {
         Column(
             modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
@@ -3671,284 +3779,140 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(14.dp))
                             Spacer(Modifier.width(8.dp))
-                            Text("Sincronizando perfis existentes na nuvem SSD...", color = Gold, fontSize = 11.sp)
+                            Text("Conectando à nuvem SSD...", color = Gold, fontSize = 11.sp)
                         }
                     }
 
-                    if (!isSwitchingUser && activeVaultUser.isNotBlank()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "COFRE DE ${activeVaultUser.uppercase(Locale.getDefault())}",
-                            color = Color.White,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Text(
-                            "Digite o seu PIN para desbloquear os seus ficheiros",
-                            color = TextGrey,
-                            fontSize = 12.sp,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(top = 4.dp)
-                        )
-                        Spacer(Modifier.height(20.dp))
-
-                        OutlinedTextField(
-                            value = vaultPinInput,
-                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
-                            label = { Text("PIN de Acesso", color = TextGrey) },
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation('*'),
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedBorderColor = Gold,
-                                unfocusedBorderColor = Color.Gray
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        if (vaultErrorMsg != null) {
-                            Text(
-                                vaultErrorMsg!!,
-                                color = DangerRed,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(top = 10.dp)
-                            )
-                        }
-
-                        Spacer(Modifier.height(20.dp))
+                    Spacer(Modifier.height(12.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(
-                            onClick = {
-                                vaultErrorMsg = null
-                                val pinDigitado = vaultPinInput.trim()
-                                if (pinDigitado.length < 4) {
-                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
-                                    return@Button
-                                }
-                                val pinLocal = obterPinCofreLocal(context, activeVaultUser)
-                                if (pinLocal != null && pinLocal == pinDigitado) {
-                                    salvarCredenciaisCofreLocal(context, activeVaultUser, pinDigitado)
-                                    vaultPinInput = ""
-                                    vaultUnlocked = true
-                                } else {
-                                    isCheckingVault = true
-                                    verificarOuRegistarCofreNuvem(client, activeVaultUser, pinDigitado, false) { ok, nomeReal, msg ->
-                                        scope.launch(Dispatchers.Main) {
-                                            isCheckingVault = false
-                                            if (ok) {
-                                                salvarCredenciaisCofreLocal(context, nomeReal, pinDigitado)
-                                                activeVaultUser = nomeReal
-                                                vaultPinInput = ""
-                                                vaultUnlocked = true
-                                            } else {
-                                                vaultErrorMsg = msg
-                                            }
-                                        }
+                            onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
+                            colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Button(
+                            onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
+                            colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+                    Text(
+                        if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros na nuvem SSD."
+                        else "Digite o seu Nome e PIN para restaurar e abrir o seu cofre privado na nuvem SSD.",
+                        color = TextGrey,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+
+                    Spacer(Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = vaultNameInput,
+                        onValueChange = { vaultNameInput = it },
+                        label = { Text("Nome do Utilizador", color = TextGrey) },
+                        singleLine = true,
+                        leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = vaultPinInput,
+                        onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
+                        singleLine = true,
+                        leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
+                        visualTransformation = PasswordVisualTransformation('*'),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (vaultErrorMsg != null) {
+                        Text(
+                            vaultErrorMsg!!,
+                            color = DangerRed,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 10.dp)
+                        )
+                    }
+
+                    Spacer(Modifier.height(20.dp))
+                    Button(
+                        onClick = {
+                            vaultErrorMsg = null
+                            val nomeLimpo = vaultNameInput.trim()
+                            val pinLimpo = vaultPinInput.trim()
+
+                            if (nomeLimpo.length < 3) {
+                                vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
+                                return@Button
+                            }
+                            if (pinLimpo.length < 4) {
+                                vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                return@Button
+                            }
+
+                            val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
+                            if (pinLocalExistente != null && pinLocalExistente == pinLimpo) {
+                                salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo)
+                                activeVaultUser = nomeLimpo
+                                isSwitchingUser = false
+                                vaultNameInput = ""
+                                vaultPinInput = ""
+                                vaultUnlocked = true
+                                Toast.makeText(context, "Cofre '$nomeLimpo' desbloqueado!", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+
+                            isCheckingVault = true
+                            verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
+                                scope.launch(Dispatchers.Main) {
+                                    isCheckingVault = false
+                                    if (ok) {
+                                        salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
+                                        activeVaultUser = nomeConfirmado
+                                        isSwitchingUser = false
+                                        vaultNameInput = ""
+                                        vaultPinInput = ""
+                                        vaultUnlocked = true
+                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        vaultErrorMsg = msg
                                     }
                                 }
-                            },
-                            enabled = !isCheckingVault,
-                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                            modifier = Modifier.fillMaxWidth().height(52.dp)
-                        ) {
-                            if (isCheckingVault) {
-                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                            } else {
-                                Text("DESBLOQUEAR COFRE", color = Color.White, fontWeight = FontWeight.Bold)
                             }
-                        }
-
-                        Spacer(Modifier.height(12.dp))
-                        TextButton(onClick = {
-                            vaultErrorMsg = null
-                            vaultPinInput = ""
-                            vaultNameInput = ""
-                            isSwitchingUser = true
-                            isCreatingNewVault = false
-                        }) {
-                            Text("Trocar de utilizador / Criar novo cofre", color = Gold, fontSize = 12.sp)
-                        }
-                    } else {
-                        Spacer(Modifier.height(12.dp))
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
-                                colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-                            Button(
-                                onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
-                                colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            }
-                        }
-
-                        // Lista de perfis encontrados automaticamente na nuvem SSD para entrar com 1 toque
-                        if (perfisExistentesNuvem.isNotEmpty() && !isCreatingNewVault) {
-                            Spacer(Modifier.height(14.dp))
+                        },
+                        enabled = !isCheckingVault,
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(52.dp)
+                    ) {
+                        if (isCheckingVault) {
+                            CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                        } else {
                             Text(
-                                "Perfis encontrados na sua nuvem SSD (toque para selecionar):",
-                                color = Gold,
-                                fontSize = 11.sp,
+                                if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
+                                color = Color.White,
                                 fontWeight = FontWeight.Bold
                             )
-                            Spacer(Modifier.height(8.dp))
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                perfisExistentesNuvem.forEach { nomePerfil ->
-                                    val selecionado = normalizarUsuario(vaultNameInput) == normalizarUsuario(nomePerfil)
-                                    OutlinedButton(
-                                        onClick = {
-                                            vaultNameInput = nomePerfil
-                                            vaultErrorMsg = null
-                                        },
-                                        border = BorderStroke(1.dp, if (selecionado) Gold else TextGrey),
-                                        colors = ButtonDefaults.outlinedButtonColors(
-                                            containerColor = if (selecionado) Gold.copy(alpha = 0.2f) else SurfaceDark
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                                    ) {
-                                        Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(16.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                        Text(nomePerfil, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                    }
-                                }
-                            }
-                        }
-
-                        Spacer(Modifier.height(14.dp))
-                        Text(
-                            if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros na nuvem SSD."
-                            else "Digite o seu Nome e PIN para restaurar e abrir o seu cofre da nuvem SSD.",
-                            color = TextGrey,
-                            fontSize = 12.sp,
-                            textAlign = TextAlign.Center
-                        )
-
-                        Spacer(Modifier.height(16.dp))
-                        OutlinedTextField(
-                            value = vaultNameInput,
-                            onValueChange = { vaultNameInput = it },
-                            label = { Text("Nome do Utilizador (ex: Carlos_85)", color = TextGrey) },
-                            singleLine = true,
-                            leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedBorderColor = Gold,
-                                unfocusedBorderColor = Color.Gray
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
-                            value = vaultPinInput,
-                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
-                            label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
-                            singleLine = true,
-                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
-                            visualTransformation = PasswordVisualTransformation('*'),
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedBorderColor = Gold,
-                                unfocusedBorderColor = Color.Gray
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        if (vaultErrorMsg != null) {
-                            Text(
-                                vaultErrorMsg!!,
-                                color = DangerRed,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                textAlign = TextAlign.Center,
-                                modifier = Modifier.padding(top = 10.dp)
-                            )
-                        }
-
-                        Spacer(Modifier.height(20.dp))
-                        Button(
-                            onClick = {
-                                vaultErrorMsg = null
-                                val nomeLimpo = vaultNameInput.trim()
-                                val pinLimpo = vaultPinInput.trim()
-
-                                if (nomeLimpo.length < 3) {
-                                    vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
-                                    return@Button
-                                }
-                                if (pinLimpo.length < 4) {
-                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
-                                    return@Button
-                                }
-
-                                val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
-                                if (pinLocalExistente != null && pinLocalExistente == pinLimpo) {
-                                    salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo)
-                                    activeVaultUser = nomeLimpo
-                                    isSwitchingUser = false
-                                    vaultPinInput = ""
-                                    vaultUnlocked = true
-                                    Toast.makeText(context, "Cofre '$nomeLimpo' desbloqueado!", Toast.LENGTH_SHORT).show()
-                                    return@Button
-                                }
-
-                                isCheckingVault = true
-                                verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
-                                    scope.launch(Dispatchers.Main) {
-                                        isCheckingVault = false
-                                        if (ok) {
-                                            salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
-                                            activeVaultUser = nomeConfirmado
-                                            isSwitchingUser = false
-                                            vaultPinInput = ""
-                                            vaultUnlocked = true
-                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            vaultErrorMsg = msg
-                                        }
-                                    }
-                                }
-                            },
-                            enabled = !isCheckingVault,
-                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                            modifier = Modifier.fillMaxWidth().height(52.dp)
-                        ) {
-                            if (isCheckingVault) {
-                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                            } else {
-                                Text(
-                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
-
-                        if (activeVaultUser.isNotBlank()) {
-                            Spacer(Modifier.height(8.dp))
-                            TextButton(onClick = {
-                                vaultErrorMsg = null
-                                vaultPinInput = ""
-                                isSwitchingUser = false
-                            }) {
-                                Text("Voltar para o cofre de $activeVaultUser", color = TextGrey, fontSize = 12.sp)
-                            }
                         }
                     }
                 }
@@ -5225,12 +5189,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         jobFilaMiniaturas?.cancel()
                         NexusLeituraNuvem.encerrar()
                         NexusTransfer.cancelar(client)
+                        isUploading = false
                         pastaAberta = null
                         selectedFileIds = emptySet()
                         isSelectionMode = false
+                        activeVaultUser = ""
+                        vaultNameInput = ""
                         vaultPinInput = ""
                         vaultErrorMsg = null
-                        isSwitchingUser = false
+                        isSwitchingUser = true
                         vaultUnlocked = false
                     },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
@@ -5317,11 +5284,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 IconButton(onClick = {
                                     jobFilaMiniaturas?.cancel()
                                     NexusLeituraNuvem.encerrar()
+                                    NexusTransfer.cancelar(client)
+                                    isUploading = false
                                     selectedFileIds = emptySet()
                                     isSelectionMode = false
+                                    activeVaultUser = ""
+                                    vaultNameInput = ""
                                     vaultPinInput = ""
                                     vaultErrorMsg = null
-                                    isSwitchingUser = false
+                                    isSwitchingUser = true
                                     vaultUnlocked = false
                                 }) {
                                     Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
@@ -5400,6 +5371,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                         onClick = {
                                             NexusTransfer.cancelar(client)
                                             isUploading = false
+                                            cloudBannerText = "Transferência cancelada."
+                                            Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
                                         },
                                         modifier = Modifier
                                             .size(32.dp)
