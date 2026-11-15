@@ -1,12 +1,16 @@
 package com.seu.nexuscloud
 
+import android.app.ActivityManager
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
@@ -24,7 +28,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
 import java.lang.reflect.Modifier as JavaModifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -42,6 +48,70 @@ object TelegramAuth {
     val transferLabel = MutableStateFlow("")
 }
 
+fun recolherDiagnosticoNativo(context: Context): String {
+    val sb = StringBuilder()
+
+    // 1. Captura o motivo oficial do Android para o encerramento anterior (API 30+)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val exits = am?.getHistoricalProcessExitReasons(context.packageName, 0, 3)
+            if (!exits.isNullOrEmpty()) {
+                val ult = exits.first()
+                sb.append("• Sinal SO: reason=${ult.reason} | status=${ult.status} | desc=${ult.description ?: "sem desc"}\n")
+                try {
+                    ult.traceInputStream?.bufferedReader()?.use { reader ->
+                        val linhasTrace = reader.readLines()
+                            .filter {
+                                it.contains("Abort message", true) ||
+                                    it.contains("signal", true) ||
+                                    it.contains("tdjni", true) ||
+                                    it.contains("CheckJNI", true) ||
+                                    it.contains("#00", true) ||
+                                    it.contains("#01", true)
+                            }
+                            .take(8)
+                        if (linhasTrace.isNotEmpty()) {
+                            sb.append(linhasTrace.joinToString("\n")).append("\n")
+                        }
+                    }
+                } catch (_: Throwable) {}
+            }
+        } catch (_: Throwable) {}
+    }
+
+    // 2. Lê as últimas linhas de erro do Logcat do próprio aplicativo
+    try {
+        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-t", "300"))
+        val reader = BufferedReader(InputStreamReader(proc.inputStream))
+        val relevantes = mutableListOf<String>()
+        var line: String? = reader.readLine()
+        while (line != null) {
+            val l = line
+            if (l.contains("FATAL", true) ||
+                l.contains("tdjni", true) ||
+                l.contains("TDLib", true) ||
+                l.contains("CheckJNI", true) ||
+                l.contains("UnsatisfiedLink", true) ||
+                l.contains("NoSuch", true) ||
+                l.contains("ClassNotFound", true) ||
+                l.contains("dlopen", true) ||
+                l.contains("Abort", true) ||
+                l.contains("AndroidRuntime", true)
+            ) {
+                relevantes.add(l)
+            }
+            line = reader.readLine()
+        }
+        if (relevantes.isNotEmpty()) {
+            sb.append("\n• Logcat:\n")
+            sb.append(relevantes.takeLast(12).joinToString("\n"))
+        }
+    } catch (_: Throwable) {}
+
+    return sb.toString().trim().ifBlank { "Sem detalhes adicionais no Logcat." }
+}
+
 class NexusApp : Application() {
     @Volatile
     var client: Client? = null
@@ -55,7 +125,7 @@ class NexusApp : Application() {
             Log.e("NexusCloud", "Exceção capturada na thread ${thread.name}", throwable)
             val causaReal = throwable.cause ?: throwable
             val resumoErro = "${causaReal.javaClass.simpleName}: ${causaReal.message}\n" +
-                causaReal.stackTrace.take(10).joinToString("\n") {
+                causaReal.stackTrace.take(8).joinToString("\n") {
                     "at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})"
                 }
 
@@ -76,10 +146,8 @@ class NexusApp : Application() {
     }
 
     @Synchronized
-    fun carregarBibliotecasNativas(): String? {
+    fun carregarSomenteTdjni(): String? {
         return try {
-            try { System.loadLibrary("cryptox") } catch (_: Throwable) {}
-            try { System.loadLibrary("sslx") } catch (_: Throwable) {}
             System.loadLibrary("tdjni")
             File(filesDir, "tdlib").apply { if (!exists()) mkdirs() }
             File(filesDir, "tdlib_files").apply { if (!exists()) mkdirs() }
@@ -98,6 +166,7 @@ class NexusApp : Application() {
             val handler = TelegramHandler(this)
             val novo = Client.create(handler, null, null)
             client = novo
+            novo?.send(TdApi.GetAuthorizationState(), handler)
             startupError = null
             novo
         } catch (e: Throwable) {
@@ -178,7 +247,6 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                 val modelo = (Build.MODEL ?: "Android").ifBlank { "Android" }
                 val versaoSO = (Build.VERSION.RELEASE ?: "13").ifBlank { "13" }
 
-                // Envia a partir da Main Thread para evitar bloqueio/crash na thread nativa C++
                 mainHandler.postDelayed({
                     try {
                         val request = TdApi.SetTdlibParameters().apply {
@@ -199,6 +267,10 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                                     "databaseEncryptionKey" -> f.set(this, ByteArray(0))
                                     "systemVersion" -> f.set(this, versaoSO)
                                     "useFileDatabase", "useChatInfoDatabase", "enableStorageOptimizer" -> f.setBoolean(this, true)
+                                    else -> {
+                                        if (f.type == String::class.java && f.get(this) == null) f.set(this, "")
+                                        if (f.type == ByteArray::class.java && f.get(this) == null) f.set(this, ByteArray(0))
+                                    }
                                 }
                             }
                         }
@@ -207,7 +279,7 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                         parametrosEnviados = false
                         TelegramAuth.errorText.value = "Erro config SSD: ${e.message}"
                     }
-                }, 120L)
+                }, 100L)
             }
             is TdApi.AuthorizationStateWaitPhoneNumber -> {
                 parametrosEnviados = false
@@ -246,12 +318,15 @@ class MainActivity : ComponentActivity() {
         val nexusApp = application as NexusApp
         val prefs = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
 
-        // Se a execução anterior fechou sozinha no meio de uma etapa nativa, bloqueia o loop e mostra na tela
         val etapaInterrompida = prefs.getString("etapa_em_curso", null)
         val crashSalvo = prefs.getString("last_crash", null)
+        val logNativo = if (!etapaInterrompida.isNullOrBlank() || !crashSalvo.isNullOrBlank()) {
+            recolherDiagnosticoNativo(this)
+        } else ""
+
         val diagnosticoInicial = when {
-            !crashSalvo.isNullOrBlank() -> crashSalvo
-            !etapaInterrompida.isNullOrBlank() -> "O aplicativo fechou inesperadamente durante a etapa:\n👉 $etapaInterrompida"
+            !crashSalvo.isNullOrBlank() -> "$crashSalvo\n\n$logNativo"
+            !etapaInterrompida.isNullOrBlank() -> "Falha na etapa:\n👉 $etapaInterrompida\n\n$logNativo"
             else -> null
         }
 
@@ -269,40 +344,40 @@ class MainActivity : ComponentActivity() {
                         try {
                             etapaTexto = "Etapa 1/3: A iniciar base de dados local..."
                             prefs.edit().putString("etapa_em_curso", "Etapa 1: Base de dados Room (NexusDB)").commit()
-                            delay(250)
+                            delay(200)
                             val db = withContext(Dispatchers.IO) { NexusDB.get(this@MainActivity) }
                             val dao = db.dao()
 
-                            etapaTexto = "Etapa 2/3: A carregar bibliotecas nativas SSD..."
+                            etapaTexto = "Etapa 2/3: A carregar motor nativo tdjni..."
                             prefs.edit().putString("etapa_em_curso", "Etapa 2: System.loadLibrary(tdjni)").commit()
-                            delay(250)
-                            val erroLib = nexusApp.carregarBibliotecasNativas()
+                            delay(200)
+                            val erroLib = nexusApp.carregarSomenteTdjni()
                             if (erroLib != null) {
                                 prefs.edit().remove("etapa_em_curso").commit()
-                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib"
+                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
                                 carregando = false
                                 return@LaunchedEffect
                             }
 
                             etapaTexto = "Etapa 3/3: A iniciar cliente de nuvem SSD..."
                             prefs.edit().putString("etapa_em_curso", "Etapa 3: Client.create / SetTdlibParameters").commit()
-                            delay(250)
+                            delay(200)
                             val cli = nexusApp.criarClienteTDLib()
                             if (cli != null) {
                                 daoPronto = dao
                                 clientPronto = cli
                                 carregando = false
-                                // Se permaneceu aberto por 1.5s após abrir a UI, limpa o marcador de etapa
                                 delay(1500)
                                 prefs.edit().remove("etapa_em_curso").commit()
                             } else {
                                 prefs.edit().remove("etapa_em_curso").commit()
-                                erroVisivel = nexusApp.startupError ?: "Não foi possível criar o cliente TDLib."
+                                erroVisivel = (nexusApp.startupError ?: "Não foi possível criar o cliente TDLib.") +
+                                    "\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
                                 carregando = false
                             }
                         } catch (e: Throwable) {
                             prefs.edit().remove("etapa_em_curso").commit()
-                            erroVisivel = "${e.javaClass.simpleName}: ${e.message}"
+                            erroVisivel = "${e.javaClass.simpleName}: ${e.message}\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
                             carregando = false
                         }
                     }
@@ -310,24 +385,25 @@ class MainActivity : ComponentActivity() {
 
                 when {
                     erroVisivel != null -> {
+                        val textoErro = erroVisivel ?: "Erro desconhecido"
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color(0xFF05070A))
-                                .padding(24.dp)
+                                .padding(20.dp)
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text("DIAGNÓSTICO NEXUS SSD", color = Color(0xFFFFD700), fontSize = 18.sp, fontWeight = FontWeight.Black)
-                            Spacer(modifier = Modifier.height(8.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                "O modo de proteção impediu o fechamento automático:",
+                                "Detalhes técnicos capturados do sistema:",
                                 color = Color(0xFFA0AABF),
                                 fontSize = 12.sp,
                                 textAlign = TextAlign.Center
                             )
-                            Spacer(modifier = Modifier.height(14.dp))
+                            Spacer(modifier = Modifier.height(12.dp))
                             Surface(
                                 color = Color(0xFF161A25),
                                 shape = RoundedCornerShape(12.dp),
@@ -335,13 +411,25 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Text(
-                                    text = erroVisivel ?: "Erro desconhecido",
+                                    text = textoErro,
                                     color = Color(0xFFE53935),
-                                    fontSize = 12.sp,
-                                    modifier = Modifier.padding(16.dp)
+                                    fontSize = 11.sp,
+                                    modifier = Modifier.padding(14.dp)
                                 )
                             }
-                            Spacer(modifier = Modifier.height(20.dp))
+                            Spacer(modifier = Modifier.height(14.dp))
+                            OutlinedButton(
+                                onClick = {
+                                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("Erro Nexus", textoErro))
+                                    Toast.makeText(this@MainActivity, "Relatório copiado!", Toast.LENGTH_SHORT).show()
+                                },
+                                border = BorderStroke(1.dp, Color(0xFFFFD700)),
+                                modifier = Modifier.fillMaxWidth().height(46.dp)
+                            ) {
+                                Text("COPIAR RELATÓRIO DE ERRO", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
                             Button(
                                 onClick = {
                                     try {
@@ -352,7 +440,7 @@ class MainActivity : ComponentActivity() {
                                     erroVisivel = null
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
-                                modifier = Modifier.fillMaxWidth().height(50.dp)
+                                modifier = Modifier.fillMaxWidth().height(48.dp)
                             ) {
                                 Text("LIMPAR PASTA TDLIB E TENTAR NOVAMENTE", color = Color(0xFF05070A), fontWeight = FontWeight.Black, fontSize = 11.sp)
                             }
