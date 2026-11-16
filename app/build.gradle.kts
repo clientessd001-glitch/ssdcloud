@@ -16,7 +16,6 @@ android {
         versionName = "1.9"
 
         ndk {
-            // Mantém apenas arquiteturas de telemóveis reais (reduz o APK de 60 MB para ~30 MB)
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
 
@@ -29,7 +28,6 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // Impede que o Gradle corrompa as bibliotecas nativas ao tentar remover símbolos
             keepDebugSymbols += setOf("**/*.so")
         }
     }
@@ -54,9 +52,13 @@ android {
 }
 
 configurations.all {
-    resolutionStrategy.eachDependency {
-        if (requested.group == "org.jetbrains.kotlin") {
-            useVersion("1.9.22")
+    resolutionStrategy {
+        cacheDynamicVersionsFor(0, "seconds")
+        cacheChangingModulesFor(0, "seconds")
+        eachDependency {
+            if (requested.group == "org.jetbrains.kotlin") {
+                useVersion("1.9.22")
+            }
         }
     }
 }
@@ -79,7 +81,8 @@ dependencies {
 
     implementation("io.coil-kt:coil-compose:2.6.0")
 
-    implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
+    // Versão estável anterior da TDLib (compatível com o motor nativo da v1.8)
+    implementation("com.github.capullo-tech:lib-tdlib-android:v1.8.29") {
         exclude(group = "org.jetbrains.kotlin")
     }
 }
