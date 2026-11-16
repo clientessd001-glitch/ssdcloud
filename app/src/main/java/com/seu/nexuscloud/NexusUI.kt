@@ -64,6 +64,16 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import coil.request.CachePolicy
 import coil.request.ImageRequest
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.lang.reflect.Modifier as JavaModifier
+import java.text.SimpleDateFormat
+import java.util.ArrayList
+import java.util.Calendar
+import java.util.Collections
+import java.util.Date
+import java.util.Locale
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -73,15 +83,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.text.SimpleDateFormat
-import java.util.ArrayList
-import java.util.Calendar
-import java.util.Collections
-import java.util.Date
-import java.util.Locale
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
@@ -148,7 +149,6 @@ object NexusTransfer {
     }
 
     fun cancelar(client: Client? = null) {
-        // Mantém cancelado.value = true para interromper imediatamente os loops e corrotinas
         cancelado.value = true
         pausado.value = false
         val fId = fileIdAtivo.value
@@ -783,7 +783,7 @@ suspend fun aguardarUploadTDLibComPausa(
 
         if (!remote.isUploadingActive) {
             inativoCount++
-            if (inativoCount >= 40) return true
+            if (inativoCount >= 60) return true
         } else {
             inativoCount = 0
         }
@@ -1309,7 +1309,6 @@ fun limparDuplicadosExistentes(
     }
 }
 
-// Extrai o array de mensagens de qualquer resposta do TDLib (compatível com TdApi.Messages e TdApi.FoundChatMessages)
 fun extrairArrayMensagensTDLib(obj: TdApi.Object?): Array<TdApi.Message>? {
     if (obj == null) return null
     if (obj is TdApi.Messages) return obj.messages
@@ -2705,7 +2704,7 @@ fun copiarLoteParaDownloads(
     }
 }
 
-// === ENVIO PARA MENSAGENS SALVAS CORRIGIDO (SEM INPUTTHUMBNAIL REJEITADO E COM SUPORTE A CANCELAMENTO) ===
+// === ENVIO PARA MENSAGENS SALVAS (PREENCHIMENTO COMPLETO DOS CAMPOS TDAPI.INPUTDOCUMENT SEM STRINGS NULAS) ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -2720,6 +2719,12 @@ fun enviarParaMensagensSalvas(
         onResult(false, 0, "Envio cancelado.")
         return
     }
+    val arqLocalFile = File(caminhoLocal)
+    if (!arqLocalFile.exists() || arqLocalFile.length() <= 0L) {
+        onResult(false, 0, "Arquivo temporário vazio ou não encontrado.")
+        return
+    }
+
     val nomeLimpo = limparPrefixoTimestamp(nomeOriginal)
 
     client.send(TdApi.GetMe()) { meObj ->
@@ -2741,49 +2746,42 @@ fun enviarParaMensagensSalvas(
                     val fileLocal = TdApi.InputFileLocal(caminhoLocal)
 
                     val doc = TdApi.InputMessageDocument().apply {
-                        try {
-                            val capField = javaClass.getDeclaredField("caption")
-                            capField.isAccessible = true
-                            capField.set(this, leg)
-                        } catch (_: Exception) {}
-                        try {
-                            val docField = javaClass.getDeclaredField("document")
-                            docField.isAccessible = true
-                            if (docField.type.isAssignableFrom(fileLocal.javaClass)) {
-                                docField.set(this, fileLocal)
-                            } else {
-                                val inputDocClass = docField.type
-                                var inst: Any? = null
-                                for (ctor in inputDocClass.constructors) {
-                                    val p = ctor.parameterTypes
-                                    try {
-                                        if (p.size == 3 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                                            inst = ctor.newInstance(fileLocal, null, false)
-                                            break
-                                        } else if (p.size == 2 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                                            inst = ctor.newInstance(fileLocal, null)
-                                            break
-                                        } else if (p.size == 1 && p[0].isAssignableFrom(fileLocal.javaClass)) {
-                                            inst = ctor.newInstance(fileLocal)
-                                            break
+                        for (f in javaClass.declaredFields) {
+                            if (JavaModifier.isStatic(f.modifiers)) continue
+                            f.isAccessible = true
+                            try {
+                                when {
+                                    f.type.isAssignableFrom(leg.javaClass) -> f.set(this, leg)
+                                    f.type.isAssignableFrom(fileLocal.javaClass) -> f.set(this, fileLocal)
+                                    f.name == "document" && !f.type.isAssignableFrom(fileLocal.javaClass) -> {
+                                        val inputDocClass = f.type
+                                        val inst = inputDocClass.getDeclaredConstructor().newInstance()
+                                        for (df in inputDocClass.declaredFields) {
+                                            if (JavaModifier.isStatic(df.modifiers)) continue
+                                            df.isAccessible = true
+                                            when {
+                                                df.type.isAssignableFrom(fileLocal.javaClass) -> df.set(inst, fileLocal)
+                                                df.type == String::class.java -> {
+                                                    if (df.name.contains("name", ignoreCase = true)) df.set(inst, nomeLimpo)
+                                                    else if (df.get(inst) == null) df.set(inst, "")
+                                                }
+                                                df.type == Boolean::class.javaPrimitiveType -> {
+                                                    if (df.name.contains("force", ignoreCase = true)) df.setBoolean(inst, true)
+                                                }
+                                            }
                                         }
-                                    } catch (_: Exception) {}
-                                }
-                                if (inst == null) {
-                                    inst = inputDocClass.getDeclaredConstructor().newInstance()
-                                    for (f in inputDocClass.declaredFields) {
-                                        f.isAccessible = true
-                                        if (f.type.isAssignableFrom(fileLocal.javaClass)) {
-                                            f.set(inst, fileLocal)
-                                        }
+                                        f.set(this, inst)
                                     }
+                                    f.type == String::class.java && f.get(this) == null -> f.set(this, "")
                                 }
-                                docField.set(this, inst)
-                            }
-                        } catch (_: Exception) {}
+                            } catch (_: Exception) {}
+                        }
                     }
 
-                    val req = TdApi.SendMessage().apply { chatId = chatObj.id; inputMessageContent = doc }
+                    val req = TdApi.SendMessage().apply {
+                        chatId = chatObj.id
+                        inputMessageContent = doc
+                    }
                     client.send(req) { msgObj ->
                         when (msgObj) {
                             is TdApi.Message -> {
@@ -3431,7 +3429,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Upload com BARRA ÚNICA e cancelamento imediato pelo botão "X"
+    // Upload com BARRA ÚNICA, cancelamento imediato pelo botão "X" e feedback real da TDLib
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
@@ -3496,9 +3494,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             break
                         }
 
-                        val concluiuRede = if (ok && rId != 0) {
+                        if (!ok) {
+                            arqTemp.delete()
+                            cloudBannerText = msg
+                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            continue
+                        }
+
+                        val concluiuRede = if (rId != 0) {
                             aguardarUploadTDLibComPausa(client, rId, nome, loteTag)
-                        } else ok
+                        } else true
 
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
@@ -3507,42 +3512,46 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
 
                         cloudBannerText = msg
-                        if (ok) {
-                            enviados++
-                            val ts = System.currentTimeMillis() + index
-                            salvarDonoFicheiro(context, ts, activeVaultUser)
-                            if (capaJpg.isNotBlank()) {
-                                NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
-                            }
-                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                            mapaDonos = carregarDonosFicheiros(context)
-                            if (pastaEscolhida.isNotBlank()) {
-                                vm.criarPasta(pastaEscolhida)
-                                associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
-                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                salvarVinculoPasta(context, ts, pastaEscolhida)
-                                mapaPastas = carregarVinculosPastas(context)
-                            }
-                            vm.salvarArquivo(
-                                ArquivoNuvem(
-                                    fileId = rId,
-                                    nomeArquivo = nome,
-                                    tamanhoBytes = tamFinal,
-                                    dataUpload = ts,
-                                    caminhoMiniatura = capaJpg
-                                )
-                            )
+                        enviados++
+                        val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        if (capaJpg.isNotBlank()) {
+                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
                         }
+                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                        mapaDonos = carregarDonosFicheiros(context)
+                        if (pastaEscolhida.isNotBlank()) {
+                            vm.criarPasta(pastaEscolhida)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                            salvarVinculoPasta(context, ts, pastaEscolhida)
+                            mapaPastas = carregarVinculosPastas(context)
+                        }
+                        vm.salvarArquivo(
+                            ArquivoNuvem(
+                                fileId = rId,
+                                nomeArquivo = nome,
+                                tamanhoBytes = tamFinal,
+                                dataUpload = ts,
+                                caminhoMiniatura = capaJpg
+                            )
+                        )
                     } else {
                         cloudBannerText = "Erro ao ler '$nome'."
+                        Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                     }
                     delay(120)
                 }
 
                 if (NexusTransfer.cancelado.value) {
                     cloudBannerText = "Envio cancelado ($enviados guardado(s))."
-                } else if (total > 1) {
-                    cloudBannerText = "$enviados de $total ficheiros guardados no cofre SSD de $activeVaultUser!"
+                } else if (enviados > 0) {
+                    cloudBannerText = if (total > 1) {
+                        "$enviados de $total ficheiros guardados no cofre SSD de $activeVaultUser!"
+                    } else {
+                        "Guardado no cofre SSD de $activeVaultUser!"
+                    }
+                    Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                 }
             } finally {
                 isUploading = false
@@ -3551,7 +3560,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Sincronização de novos arquivos com BARRA ÚNICA e cancelamento imediato pelo botão "X"
+    // Sincronização de novos arquivos com BARRA ÚNICA, cancelamento no "X" e feedback real da TDLib
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
@@ -3614,9 +3623,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             break
                         }
 
-                        val concluiuRede = if (ok && rId != 0) {
+                        if (!ok) {
+                            arqTemp.delete()
+                            cloudBannerText = msg
+                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            continue
+                        }
+
+                        val concluiuRede = if (rId != 0) {
                             aguardarUploadTDLibComPausa(client, rId, nomeLimpo, loteTag)
-                        } else ok
+                        } else true
 
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
@@ -3625,32 +3641,30 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
 
                         cloudBannerText = msg
-                        if (ok) {
-                            enviados++
-                            val ts = System.currentTimeMillis() + index
-                            salvarDonoFicheiro(context, ts, activeVaultUser)
-                            if (capaJpg.isNotBlank()) {
-                                NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
-                            }
-                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                            mapaDonos = carregarDonosFicheiros(context)
-                            if (pastaAlvo.isNotBlank()) {
-                                vm.criarPasta(pastaAlvo)
-                                associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
-                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                salvarVinculoPasta(context, ts, pastaAlvo)
-                                mapaPastas = carregarVinculosPastas(context)
-                            }
-                            vm.salvarArquivo(
-                                ArquivoNuvem(
-                                    fileId = rId,
-                                    nomeArquivo = nomeLimpo,
-                                    tamanhoBytes = tamFinal,
-                                    dataUpload = ts,
-                                    caminhoMiniatura = capaJpg
-                                )
-                            )
+                        enviados++
+                        val ts = System.currentTimeMillis() + index
+                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        if (capaJpg.isNotBlank()) {
+                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
                         }
+                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
+                        mapaDonos = carregarDonosFicheiros(context)
+                        if (pastaAlvo.isNotBlank()) {
+                            vm.criarPasta(pastaAlvo)
+                            associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
+                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                            salvarVinculoPasta(context, ts, pastaAlvo)
+                            mapaPastas = carregarVinculosPastas(context)
+                        }
+                        vm.salvarArquivo(
+                            ArquivoNuvem(
+                                fileId = rId,
+                                nomeArquivo = nomeLimpo,
+                                tamanhoBytes = tamFinal,
+                                dataUpload = ts,
+                                caminhoMiniatura = capaJpg
+                            )
+                        )
                     }
                     delay(120)
                 }
