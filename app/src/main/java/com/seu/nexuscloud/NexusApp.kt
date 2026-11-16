@@ -1,16 +1,12 @@
 package com.seu.nexuscloud
 
-import android.app.ActivityManager
 import android.app.Application
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.BorderStroke
@@ -28,9 +24,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.io.BufferedReader
 import java.io.File
-import java.io.InputStreamReader
 import java.lang.reflect.Modifier as JavaModifier
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -48,179 +42,6 @@ object TelegramAuth {
     val transferLabel = MutableStateFlow("")
 }
 
-// Alinha o COMMIT_HASH do TdApi.java com a versão exigida pelo binário nativo libtdjni.so
-fun alinharHashTdApiComNativo(): String {
-    val hashExigidoPeloSo = "89ebded9571b7bb589ec1bd05e585fffa4c580e2"
-    val hashDivergenteJava = "a17f87c4cff7b90b278d12b91ba0614383aaee82"
-    val relatorio = StringBuilder()
-
-    val nomesClasses = listOf(
-        "org.drinkless.tdlib.TdApi",
-        "org.drinkless.tdlib.TdApi\$Object",
-        "org.drinkless.tdlib.TdApi\$Function",
-        "org.drinkless.tdlib.Client"
-    )
-
-    for (nomeClasse in nomesClasses) {
-        try {
-            // initialize = true garante que o ART inicialize os campos estáticos antes da substituição
-            val clazz = Class.forName(nomeClasse, true, NexusApp::class.java.classLoader)
-            for (field in clazz.declaredFields) {
-                if (!JavaModifier.isStatic(field.modifiers) || field.type != String::class.java) continue
-                field.isAccessible = true
-                val valorAtual = try { field.get(null) as? String } catch (_: Throwable) { null } ?: continue
-
-                if (valorAtual == hashDivergenteJava ||
-                    field.name.contains("HASH", ignoreCase = true) ||
-                    field.name.contains("COMMIT", ignoreCase = true) ||
-                    valorAtual.length == 40
-                ) {
-                    // 1. Tentativa direta via Reflection removendo flag FINAL de accessFlags
-                    try {
-                        val accessFlagsField = java.lang.reflect.Field::class.java.getDeclaredField("accessFlags")
-                        accessFlagsField.isAccessible = true
-                        accessFlagsField.setInt(field, field.modifiers and JavaModifier.FINAL.inv())
-                        field.set(null, hashExigidoPeloSo)
-                    } catch (_: Throwable) {
-                        try { field.set(null, hashExigidoPeloSo) } catch (_: Throwable) {}
-                    }
-
-                    // 2. Tentativa via sun.misc.Unsafe diretamente no endereço de memória da classe no ART
-                    if ((try { field.get(null) as? String } catch (_: Throwable) { null }) != hashExigidoPeloSo) {
-                        try {
-                            val unsafeClass = Class.forName("sun.misc.Unsafe")
-                            val theUnsafeField = unsafeClass.getDeclaredField("theUnsafe")
-                            theUnsafeField.isAccessible = true
-                            val unsafe = theUnsafeField.get(null)
-
-                            val offset: Long = try {
-                                val mGetOffset = java.lang.reflect.Field::class.java.getDeclaredMethod("getOffset")
-                                mGetOffset.isAccessible = true
-                                (mGetOffset.invoke(field) as Number).toLong()
-                            } catch (_: Throwable) {
-                                try {
-                                    val fOffset = java.lang.reflect.Field::class.java.getDeclaredField("offset")
-                                    fOffset.isAccessible = true
-                                    fOffset.getInt(field).toLong()
-                                } catch (_: Throwable) {
-                                    val mStaticOffset = unsafeClass.getDeclaredMethod("staticFieldOffset", java.lang.reflect.Field::class.java)
-                                    mStaticOffset.isAccessible = true
-                                    (mStaticOffset.invoke(unsafe, field) as Number).toLong()
-                                }
-                            }
-
-                            val baseObj: Any = try {
-                                val mStaticBase = unsafeClass.getDeclaredMethod("staticFieldBase", java.lang.reflect.Field::class.java)
-                                mStaticBase.isAccessible = true
-                                mStaticBase.invoke(unsafe, field) ?: clazz
-                            } catch (_: Throwable) {
-                                clazz
-                            }
-
-                            val mPutObject = unsafeClass.getDeclaredMethod(
-                                "putObject",
-                                Any::class.java,
-                                Long::class.javaPrimitiveType,
-                                Any::class.java
-                            )
-                            mPutObject.isAccessible = true
-                            mPutObject.invoke(unsafe, baseObj, offset, hashExigidoPeloSo)
-                        } catch (e: Throwable) {
-                            relatorio.append("Aviso Unsafe (${field.name}): ${e.message}\n")
-                        }
-                    }
-
-                    val valorFinal = try { field.get(null) as? String } catch (_: Throwable) { null }
-                    relatorio.append("Campo ${clazz.simpleName}.${field.name}: $valorAtual -> $valorFinal\n")
-                }
-            }
-        } catch (_: Throwable) {}
-    }
-    return relatorio.toString().trim()
-}
-
-fun recolherDiagnosticoNativo(context: Context): String {
-    val sb = StringBuilder()
-
-    try {
-        val libDir = File(context.applicationInfo.nativeLibraryDir)
-        val libs = libDir.listFiles()?.joinToString(", ") { "${it.name} (${it.length() / 1024}KB)" } ?: "pasta vazia"
-        sb.append("• Libs Nativas: $libs\n")
-    } catch (_: Throwable) {}
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        try {
-            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            val exits = am?.getHistoricalProcessExitReasons(context.packageName, 0, 3)
-            if (!exits.isNullOrEmpty()) {
-                val ult = exits.first()
-                sb.append("• Sinal SO: reason=${ult.reason} | status=${ult.status} | desc=${ult.description ?: "sem desc"}\n")
-                try {
-                    val rawBytes = ult.traceInputStream?.use { it.readBytes() } ?: ByteArray(0)
-                    if (rawBytes.isNotEmpty()) {
-                        val extraidas = mutableListOf<String>()
-                        val seq = StringBuilder()
-                        for (b in rawBytes) {
-                            val v = b.toInt() and 0xFF
-                            if (v in 32..126) {
-                                seq.append(v.toChar())
-                            } else {
-                                if (seq.length >= 5) {
-                                    extraidas.add(seq.toString().trim())
-                                }
-                                seq.setLength(0)
-                            }
-                        }
-                        if (seq.length >= 5) extraidas.add(seq.toString().trim())
-
-                        val cabecalho = extraidas.take(20)
-                        val palavrasChave = extraidas.filter { s ->
-                            s.contains("Abort", true) ||
-                                s.contains("FATAL", true) ||
-                                s.contains("JNI", true) ||
-                                s.contains("Mismatched", true) ||
-                                s.contains("tdjni", true) ||
-                                s.contains("TdApi", true) ||
-                                s.contains("NoSuch", true) ||
-                                s.contains("Error", true)
-                        }.take(25)
-
-                        val combinadas = (cabecalho + palavrasChave).distinct()
-                        sb.append("\n• Trace Extraído:\n")
-                        sb.append(combinadas.joinToString("\n")).append("\n")
-                    }
-                } catch (_: Throwable) {}
-            }
-        } catch (_: Throwable) {}
-    }
-
-    try {
-        val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-b", "all", "-d", "-t", "300"))
-        val reader = BufferedReader(InputStreamReader(proc.inputStream))
-        val relevantes = mutableListOf<String>()
-        var line: String? = reader.readLine()
-        while (line != null) {
-            val l = line.replace("\u0000", "")
-            if (l.contains("FATAL", true) ||
-                l.contains("tdjni", true) ||
-                l.contains("TDLib", true) ||
-                l.contains("Mismatched", true) ||
-                l.contains("Abort", true) ||
-                l.contains("AndroidRuntime", true)
-            ) {
-                relevantes.add(l)
-            }
-            line = reader.readLine()
-        }
-        if (relevantes.isNotEmpty()) {
-            sb.append("\n• Logcat:\n")
-            sb.append(relevantes.takeLast(12).joinToString("\n"))
-        }
-    } catch (_: Throwable) {}
-
-    return sb.toString().replace("\u0000", "").trim()
-}
-
 class NexusApp : Application() {
     @Volatile
     var client: Client? = null
@@ -234,14 +55,14 @@ class NexusApp : Application() {
             Log.e("NexusCloud", "Exceção capturada na thread ${thread.name}", throwable)
             val causaReal = throwable.cause ?: throwable
             val resumoErro = "${causaReal.javaClass.simpleName}: ${causaReal.message}\n" +
-                causaReal.stackTrace.take(8).joinToString("\n") {
+                causaReal.stackTrace.take(10).joinToString("\n") {
                     "at ${it.className}.${it.methodName}(${it.fileName}:${it.lineNumber})"
                 }
 
             try {
                 getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
                     .edit()
-                    .putString("last_crash_v2", resumoErro.replace("\u0000", ""))
+                    .putString("last_crash", resumoErro)
                     .commit()
             } catch (_: Throwable) {}
 
@@ -255,12 +76,10 @@ class NexusApp : Application() {
     }
 
     @Synchronized
-    fun carregarSomenteTdjni(): String? {
+    fun carregarBibliotecasNativas(): String? {
         return try {
-            // Alinha o hash do TdApi.java com o libtdjni.so antes de carregar a biblioteca C++
-            val logHash = alinharHashTdApiComNativo()
-            Log.i("NexusCloud", "Alinhamento Hash TDLib: $logHash")
-
+            try { System.loadLibrary("cryptox") } catch (_: Throwable) {}
+            try { System.loadLibrary("sslx") } catch (_: Throwable) {}
             System.loadLibrary("tdjni")
             File(filesDir, "tdlib").apply { if (!exists()) mkdirs() }
             File(filesDir, "tdlib_files").apply { if (!exists()) mkdirs() }
@@ -279,7 +98,6 @@ class NexusApp : Application() {
             val handler = TelegramHandler(this)
             val novo = Client.create(handler, null, null)
             client = novo
-            novo?.send(TdApi.GetAuthorizationState(), handler)
             startupError = null
             novo
         } catch (e: Throwable) {
@@ -360,6 +178,7 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                 val modelo = (Build.MODEL ?: "Android").ifBlank { "Android" }
                 val versaoSO = (Build.VERSION.RELEASE ?: "13").ifBlank { "13" }
 
+                // Envia a partir da Main Thread para evitar bloqueio/crash na thread nativa C++
                 mainHandler.postDelayed({
                     try {
                         val request = TdApi.SetTdlibParameters().apply {
@@ -380,10 +199,6 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                                     "databaseEncryptionKey" -> f.set(this, ByteArray(0))
                                     "systemVersion" -> f.set(this, versaoSO)
                                     "useFileDatabase", "useChatInfoDatabase", "enableStorageOptimizer" -> f.setBoolean(this, true)
-                                    else -> {
-                                        if (f.type == String::class.java && f.get(this) == null) f.set(this, "")
-                                        if (f.type == ByteArray::class.java && f.get(this) == null) f.set(this, ByteArray(0))
-                                    }
                                 }
                             }
                         }
@@ -392,7 +207,7 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                         parametrosEnviados = false
                         TelegramAuth.errorText.value = "Erro config SSD: ${e.message}"
                     }
-                }, 100L)
+                }, 120L)
             }
             is TdApi.AuthorizationStateWaitPhoneNumber -> {
                 parametrosEnviados = false
@@ -431,20 +246,12 @@ class MainActivity : ComponentActivity() {
         val nexusApp = application as NexusApp
         val prefs = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
 
-        // Limpa automaticamente o bloqueio antigo ao instalar esta correção
-        if (prefs.getString("versao_fix_hash", "") != "v1.9_hash_aligned") {
-            prefs.edit().clear().putString("versao_fix_hash", "v1.9_hash_aligned").commit()
-        }
-
-        val etapaInterrompida = prefs.getString("etapa_em_curso_v2", null)
-        val crashSalvo = prefs.getString("last_crash_v2", null)
-        val logNativo = if (!etapaInterrompida.isNullOrBlank() || !crashSalvo.isNullOrBlank()) {
-            recolherDiagnosticoNativo(this)
-        } else ""
-
+        // Se a execução anterior fechou sozinha no meio de uma etapa nativa, bloqueia o loop e mostra na tela
+        val etapaInterrompida = prefs.getString("etapa_em_curso", null)
+        val crashSalvo = prefs.getString("last_crash", null)
         val diagnosticoInicial = when {
-            !crashSalvo.isNullOrBlank() -> "$crashSalvo\n\n$logNativo"
-            !etapaInterrompida.isNullOrBlank() -> "Falha na etapa:\n👉 $etapaInterrompida\n\n$logNativo"
+            !crashSalvo.isNullOrBlank() -> crashSalvo
+            !etapaInterrompida.isNullOrBlank() -> "O aplicativo fechou inesperadamente durante a etapa:\n👉 $etapaInterrompida"
             else -> null
         }
 
@@ -461,42 +268,41 @@ class MainActivity : ComponentActivity() {
                         carregando = true
                         try {
                             etapaTexto = "Etapa 1/3: A iniciar base de dados local..."
-                            prefs.edit().putString("etapa_em_curso_v2", "Etapa 1: Base de dados Room (NexusDB)").commit()
-                            delay(150)
+                            prefs.edit().putString("etapa_em_curso", "Etapa 1: Base de dados Room (NexusDB)").commit()
+                            delay(250)
                             val db = withContext(Dispatchers.IO) { NexusDB.get(this@MainActivity) }
                             val dao = db.dao()
 
-                            etapaTexto = "Etapa 2/3: A alinhar e carregar motor nativo SSD..."
-                            val statusHash = alinharHashTdApiComNativo()
-                            prefs.edit().putString("etapa_em_curso_v2", "Etapa 2: System.loadLibrary(tdjni) [$statusHash]").commit()
-                            delay(150)
-                            val erroLib = nexusApp.carregarSomenteTdjni()
+                            etapaTexto = "Etapa 2/3: A carregar bibliotecas nativas SSD..."
+                            prefs.edit().putString("etapa_em_curso", "Etapa 2: System.loadLibrary(tdjni)").commit()
+                            delay(250)
+                            val erroLib = nexusApp.carregarBibliotecasNativas()
                             if (erroLib != null) {
-                                prefs.edit().remove("etapa_em_curso_v2").commit()
-                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib\n$statusHash\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
+                                prefs.edit().remove("etapa_em_curso").commit()
+                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib"
                                 carregando = false
                                 return@LaunchedEffect
                             }
 
                             etapaTexto = "Etapa 3/3: A iniciar cliente de nuvem SSD..."
-                            prefs.edit().putString("etapa_em_curso_v2", "Etapa 3: Client.create / SetTdlibParameters").commit()
-                            delay(150)
+                            prefs.edit().putString("etapa_em_curso", "Etapa 3: Client.create / SetTdlibParameters").commit()
+                            delay(250)
                             val cli = nexusApp.criarClienteTDLib()
                             if (cli != null) {
                                 daoPronto = dao
                                 clientPronto = cli
                                 carregando = false
+                                // Se permaneceu aberto por 1.5s após abrir a UI, limpa o marcador de etapa
                                 delay(1500)
-                                prefs.edit().remove("etapa_em_curso_v2").commit()
+                                prefs.edit().remove("etapa_em_curso").commit()
                             } else {
-                                prefs.edit().remove("etapa_em_curso_v2").commit()
-                                erroVisivel = (nexusApp.startupError ?: "Não foi possível criar o cliente TDLib.") +
-                                    "\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
+                                prefs.edit().remove("etapa_em_curso").commit()
+                                erroVisivel = nexusApp.startupError ?: "Não foi possível criar o cliente TDLib."
                                 carregando = false
                             }
                         } catch (e: Throwable) {
-                            prefs.edit().remove("etapa_em_curso_v2").commit()
-                            erroVisivel = "${e.javaClass.simpleName}: ${e.message}\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
+                            prefs.edit().remove("etapa_em_curso").commit()
+                            erroVisivel = "${e.javaClass.simpleName}: ${e.message}"
                             carregando = false
                         }
                     }
@@ -504,25 +310,24 @@ class MainActivity : ComponentActivity() {
 
                 when {
                     erroVisivel != null -> {
-                        val textoErro = (erroVisivel ?: "Erro desconhecido").replace("\u0000", "")
                         Column(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .background(Color(0xFF05070A))
-                                .padding(20.dp)
+                                .padding(24.dp)
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             Text("DIAGNÓSTICO NEXUS SSD", color = Color(0xFFFFD700), fontSize = 18.sp, fontWeight = FontWeight.Black)
-                            Spacer(modifier = Modifier.height(6.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                "Detalhes técnicos capturados do sistema:",
+                                "O modo de proteção impediu o fechamento automático:",
                                 color = Color(0xFFA0AABF),
                                 fontSize = 12.sp,
                                 textAlign = TextAlign.Center
                             )
-                            Spacer(modifier = Modifier.height(12.dp))
+                            Spacer(modifier = Modifier.height(14.dp))
                             Surface(
                                 color = Color(0xFF161A25),
                                 shape = RoundedCornerShape(12.dp),
@@ -530,36 +335,24 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier.fillMaxWidth()
                             ) {
                                 Text(
-                                    text = textoErro,
+                                    text = erroVisivel ?: "Erro desconhecido",
                                     color = Color(0xFFE53935),
-                                    fontSize = 11.sp,
-                                    modifier = Modifier.padding(14.dp)
+                                    fontSize = 12.sp,
+                                    modifier = Modifier.padding(16.dp)
                                 )
                             }
-                            Spacer(modifier = Modifier.height(14.dp))
-                            OutlinedButton(
-                                onClick = {
-                                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("Erro Nexus", textoErro))
-                                    Toast.makeText(this@MainActivity, "Relatório completo copiado!", Toast.LENGTH_SHORT).show()
-                                },
-                                border = BorderStroke(1.dp, Color(0xFFFFD700)),
-                                modifier = Modifier.fillMaxWidth().height(46.dp)
-                            ) {
-                                Text("COPIAR RELATÓRIO DE ERRO", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(20.dp))
                             Button(
                                 onClick = {
                                     try {
                                         File(filesDir, "tdlib").deleteRecursively()
                                         File(filesDir, "tdlib_files").deleteRecursively()
                                     } catch (_: Throwable) {}
-                                    prefs.edit().clear().putString("versao_fix_hash", "v1.9_hash_aligned").commit()
+                                    prefs.edit().clear().commit()
                                     erroVisivel = null
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                modifier = Modifier.fillMaxWidth().height(50.dp)
                             ) {
                                 Text("LIMPAR PASTA TDLIB E TENTAR NOVAMENTE", color = Color(0xFF05070A), fontWeight = FontWeight.Black, fontSize = 11.sp)
                             }
