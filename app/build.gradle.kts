@@ -52,13 +52,9 @@ android {
 }
 
 configurations.all {
-    resolutionStrategy {
-        cacheDynamicVersionsFor(0, "seconds")
-        cacheChangingModulesFor(0, "seconds")
-        eachDependency {
-            if (requested.group == "org.jetbrains.kotlin") {
-                useVersion("1.9.22")
-            }
+    resolutionStrategy.eachDependency {
+        if (requested.group == "org.jetbrains.kotlin") {
+            useVersion("1.9.22")
         }
     }
 }
@@ -81,8 +77,7 @@ dependencies {
 
     implementation("io.coil-kt:coil-compose:2.6.0")
 
-    // Versão estável anterior da TDLib (compatível com o motor nativo da v1.8)
-    implementation("com.github.capullo-tech:lib-tdlib-android:v1.8.29") {
+    implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
         exclude(group = "org.jetbrains.kotlin")
     }
 }
