@@ -1,4 +1,4 @@
-plugins {
+Plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("kotlin-kapt")
@@ -13,12 +13,7 @@ android {
         minSdk = 26
         targetSdk = 34
         versionCode = 1
-        versionName = "1.9"
-
-        ndk {
-            // Mantém apenas arquiteturas de telemóveis reais (reduz o APK de 60 MB para ~30 MB)
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-        }
+        versionName = "1.0"
 
         val apiId = System.getenv("TELEGRAM_API_ID") ?: "0"
         val apiHash = System.getenv("TELEGRAM_API_HASH") ?: ""
@@ -29,8 +24,6 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
-            // Impede que o Gradle corrompa as bibliotecas nativas ao tentar remover símbolos
-            keepDebugSymbols += setOf("**/*.so")
         }
     }
 
@@ -77,6 +70,7 @@ dependencies {
     implementation("androidx.room:room-ktx:$roomVersion")
     kapt("androidx.room:room-compiler:$roomVersion")
 
+    // Biblioteca Coil para gerar miniaturas de imagens
     implementation("io.coil-kt:coil-compose:2.6.0")
 
     implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
