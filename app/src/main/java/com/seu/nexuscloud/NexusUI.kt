@@ -2704,7 +2704,114 @@ fun copiarLoteParaDownloads(
     }
 }
 
-// === ENVIO PARA MENSAGENS SALVAS (PREENCHIMENTO COMPLETO DOS CAMPOS TDAPI.INPUTDOCUMENT SEM STRINGS NULAS) ===
+// === CONSTRUTOR DINÂMICO DE INPUTMESSAGEDOCUMENT / INPUTDOCUMENT (COMPATÍVEL COM QUALQUER VERSÃO TDAPI) ===
+fun construirInputMessageDocument(
+    caminhoLocal: String,
+    nomeLimpo: String,
+    legenda: TdApi.FormattedText
+): Pair<TdApi.InputMessageDocument, String> {
+    val fileLocal = TdApi.InputFileLocal(caminhoLocal)
+    val diag = StringBuilder()
+    val doc = TdApi.InputMessageDocument()
+
+    for (f in doc.javaClass.declaredFields) {
+        if (JavaModifier.isStatic(f.modifiers)) continue
+        f.isAccessible = true
+        try {
+            when {
+                f.type.isAssignableFrom(legenda.javaClass) -> {
+                    f.set(doc, legenda)
+                }
+                f.type.isAssignableFrom(fileLocal.javaClass) -> {
+                    f.set(doc, fileLocal)
+                    diag.append("DirectFile")
+                }
+                f.name == "document" -> {
+                    val inputDocBaseClass = f.type
+                    val subclasses = TdApi::class.java.declaredClasses.filter {
+                        inputDocBaseClass.isAssignableFrom(it) &&
+                            it != inputDocBaseClass &&
+                            !JavaModifier.isAbstract(it.modifiers)
+                    }
+                    diag.append("Base=${inputDocBaseClass.simpleName}, Subs=${subclasses.map { it.simpleName }}")
+
+                    val candidataSub = subclasses.sortedByDescending { sub ->
+                        var score = 0
+                        if (sub.simpleName.contains("Local", ignoreCase = true)) score += 10
+                        if (sub.simpleName.contains("File", ignoreCase = true)) score += 8
+                        if (sub.declaredFields.any { TdApi.InputFile::class.java.isAssignableFrom(it.type) }) score += 5
+                        score
+                    }.firstOrNull()
+
+                    val targetClass = candidataSub ?: inputDocBaseClass
+                    var inst: Any? = null
+
+                    val ctors = targetClass.constructors.sortedBy { it.parameterTypes.size }
+                    for (ctor in ctors) {
+                        val params = ctor.parameterTypes
+                        if (params.isEmpty()) continue
+                        val args = arrayOfNulls<Any>(params.size)
+                        var compativel = true
+                        for (i in params.indices) {
+                            val pt = params[i]
+                            when {
+                                pt.isAssignableFrom(fileLocal.javaClass) -> args[i] = fileLocal
+                                TdApi.InputThumbnail::class.java.isAssignableFrom(pt) -> args[i] = null
+                                pt == String::class.java -> args[i] = if (params.size == 1) caminhoLocal else nomeLimpo
+                                pt == Boolean::class.javaPrimitiveType || pt == Boolean::class.java -> args[i] = false
+                                pt == Int::class.javaPrimitiveType || pt == Int::class.java -> args[i] = 0
+                                pt == Long::class.javaPrimitiveType || pt == Long::class.java -> args[i] = 0L
+                                else -> {
+                                    compativel = false
+                                    break
+                                }
+                            }
+                        }
+                        if (compativel) {
+                            try {
+                                inst = ctor.newInstance(*args)
+                                diag.append(" -> Ctor(${targetClass.simpleName}:${params.joinToString(",") { it.simpleName }})")
+                                break
+                            } catch (_: Exception) {}
+                        }
+                    }
+
+                    if (inst == null) {
+                        inst = targetClass.getDeclaredConstructor().newInstance()
+                        for (df in targetClass.declaredFields) {
+                            if (JavaModifier.isStatic(df.modifiers)) continue
+                            df.isAccessible = true
+                            when {
+                                df.type.isAssignableFrom(fileLocal.javaClass) -> df.set(inst, fileLocal)
+                                df.type == String::class.java -> {
+                                    when {
+                                        df.name.contains("path", ignoreCase = true) -> df.set(inst, caminhoLocal)
+                                        df.name.contains("name", ignoreCase = true) -> df.set(inst, nomeLimpo)
+                                        df.get(inst) == null -> df.set(inst, "")
+                                    }
+                                }
+                                df.type == Boolean::class.javaPrimitiveType -> {
+                                    if (df.name.contains("force", ignoreCase = true)) df.setBoolean(inst, true)
+                                }
+                            }
+                        }
+                        diag.append(" -> EmptyCtor(${targetClass.simpleName})")
+                    }
+
+                    f.set(doc, inst)
+                }
+                f.type == String::class.java && f.get(doc) == null -> {
+                    f.set(doc, "")
+                }
+            }
+        } catch (e: Exception) {
+            diag.append(" [Err:${e.message}]")
+        }
+    }
+    return Pair(doc, diag.toString())
+}
+
+// === ENVIO PARA MENSAGENS SALVAS ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -2740,43 +2847,13 @@ fun enviarParaMensagensSalvas(
                 }
                 if (chatObj is TdApi.Chat) {
                     NexusTransfer.chatIdUploadAtivo = chatObj.id
+                    try { client.send(TdApi.OpenChat(chatObj.id)) {} } catch (_: Exception) {}
+
                     val userTag = "👤 [$usuarioAtivo] • "
                     val pastaTag = if (pastaDestino.isNotBlank()) "📁 [$pastaDestino] • " else ""
                     val leg = TdApi.FormattedText("☁️ Nexus Cloud • $userTag$pastaTag$nomeLimpo", emptyArray())
-                    val fileLocal = TdApi.InputFileLocal(caminhoLocal)
 
-                    val doc = TdApi.InputMessageDocument().apply {
-                        for (f in javaClass.declaredFields) {
-                            if (JavaModifier.isStatic(f.modifiers)) continue
-                            f.isAccessible = true
-                            try {
-                                when {
-                                    f.type.isAssignableFrom(leg.javaClass) -> f.set(this, leg)
-                                    f.type.isAssignableFrom(fileLocal.javaClass) -> f.set(this, fileLocal)
-                                    f.name == "document" && !f.type.isAssignableFrom(fileLocal.javaClass) -> {
-                                        val inputDocClass = f.type
-                                        val inst = inputDocClass.getDeclaredConstructor().newInstance()
-                                        for (df in inputDocClass.declaredFields) {
-                                            if (JavaModifier.isStatic(df.modifiers)) continue
-                                            df.isAccessible = true
-                                            when {
-                                                df.type.isAssignableFrom(fileLocal.javaClass) -> df.set(inst, fileLocal)
-                                                df.type == String::class.java -> {
-                                                    if (df.name.contains("name", ignoreCase = true)) df.set(inst, nomeLimpo)
-                                                    else if (df.get(inst) == null) df.set(inst, "")
-                                                }
-                                                df.type == Boolean::class.javaPrimitiveType -> {
-                                                    if (df.name.contains("force", ignoreCase = true)) df.setBoolean(inst, true)
-                                                }
-                                            }
-                                        }
-                                        f.set(this, inst)
-                                    }
-                                    f.type == String::class.java && f.get(this) == null -> f.set(this, "")
-                                }
-                            } catch (_: Exception) {}
-                        }
-                    }
+                    val (doc, diagInfo) = construirInputMessageDocument(caminhoLocal, nomeLimpo, leg)
 
                     val req = TdApi.SendMessage().apply {
                         chatId = chatObj.id
@@ -2814,7 +2891,7 @@ fun enviarParaMensagensSalvas(
                                 val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Guardado no cofre SSD de $usuarioAtivo!"
                                 onResult(true, rId, txt)
                             }
-                            is TdApi.Error -> onResult(false, 0, "Erro SSD (${msgObj.code}): ${msgObj.message}")
+                            is TdApi.Error -> onResult(false, 0, "Erro SSD (${msgObj.code}): ${msgObj.message} [$diagInfo]")
                             else -> onResult(true, 0, "Upload SSD iniciado!")
                         }
                     }
@@ -3202,6 +3279,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var isDeletingFolder by remember { mutableStateOf(false) }
     var showAboutDialog by remember { mutableStateOf(false) }
     var showCacheDialog by remember { mutableStateOf(false) }
+    var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
 
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
@@ -3497,7 +3575,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         if (!ok) {
                             arqTemp.delete()
                             cloudBannerText = msg
-                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            erroUploadDetalhado = msg
                             continue
                         }
 
@@ -3626,7 +3704,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         if (!ok) {
                             arqTemp.delete()
                             cloudBannerText = msg
-                            Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            erroUploadDetalhado = msg
                             continue
                         }
 
@@ -3933,6 +4011,42 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
         }
         return
+    }
+
+    // === JANELA DE ALERTA DETALHADO CASO O UPLOAD RETORNE ERRO ===
+    if (erroUploadDetalhado != null) {
+        Dialog(onDismissRequest = { erroUploadDetalhado = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.5.dp, DangerRed),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier.padding(22.dp).verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(Icons.Default.ErrorOutline, null, tint = DangerRed, modifier = Modifier.size(46.dp))
+                    Spacer(Modifier.height(10.dp))
+                    Text("FALHA NO ENVIO SSD", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        text = erroUploadDetalhado ?: "",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    Button(
+                        onClick = { erroUploadDetalhado = null },
+                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                        modifier = Modifier.fillMaxWidth().height(46.dp)
+                    ) {
+                        Text("FECHAR", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
     }
 
     // === JANELA DE CACHE DO SSD NEXUS ===
