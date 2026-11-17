@@ -2898,7 +2898,7 @@ fun criarInstanciaWrapperMidia(wrapperClass: Class<*>, inputFile: TdApi.InputFil
     }
 }
 
-// === CONSTRUTOR DINÂMICO COM OVERRIDE REAL DE GETCONSTRUCTOR() ===
+// === CONSTRUTOR DINÂMICO COMPATÍVEL COM A TDLIB ESTÁVEL E SNAPSHOT ===
 fun construirConteudoUploadTDLib(
     inputFile: TdApi.InputFile,
     nomeLimpo: String,
@@ -2916,8 +2916,13 @@ fun construirConteudoUploadTDLib(
 
     val idEscolhido = idsClassicosDoc[modoTentativa.coerceIn(0, idsClassicosDoc.lastIndex)]
 
-    val doc = object : TdApi.InputMessageDocument() {
-        override fun getConstructor(): Int = idEscolhido
+    // Na tentativa 0 usa a classe pura TdApi.InputMessageDocument() para identidade exata no JNI
+    val doc = if (modoTentativa == 0) {
+        TdApi.InputMessageDocument()
+    } else {
+        object : TdApi.InputMessageDocument() {
+            override fun getConstructor(): Int = idEscolhido
+        }
     }
 
     for (f in TdApi.InputMessageDocument::class.java.declaredFields) {
