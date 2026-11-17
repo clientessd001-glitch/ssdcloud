@@ -732,64 +732,94 @@ suspend fun aguardarUploadTDLibComPausa(
     client: Client,
     fileId: Int,
     nomeArquivo: String,
-    loteTag: String = ""
-): Boolean {
-    if (fileId == 0) return true
+    loteTag: String = "",
+    chatId: Long = 0L,
+    messageId: Long = 0L
+): Pair<Boolean, String> {
     NexusTransfer.fileIdAtivo.value = fileId
     var tentativas = 0
     var inativoCount = 0
 
-    while (tentativas < 1200) {
+    while (tentativas < 1800) {
         if (NexusTransfer.cancelado.value) {
-            client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
-            return false
+            if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return Pair(false, "Envio cancelado.")
         }
         while (NexusTransfer.pausado.value) {
             delay(200)
             if (NexusTransfer.cancelado.value) {
-                client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
-                return false
+                if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+                return Pair(false, "Envio cancelado.")
             }
         }
 
-        delay(150)
+        delay(200)
         if (NexusTransfer.cancelado.value) {
-            client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
-            return false
+            if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return Pair(false, "Envio cancelado.")
         }
 
         tentativas++
-        val info = obterInfoArquivoTDLib(client, fileId) ?: return true
-        val remote = info.remote ?: return true
-        val enviado = remote.uploadedSize
+
+        var msgConfirmadaNoServidor = (chatId == 0L || messageId == 0L)
+        if (!msgConfirmadaNoServidor) {
+            val defMsg = CompletableDeferred<TdApi.Object?>()
+            client.send(TdApi.GetMessage(chatId, messageId)) { defMsg.complete(it) }
+            when (val mObj = defMsg.await()) {
+                is TdApi.Message -> {
+                    when (val st = mObj.sendingState) {
+                        null -> msgConfirmadaNoServidor = true
+                        is TdApi.MessageSendingStateFailed -> {
+                            return Pair(false, "Falha no servidor SSD (${st.errorCode}): ${st.errorMessage}")
+                        }
+                    }
+                }
+                is TdApi.Error -> {
+                    if (mObj.code == 404) return Pair(false, "Mensagem removida antes de concluir o envio.")
+                }
+            }
+        }
+
+        val info = if (fileId != 0) obterInfoArquivoTDLib(client, fileId) else null
+        val remote = info?.remote
+        val enviado = remote?.uploadedSize ?: 0L
         val total = when {
-            info.size > 0 -> info.size
-            info.expectedSize > 0 -> info.expectedSize
+            (info?.size ?: 0L) > 0L -> info!!.size
+            (info?.expectedSize ?: 0L) > 0L -> info!!.expectedSize
             else -> 0L
         }
 
-        if (remote.isUploadingCompleted && !remote.id.isNullOrEmpty()) {
+        val uploadArquivoOk = (fileId == 0) || (remote != null && remote.isUploadingCompleted && !remote.id.isNullOrEmpty())
+
+        if (uploadArquivoOk && msgConfirmadaNoServidor) {
             NexusTransfer.progress.value = 100
-            return true
+            return Pair(true, "OK")
         }
 
         if (total > 0L && enviado > 0L) {
             val pctRede = ((enviado * 100L) / total).toInt().coerceIn(1, 99)
-            val pctTotal = (40 + (pctRede * 59) / 100).coerceIn(40, 99)
+            val pctTotal = (40 + (pctRede * 58) / 100).coerceIn(40, 98)
             val mbEnv = String.format(Locale.US, "%.1f", enviado / (1024.0 * 1024.0))
             val mbTot = String.format(Locale.US, "%.1f", total / (1024.0 * 1024.0))
             NexusTransfer.progress.value = pctTotal
-            NexusTransfer.label.value = "Enviando $loteTag'$nomeArquivo': $mbEnv / $mbTot MB ($pctTotal%)"
+            NexusTransfer.label.value = if (uploadArquivoOk) {
+                "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)..."
+            } else {
+                "Enviando $loteTag'$nomeArquivo': $mbEnv / $mbTot MB ($pctTotal%)"
+            }
+        } else if (uploadArquivoOk) {
+            NexusTransfer.progress.value = 99
+            NexusTransfer.label.value = "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)..."
         }
 
-        if (!remote.isUploadingActive) {
+        if (remote != null && !remote.isUploadingActive && !uploadArquivoOk) {
             inativoCount++
-            if (inativoCount >= 60) return true
+            if (inativoCount >= 80 && msgConfirmadaNoServidor) return Pair(true, "OK")
         } else {
             inativoCount = 0
         }
     }
-    return true
+    return Pair(true, "OK")
 }
 
 suspend fun recuperarFileIdNaNuvemPorNome(
@@ -808,7 +838,7 @@ suspend fun recuperarFileIdNaNuvemPorNome(
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    buscarHistoricoPaginado(client, chatObj.id, 0L, 12, mutableListOf()) { todasMensagens ->
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { todasMensagens ->
                         var achouFileId = 0
                         var achouThumbId = 0
                         for (msg in todasMensagens) {
@@ -1188,7 +1218,7 @@ fun eliminarMultiplosFicheiros(
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    buscarHistoricoPaginado(client, chatObj.id, 0L, 12, mutableListOf()) { todasMensagens ->
+                    buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { todasMensagens ->
                         val msgIdsParaApagar = mutableListOf<Long>()
                         for (msg in todasMensagens) {
                             val legenda = when (val c = msg.content) {
@@ -1431,9 +1461,21 @@ fun buscarHistoricoPaginado(
     }
     client.send(req) { obj ->
         val msgs = extrairArrayMensagensTDLib(obj)?.filterNotNull() ?: emptyList()
+
+        // Na primeira leitura após reinstalação (fromMsgId == 0L), a TDLib devolve 1-3 mensagens do cache local
+        // antes de baixar o lote completo do servidor. Aguarda a sincronização do topo antes de paginar para trás.
+        if (fromMsgId == 0L && msgs.size <= 3 && tentativasVazio < 5) {
+            acumulado.addAll(msgs)
+            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                delay(650)
+                buscarHistoricoPaginado(client, chatId, 0L, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
+            }
+            return@send
+        }
+
         if (msgs.isNotEmpty()) {
             acumulado.addAll(msgs)
-            val ultimoId = msgs.last().id
+            val ultimoId = msgs.minOf { it.id }
             if (ultimoId != 0L && ultimoId != fromMsgId) {
                 buscarHistoricoPaginado(client, chatId, ultimoId, lotesRestantes - 1, acumulado, 0, onComplete)
             } else {
@@ -1441,7 +1483,7 @@ fun buscarHistoricoPaginado(
             }
         } else if (acumulado.size <= 1 && tentativasVazio < 5) {
             kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                delay(550)
+                delay(650)
                 buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
             }
         } else {
@@ -1879,7 +1921,7 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO COM BARRA DE CONTAGEM DE ARQUIVOS NA NUVEM ===
+// === SINCRONIZAÇÃO COMPLETA DA NUVEM (BUSCA DO TOPO DO SERVIDOR + PESQUISA GLOBAL) ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -1898,185 +1940,183 @@ fun sincronizarCofreDaNuvem(
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
-                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, usuarioAtivo.trim()) { msgsBusca ->
-                        buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
-                            val todasMensagens = (msgsBusca + msgsHistorico).distinctBy { it.id }
-                            val mensagensDoUsuario = todasMensagens.filter { msg ->
-                                val legenda = when (val c = msg.content) {
-                                    is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                    is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                    is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                                    is TdApi.MessageVideo -> c.caption?.text ?: ""
-                                    else -> ""
-                                }
-                                legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)
-                            }
+                    try { client.send(TdApi.OpenChat(chatObj.id)) {} } catch (_: Exception) {}
 
-                            val totalNaNuvem = mensagensDoUsuario.size
-                            if (totalNaNuvem > 0) {
-                                NexusLeituraNuvem.iniciar(totalNaNuvem, "Lendo arquivos da nuvem SSD...")
-                            } else {
-                                NexusLeituraNuvem.encerrar()
-                                onComplete(0)
-                                return@buscarHistoricoPaginado
-                            }
-
-                            var importados = 0
-                            val donosAtuais = carregarDonosFicheiros(context)
-                            val pastasAtuais = carregarVinculosPastas(context)
-
-                            val mapaExistentesPorChave = arquivosAtuaisReais
-                                .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
-                                .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
-                                .toMutableMap()
-
-                            val nomesExistentes = arquivosAtuaisReais
-                                .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
-                                .map { limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT) }
-                                .toMutableSet()
-
-                            mensagensDoUsuario.forEachIndexed { index, msg ->
-                                var legenda = ""
-                                var rId = 0
-                                var thumbId = 0
-                                var thumbPathLocal = ""
-                                var nomeBruto = ""
-                                var tam = 0L
-                                var caminhoLocalExistente = ""
-
-                                when (val c = msg.content) {
-                                    is TdApi.MessageDocument -> {
-                                        legenda = c.caption?.text ?: ""
-                                        rId = c.document?.document?.id ?: 0
-                                        thumbId = c.document?.thumbnail?.file?.id ?: 0
-                                        thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
-                                        nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                        tam = c.document?.document?.size ?: 0L
-                                        caminhoLocalExistente = c.document?.document?.local?.path ?: ""
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "Nexus Cloud") { msgsNexus ->
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, usuarioAtivo.trim()) { msgsBusca ->
+                            buscarHistoricoPaginado(client, chatObj.id, 0L, 20, mutableListOf()) { msgsHistorico ->
+                                val todasMensagens = (msgsNexus + msgsBusca + msgsHistorico).distinctBy { it.id }
+                                val mensagensDoUsuario = todasMensagens.filter { msg ->
+                                    val legenda = when (val c = msg.content) {
+                                        is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                        is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                        is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                                        is TdApi.MessageVideo -> c.caption?.text ?: ""
+                                        else -> ""
                                     }
-                                    is TdApi.MessageAudio -> {
-                                        legenda = c.caption?.text ?: ""
-                                        rId = c.audio?.audio?.id ?: 0
-                                        thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
-                                        thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
-                                        nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                        tam = c.audio?.audio?.size ?: 0L
-                                        caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
-                                    }
-                                    is TdApi.MessagePhoto -> {
-                                        legenda = c.caption?.text ?: ""
-                                        val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
-                                        rId = maior?.photo?.id ?: 0
-                                        nomeBruto = "Foto_$rId.jpg"
-                                        tam = maior?.photo?.size ?: 0L
-                                        caminhoLocalExistente = maior?.photo?.local?.path ?: ""
-                                    }
-                                    is TdApi.MessageVideo -> {
-                                        legenda = c.caption?.text ?: ""
-                                        rId = c.video?.video?.id ?: 0
-                                        thumbId = c.video?.thumbnail?.file?.id ?: 0
-                                        thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
-                                        nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
-                                        tam = c.video?.video?.size ?: 0L
-                                        caminhoLocalExistente = c.video?.video?.local?.path ?: ""
-                                    }
-                                    else -> return@forEachIndexed
+                                    legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)
                                 }
 
-                                if (rId != 0 && thumbId != 0) {
-                                    NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
+                                val totalNaNuvem = mensagensDoUsuario.size
+                                if (totalNaNuvem > 0) {
+                                    NexusLeituraNuvem.iniciar(totalNaNuvem, "Lendo arquivos da nuvem SSD...")
+                                } else {
+                                    NexusLeituraNuvem.encerrar()
+                                    onComplete(0)
+                                    return@buscarHistoricoPaginado
                                 }
 
-                                val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
-                                val nomeLower = nomeDoc.lowercase(Locale.ROOT)
-                                val chaveUnica = "$nomeLower|$tam"
+                                var importados = 0
+                                val donosAtuais = carregarDonosFicheiros(context)
+                                val pastasAtuais = carregarVinculosPastas(context)
 
-                                NexusLeituraNuvem.avancar(
-                                    novoLido = index + 1,
-                                    novoTotal = totalNaNuvem,
-                                    texto = "Lendo nuvem SSD: $nomeDoc"
-                                )
+                                val mapaExistentesPorChave = arquivosAtuaisReais
+                                    .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                                    .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                                    .toMutableMap()
 
-                                if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
-                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
-                                    return@forEachIndexed
-                                }
+                                mensagensDoUsuario.forEachIndexed { index, msg ->
+                                    var legenda = ""
+                                    var rId = 0
+                                    var thumbId = 0
+                                    var thumbPathLocal = ""
+                                    var nomeBruto = ""
+                                    var tam = 0L
+                                    var caminhoLocalExistente = ""
 
-                                val pastaBruta = if (legenda.contains("📁 [")) {
-                                    legenda.substringAfter("📁 [").substringBefore("]").trim()
-                                } else ""
-                                val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaBruta)
-                                val pastaFinal = if (pastaResolvida.isNotBlank() && !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)) {
-                                    pastaResolvida
-                                } else ""
-
-                                if (pastaFinal.isNotBlank()) {
-                                    vm.criarPasta(pastaFinal)
-                                    associarPastaAoUsuario(context, usuarioAtivo, pastaFinal)
-                                }
-
-                                marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeDoc, tam)
-
-                                val uriMiniaturaInicial = when {
-                                    caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
-                                        prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
-                                    thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
-                                        salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
-                                    else -> ""
-                                }
-
-                                val arqExistente = mapaExistentesPorChave[chaveUnica]
-                                if (arqExistente != null) {
-                                    if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
-                                        salvarVinculoPasta(context, arqExistente.dataUpload, pastaFinal)
-                                    }
-                                    if (uriMiniaturaInicial.isNotBlank()) {
-                                        NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
-                                    }
-                                    if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                        NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
-                                    }
-                                    if ((rId != 0 && arqExistente.fileId != rId) ||
-                                        (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
-                                    ) {
-                                        vm.salvarArquivo(
-                                            arqExistente.copy(
-                                                fileId = if (rId != 0) rId else arqExistente.fileId,
-                                                caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
-                                            )
-                                        )
-                                    }
-                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
-                                } else if (!nomesExistentes.contains(nomeLower)) {
-                                    nomesExistentes.add(nomeLower)
-                                    registarMensagemSincronizada(context, usuarioAtivo, msg.id)
-
-                                    val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + index
-                                    salvarDonoFicheiro(context, ts, usuarioAtivo)
-                                    if (pastaFinal.isNotBlank()) {
-                                        salvarVinculoPasta(context, ts, pastaFinal)
-                                    }
-                                    if (uriMiniaturaInicial.isNotBlank()) {
-                                        NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
-                                    }
-                                    if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                    when (val c = msg.content) {
+                                        is TdApi.MessageDocument -> {
+                                            legenda = c.caption?.text ?: ""
+                                            rId = c.document?.document?.id ?: 0
+                                            thumbId = c.document?.thumbnail?.file?.id ?: 0
+                                            thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
+                                            nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                            tam = c.document?.document?.size ?: 0L
+                                            caminhoLocalExistente = c.document?.document?.local?.path ?: ""
+                                        }
+                                        is TdApi.MessageAudio -> {
+                                            legenda = c.caption?.text ?: ""
+                                            rId = c.audio?.audio?.id ?: 0
+                                            thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
+                                            thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
+                                            nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                            tam = c.audio?.audio?.size ?: 0L
+                                            caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
+                                        }
+                                        is TdApi.MessagePhoto -> {
+                                            legenda = c.caption?.text ?: ""
+                                            val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                                            rId = maior?.photo?.id ?: 0
+                                            nomeBruto = "Foto_$rId.jpg"
+                                            tam = maior?.photo?.size ?: 0L
+                                            caminhoLocalExistente = maior?.photo?.local?.path ?: ""
+                                        }
+                                        is TdApi.MessageVideo -> {
+                                            legenda = c.caption?.text ?: ""
+                                            rId = c.video?.video?.id ?: 0
+                                            thumbId = c.video?.thumbnail?.file?.id ?: 0
+                                            thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
+                                            nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
+                                            tam = c.video?.video?.size ?: 0L
+                                            caminhoLocalExistente = c.video?.video?.local?.path ?: ""
+                                        }
+                                        else -> return@forEachIndexed
                                     }
 
-                                    val novoArq = ArquivoNuvem(
-                                        fileId = rId,
-                                        nomeArquivo = nomeDoc,
-                                        tamanhoBytes = tam,
-                                        dataUpload = ts,
-                                        caminhoMiniatura = uriMiniaturaInicial
+                                    if (rId != 0 && thumbId != 0) {
+                                        NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
+                                    }
+
+                                    val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                                    val nomeLower = nomeDoc.lowercase(Locale.ROOT)
+                                    val chaveUnica = "$nomeLower|$tam"
+
+                                    NexusLeituraNuvem.avancar(
+                                        novoLido = index + 1,
+                                        novoTotal = totalNaNuvem,
+                                        texto = "Lendo nuvem SSD: $nomeDoc"
                                     )
-                                    mapaExistentesPorChave[chaveUnica] = novoArq
-                                    vm.salvarArquivo(novoArq)
-                                    importados++
-                                }
-                            }
 
-                            onComplete(importados)
+                                    if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
+                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+                                        return@forEachIndexed
+                                    }
+
+                                    val pastaBruta = if (legenda.contains("📁 [")) {
+                                        legenda.substringAfter("📁 [").substringBefore("]").trim()
+                                    } else ""
+                                    val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaBruta)
+                                    val pastaFinal = if (pastaResolvida.isNotBlank() && !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)) {
+                                        pastaResolvida
+                                    } else ""
+
+                                    if (pastaFinal.isNotBlank()) {
+                                        vm.criarPasta(pastaFinal)
+                                        associarPastaAoUsuario(context, usuarioAtivo, pastaFinal)
+                                    }
+
+                                    marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeDoc, tam)
+
+                                    val uriMiniaturaInicial = when {
+                                        caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
+                                            prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
+                                        thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
+                                            salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
+                                        else -> ""
+                                    }
+
+                                    val arqExistente = mapaExistentesPorChave[chaveUnica]
+                                    if (arqExistente != null) {
+                                        if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
+                                            salvarVinculoPasta(context, arqExistente.dataUpload, pastaFinal)
+                                        }
+                                        if (uriMiniaturaInicial.isNotBlank()) {
+                                            NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
+                                        }
+                                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                            NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                        }
+                                        if ((rId != 0 && arqExistente.fileId != rId) ||
+                                            (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
+                                        ) {
+                                            vm.salvarArquivo(
+                                                arqExistente.copy(
+                                                    fileId = if (rId != 0) rId else arqExistente.fileId,
+                                                    caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
+                                                )
+                                            )
+                                        }
+                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+                                    } else {
+                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
+
+                                        val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + index
+                                        salvarDonoFicheiro(context, ts, usuarioAtivo)
+                                        if (pastaFinal.isNotBlank()) {
+                                            salvarVinculoPasta(context, ts, pastaFinal)
+                                        }
+                                        if (uriMiniaturaInicial.isNotBlank()) {
+                                            NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
+                                        }
+                                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                        }
+
+                                        val novoArq = ArquivoNuvem(
+                                            fileId = rId,
+                                            nomeArquivo = nomeDoc,
+                                            tamanhoBytes = tam,
+                                            dataUpload = ts,
+                                            caminhoMiniatura = uriMiniaturaInicial
+                                        )
+                                        mapaExistentesPorChave[chaveUnica] = novoArq
+                                        vm.salvarArquivo(novoArq)
+                                        importados++
+                                    }
+                                }
+
+                                onComplete(importados)
+                            }
                         }
                     }
                 } else {
@@ -2916,7 +2956,6 @@ fun construirConteudoUploadTDLib(
 
     val idEscolhido = idsClassicosDoc[modoTentativa.coerceIn(0, idsClassicosDoc.lastIndex)]
 
-    // Na tentativa 0 usa a classe pura TdApi.InputMessageDocument() para identidade exata no JNI
     val doc = if (modoTentativa == 0) {
         TdApi.InputMessageDocument()
     } else {
@@ -2943,7 +2982,7 @@ fun construirConteudoUploadTDLib(
     return Pair(doc, "DocCtor($idEscolhido)")
 }
 
-// === ENVIO PARA MENSAGENS SALVAS ===
+// === ENVIO PARA MENSAGENS SALVAS COM CONFIRMAÇÃO REAL NO SERVIDOR ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -2952,15 +2991,15 @@ fun enviarParaMensagensSalvas(
     caminhoCapaJpg: String,
     nomeOriginal: String,
     pastaDestino: String,
-    onResult: (Boolean, Int, String) -> Unit
+    onResult: (Boolean, Int, Long, Long, String) -> Unit
 ) {
     if (NexusTransfer.cancelado.value) {
-        onResult(false, 0, "Envio cancelado.")
+        onResult(false, 0, 0L, 0L, "Envio cancelado.")
         return
     }
     val arqLocalFile = File(caminhoLocal)
     if (!arqLocalFile.exists() || arqLocalFile.length() <= 0L) {
-        onResult(false, 0, "Arquivo temporário vazio ou não encontrado.")
+        onResult(false, 0, 0L, 0L, "Arquivo temporário vazio ou não encontrado.")
         return
     }
 
@@ -2968,13 +3007,13 @@ fun enviarParaMensagensSalvas(
 
     client.send(TdApi.GetMe()) { meObj ->
         if (NexusTransfer.cancelado.value) {
-            onResult(false, 0, "Envio cancelado.")
+            onResult(false, 0, 0L, 0L, "Envio cancelado.")
             return@send
         }
         if (meObj is TdApi.User) {
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (NexusTransfer.cancelado.value) {
-                    onResult(false, 0, "Envio cancelado.")
+                    onResult(false, 0, 0L, 0L, "Envio cancelado.")
                     return@send
                 }
                 if (chatObj is TdApi.Chat) {
@@ -2987,20 +3026,6 @@ fun enviarParaMensagensSalvas(
                     val leg = TdApi.FormattedText(textoCompletoLegenda, emptyArray())
                     val fileLocal = TdApi.InputFileLocal(caminhoLocal)
 
-                    var fileIdPreliminar = 0
-                    try {
-                        val prelimReq = TdApi.PreliminaryUploadFile().apply {
-                            this.file = fileLocal
-                            this.priority = 32
-                        }
-                        client.send(prelimReq) { fObj ->
-                            if (fObj is TdApi.File && fObj.id != 0) {
-                                fileIdPreliminar = fObj.id
-                                NexusTransfer.fileIdAtivo.value = fObj.id
-                            }
-                        }
-                    } catch (_: Exception) {}
-
                     fun tentarEnvioSequencial(etapa: Int, historicoDiag: String) {
                         val (conteudo, diagAtual) = construirConteudoUploadTDLib(
                             inputFile = fileLocal,
@@ -3012,27 +3037,13 @@ fun enviarParaMensagensSalvas(
                         val req = TdApi.SendMessage().apply {
                             chatId = chatObj.id
                             inputMessageContent = conteudo
-                            for (sf in javaClass.declaredFields) {
-                                if (JavaModifier.isStatic(sf.modifiers)) continue
-                                sf.isAccessible = true
-                                try {
-                                    when {
-                                        sf.type.isAssignableFrom(conteudo.javaClass) -> sf.set(this, conteudo)
-                                        sf.type.isArray && sf.type.componentType?.isAssignableFrom(conteudo.javaClass) == true -> {
-                                            val arr = java.lang.reflect.Array.newInstance(sf.type.componentType!!, 1)
-                                            java.lang.reflect.Array.set(arr, 0, conteudo)
-                                            sf.set(this, arr)
-                                        }
-                                    }
-                                } catch (_: Exception) {}
-                            }
                         }
 
                         client.send(req) { msgObj ->
                             when (msgObj) {
                                 is TdApi.Message -> {
                                     val docResp = (msgObj.content as? TdApi.MessageDocument)?.document
-                                    val rId = docResp?.document?.id ?: fileIdPreliminar
+                                    val rId = docResp?.document?.id ?: 0
                                     val tId = docResp?.thumbnail?.file?.id ?: 0
                                     NexusTransfer.msgIdUploadAtivo = msgObj.id
                                     if (rId != 0) NexusTransfer.fileIdAtivo.value = rId
@@ -3042,7 +3053,7 @@ fun enviarParaMensagensSalvas(
                                         NexusThumbCache.salvarThumbIdNuvem(context, rId, tId)
                                     }
                                     val txt = if (pastaDestino.isNotBlank()) "Guardado na pasta '$pastaDestino'!" else "Guardado no cofre SSD de $usuarioAtivo!"
-                                    onResult(true, rId, txt)
+                                    onResult(true, rId, chatObj.id, msgObj.id, txt)
                                 }
                                 is TdApi.Error -> {
                                     val novoHist = if (historicoDiag.isBlank()) diagAtual else "$historicoDiag -> $diagAtual"
@@ -3053,19 +3064,21 @@ fun enviarParaMensagensSalvas(
                                         onResult(
                                             false,
                                             0,
-                                            "Erro SSD (${msgObj.code}): ${msgObj.message}\n[$novoHist | Prelim=$fileIdPreliminar]\n\n$infoSo"
+                                            0L,
+                                            0L,
+                                            "Erro SSD (${msgObj.code}): ${msgObj.message}\n[$novoHist]\n\n$infoSo"
                                         )
                                     }
                                 }
-                                else -> onResult(true, fileIdPreliminar, "Upload SSD iniciado!")
+                                else -> onResult(true, 0, chatObj.id, 0L, "Upload SSD iniciado!")
                             }
                         }
                     }
 
                     tentarEnvioSequencial(0, "")
-                } else if (chatObj is TdApi.Error) onResult(false, 0, "Erro cofre SSD: ${chatObj.message}")
+                } else if (chatObj is TdApi.Error) onResult(false, 0, 0L, 0L, "Erro cofre SSD: ${chatObj.message}")
             }
-        } else if (meObj is TdApi.Error) onResult(false, 0, "Erro sessão SSD: ${meObj.message}")
+        } else if (meObj is TdApi.Error) onResult(false, 0, 0L, 0L, "Erro sessão SSD: ${meObj.message}")
     }
 }
 
@@ -3362,6 +3375,14 @@ fun GrelhaArquivos(
 }
 // === FIM DA PARTE 1 (ENVIE "parte 2" PARA RECEBER O RESTANTE DO CÓDIGO) ===
 // === CONTINUAÇÃO: PARTE 2 DE 2 (COLE LOGO ABAIXO DA PARTE 1) ===
+
+private data class ResultadoEnvioSSD(
+    val ok: Boolean,
+    val fileId: Int,
+    val chatId: Long,
+    val messageId: Long,
+    val mensagem: String
+)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -3676,7 +3697,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Upload com BARRA ÚNICA, cancelamento imediato pelo botão "X" e feedback real da TDLib
+    // Upload com BARRA ÚNICA, cancelamento imediato pelo botão "X" e confirmação real no servidor
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
@@ -3730,35 +3751,44 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         NexusTransfer.progress.value = 40
                         NexusTransfer.label.value = "Enviando para nuvem SSD $loteTag'$nome'..."
 
-                        val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, msg ->
-                            deferred.complete(Triple(ok, rId, msg))
+                        val deferred = CompletableDeferred<ResultadoEnvioSSD>()
+                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, cId, mId, msg ->
+                            deferred.complete(ResultadoEnvioSSD(ok, rId, cId, mId, msg))
                         }
-                        val (ok, rId, msg) = deferred.await()
+                        val res = deferred.await()
 
                         if (NexusTransfer.cancelado.value) {
                             arqTemp.delete()
                             break
                         }
 
-                        if (!ok) {
+                        if (!res.ok) {
                             arqTemp.delete()
-                            cloudBannerText = msg
-                            erroUploadDetalhado = msg
+                            cloudBannerText = res.mensagem
+                            erroUploadDetalhado = res.mensagem
                             continue
                         }
 
-                        val concluiuRede = if (rId != 0) {
-                            aguardarUploadTDLibComPausa(client, rId, nome, loteTag)
-                        } else true
+                        val (concluiuRede, erroRede) = aguardarUploadTDLibComPausa(
+                            client = client,
+                            fileId = res.fileId,
+                            nomeArquivo = nome,
+                            loteTag = loteTag,
+                            chatId = res.chatId,
+                            messageId = res.messageId
+                        )
 
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
-                            cloudBannerText = "Envio de '$nome' cancelado."
+                            val motivo = if (NexusTransfer.cancelado.value) "Envio de '$nome' cancelado." else erroRede
+                            cloudBannerText = motivo
+                            if (!NexusTransfer.cancelado.value && erroRede.isNotBlank() && erroRede != "OK") {
+                                erroUploadDetalhado = erroRede
+                            }
                             break
                         }
 
-                        cloudBannerText = msg
+                        cloudBannerText = res.mensagem
                         enviados++
                         val ts = System.currentTimeMillis() + index
                         salvarDonoFicheiro(context, ts, activeVaultUser)
@@ -3776,7 +3806,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                         vm.salvarArquivo(
                             ArquivoNuvem(
-                                fileId = rId,
+                                fileId = res.fileId,
                                 nomeArquivo = nome,
                                 tamanhoBytes = tamFinal,
                                 dataUpload = ts,
@@ -3807,7 +3837,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Sincronização de novos arquivos com BARRA ÚNICA, cancelamento no "X" e feedback real da TDLib
+    // Sincronização de novos arquivos com BARRA ÚNICA, cancelamento no "X" e confirmação real no servidor
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
@@ -3859,35 +3889,44 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
                         marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
 
-                        val deferred = CompletableDeferred<Triple<Boolean, Int, String>>()
-                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, msg ->
-                            deferred.complete(Triple(ok, rId, msg))
+                        val deferred = CompletableDeferred<ResultadoEnvioSSD>()
+                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, cId, mId, msg ->
+                            deferred.complete(ResultadoEnvioSSD(ok, rId, cId, mId, msg))
                         }
-                        val (ok, rId, msg) = deferred.await()
+                        val res = deferred.await()
 
                         if (NexusTransfer.cancelado.value) {
                             arqTemp.delete()
                             break
                         }
 
-                        if (!ok) {
+                        if (!res.ok) {
                             arqTemp.delete()
-                            cloudBannerText = msg
-                            erroUploadDetalhado = msg
+                            cloudBannerText = res.mensagem
+                            erroUploadDetalhado = res.mensagem
                             continue
                         }
 
-                        val concluiuRede = if (rId != 0) {
-                            aguardarUploadTDLibComPausa(client, rId, nomeLimpo, loteTag)
-                        } else true
+                        val (concluiuRede, erroRede) = aguardarUploadTDLibComPausa(
+                            client = client,
+                            fileId = res.fileId,
+                            nomeArquivo = nomeLimpo,
+                            loteTag = loteTag,
+                            chatId = res.chatId,
+                            messageId = res.messageId
+                        )
 
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
-                            cloudBannerText = "Sincronização cancelada."
+                            val motivo = if (NexusTransfer.cancelado.value) "Sincronização cancelada." else erroRede
+                            cloudBannerText = motivo
+                            if (!NexusTransfer.cancelado.value && erroRede.isNotBlank() && erroRede != "OK") {
+                                erroUploadDetalhado = erroRede
+                            }
                             break
                         }
 
-                        cloudBannerText = msg
+                        cloudBannerText = res.mensagem
                         enviados++
                         val ts = System.currentTimeMillis() + index
                         salvarDonoFicheiro(context, ts, activeVaultUser)
@@ -3905,7 +3944,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                         vm.salvarArquivo(
                             ArquivoNuvem(
-                                fileId = rId,
+                                fileId = res.fileId,
                                 nomeArquivo = nomeLimpo,
                                 tamanhoBytes = tamFinal,
                                 dataUpload = ts,
