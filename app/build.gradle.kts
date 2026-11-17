@@ -1,8 +1,56 @@
+import java.net.HttpURLConnection
+import java.net.URL
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("kotlin-kapt")
 }
+
+// Localiza automaticamente o commit estável da v1.8 no JitPack (anterior ao main-SNAPSHOT quebrado)
+fun resolverVersaoEstavelTdlib(): String {
+    try {
+        val apiUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/commits?per_page=10")
+        val conn = (apiUrl.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            setRequestProperty("Accept", "application/vnd.github.v3+json")
+            setRequestProperty("User-Agent", "Gradle-NexusCloud")
+            connectTimeout = 8000
+            readTimeout = 8000
+        }
+        if (conn.responseCode == 200) {
+            val json = conn.inputStream.bufferedReader().readText()
+            val shas = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{40})\"")
+                .findAll(json)
+                .map { it.groupValues[1] }
+                .distinct()
+                .toList()
+
+            println("TDLib commits encontrados no GitHub: $shas")
+
+            // Testa primeiro os commits anteriores ao último (onde TdApi.java e libtdjni.so estavam alinhados na v1.8)
+            val candidatos = if (shas.size > 1) shas.drop(1) + shas.first() else shas
+            for (sha in candidatos) {
+                val shaCurto = sha.take(10)
+                val pomUrl = URL("https://jitpack.io/com/github/capullo-tech/lib-tdlib-android/$shaCurto/lib-tdlib-android-$shaCurto.pom")
+                val pomConn = (pomUrl.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "HEAD"
+                    connectTimeout = 6000
+                    readTimeout = 6000
+                }
+                if (pomConn.responseCode == 200) {
+                    println("TDLib versão estável selecionada no JitPack: $shaCurto")
+                    return shaCurto
+                }
+            }
+        }
+    } catch (e: Exception) {
+        println("Aviso ao consultar commits da TDLib: ${e.message}")
+    }
+    return "main-SNAPSHOT"
+}
+
+val tdlibVersion = resolverVersaoEstavelTdlib()
 
 android {
     namespace = "com.seu.nexuscloud"
@@ -52,9 +100,13 @@ android {
 }
 
 configurations.all {
-    resolutionStrategy.eachDependency {
-        if (requested.group == "org.jetbrains.kotlin") {
-            useVersion("1.9.22")
+    resolutionStrategy {
+        cacheDynamicVersionsFor(0, "seconds")
+        cacheChangingModulesFor(0, "seconds")
+        eachDependency {
+            if (requested.group == "org.jetbrains.kotlin") {
+                useVersion("1.9.22")
+            }
         }
     }
 }
@@ -77,7 +129,7 @@ dependencies {
 
     implementation("io.coil-kt:coil-compose:2.6.0")
 
-    implementation("com.github.capullo-tech:lib-tdlib-android:main-SNAPSHOT") {
+    implementation("com.github.capullo-tech:lib-tdlib-android:$tdlibVersion") {
         exclude(group = "org.jetbrains.kotlin")
     }
 }
