@@ -770,7 +770,10 @@ suspend fun aguardarUploadTDLibComPausa(
                     when (val st = mObj.sendingState) {
                         null -> msgConfirmadaNoServidor = true
                         is TdApi.MessageSendingStateFailed -> {
-                            return Pair(false, "Falha no servidor SSD (${st.errorCode}): ${st.errorMessage}")
+                            val errObj = try { st.javaClass.getField("error").get(st) as? TdApi.Error } catch (_: Throwable) { null }
+                            val code = errObj?.code ?: 0
+                            val msg = errObj?.message ?: st.toString()
+                            return Pair(false, "Falha no servidor SSD ($code): $msg")
                         }
                     }
                 }
