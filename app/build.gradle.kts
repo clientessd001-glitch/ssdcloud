@@ -1,13 +1,49 @@
 import java.net.HttpURLConnection
 import java.net.URL
 
+// Aumenta o timeout HTTP do Gradle para 3 minutos para evitar "Read timed out" no JitPack
+System.setProperty("org.gradle.internal.http.connectionTimeout", "180000")
+System.setProperty("org.gradle.internal.http.socketTimeout", "180000")
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("kotlin-kapt")
 }
 
-// Localiza na API do GitHub o commit estável da v1.8 onde TdApi.java e libtdjni.so estão pareados
+fun aquecerJitPack(shaCurto: String): Boolean {
+    val urls = listOf(
+        "https://jitpack.io/com/github/capullo-tech/lib-tdlib-android/$shaCurto/lib-tdlib-android-$shaCurto.pom",
+        "https://jitpack.io/com/github/capullo-tech/lib-tdlib-android/$shaCurto/lib-tdlib-android-$shaCurto.aar"
+    )
+    for (urlStr in urls) {
+        var ok = false
+        for (tentativa in 1..2) {
+            try {
+                println("Aguardando JitPack preparar $shaCurto (tentativa $tentativa)...")
+                val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "Gradle-NexusCloud")
+                    connectTimeout = 30000
+                    readTimeout = 180000
+                }
+                val code = conn.responseCode
+                if (code == 200) {
+                    conn.inputStream.use { it.read() }
+                    ok = true
+                    break
+                } else {
+                    println("JitPack respondeu HTTP $code para $urlStr")
+                }
+            } catch (e: Exception) {
+                println("Aviso JitPack ($shaCurto - tentativa $tentativa): ${e.message}")
+            }
+        }
+        if (!ok) return false
+    }
+    return true
+}
+
 fun resolverVersaoEstavelTdlib(): String {
     try {
         val apiUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/commits?per_page=15")
@@ -20,7 +56,6 @@ fun resolverVersaoEstavelTdlib(): String {
         }
         if (conn.responseCode == 200) {
             val json = conn.inputStream.bufferedReader().readText()
-            // Captura apenas SHAs de commits reais (seguidos por node_id), ignorando SHAs de tree
             val commitShas = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{40})\"\\s*,\\s*\"node_id\"")
                 .findAll(json)
                 .map { it.groupValues[1] }
@@ -29,16 +64,16 @@ fun resolverVersaoEstavelTdlib(): String {
 
             println("TDLib commits reais encontrados no GitHub: $commitShas")
 
-            // Verifica nos commits qual possui o TdApi.java compatível com o binário 89ebded9 (v1.8)
             for (sha in commitShas) {
+                val shaCurto = sha.take(10)
                 try {
                     val treeUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/git/trees/$sha?recursive=1")
                     val treeConn = (treeUrl.openConnection() as HttpURLConnection).apply {
                         requestMethod = "GET"
                         setRequestProperty("Accept", "application/vnd.github.v3+json")
                         setRequestProperty("User-Agent", "Gradle-NexusCloud")
-                        connectTimeout = 10000
-                        readTimeout = 10000
+                        connectTimeout = 15000
+                        readTimeout = 15000
                     }
                     if (treeConn.responseCode == 200) {
                         val treeJson = treeConn.inputStream.bufferedReader().readText()
@@ -50,35 +85,39 @@ fun resolverVersaoEstavelTdlib(): String {
                             val rawConn = (rawUrl.openConnection() as HttpURLConnection).apply {
                                 requestMethod = "GET"
                                 setRequestProperty("User-Agent", "Gradle-NexusCloud")
-                                connectTimeout = 10000
-                                readTimeout = 15000
+                                connectTimeout = 15000
+                                readTimeout = 60000
                             }
                             if (rawConn.responseCode == 200) {
-                                val conteudoTdApi = rawConn.inputStream.bufferedReader().use { r ->
-                                    val buf = CharArray(120000)
-                                    val lidos = r.read(buf)
-                                    if (lidos > 0) String(buf, 0, lidos) else ""
+                                var hashLinha = ""
+                                var temInputDocument = false
+                                rawConn.inputStream.bufferedReader().useLines { lines ->
+                                    for (line in lines) {
+                                        if (line.contains("COMMIT_HASH =")) {
+                                            hashLinha = line.trim()
+                                        }
+                                        if (line.contains("class InputDocument ")) {
+                                            temInputDocument = true
+                                        }
+                                    }
                                 }
-                                if (conteudoTdApi.contains("89ebded9571b7bb589ec1bd05e585fffa4c580e2") ||
-                                    (!conteudoTdApi.contains("class InputDocument ") && sha != commitShas.first())
-                                ) {
-                                    val escolhido = sha.take(10)
-                                    println("TDLib commit v1.8 compatível localizado: $escolhido")
-                                    return escolhido
+                                println("Commit $shaCurto -> $hashLinha | InputDocument=$temInputDocument")
+
+                                val ehCompativel = hashLinha.contains("89ebded9571b7bb589ec1bd05e585fffa4c580e2") ||
+                                    (!temInputDocument && sha != commitShas.first())
+
+                                if (ehCompativel) {
+                                    if (aquecerJitPack(shaCurto)) {
+                                        println("TDLib commit v1.8 pronto no JitPack: $shaCurto")
+                                        return shaCurto
+                                    }
                                 }
                             }
                         }
                     }
                 } catch (e: Exception) {
-                    println("Aviso ao inspecionar árvore do commit $sha: ${e.message}")
+                    println("Aviso ao inspecionar commit $shaCurto: ${e.message}")
                 }
-            }
-
-            // Se o repositório empacota binários pré-compilados sem TdApi.java aberto, usa o commit anterior ao atual
-            if (commitShas.size > 1) {
-                val commitAnterior = commitShas[1].take(10)
-                println("TDLib selecionando commit anterior ao main-SNAPSHOT: $commitAnterior")
-                return commitAnterior
             }
         }
     } catch (e: Exception) {
