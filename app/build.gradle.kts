@@ -7,43 +7,78 @@ plugins {
     id("kotlin-kapt")
 }
 
-// Localiza automaticamente o commit estável da v1.8 no JitPack (anterior ao main-SNAPSHOT quebrado)
+// Localiza na API do GitHub o commit estável da v1.8 onde TdApi.java e libtdjni.so estão pareados
 fun resolverVersaoEstavelTdlib(): String {
     try {
-        val apiUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/commits?per_page=10")
+        val apiUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/commits?per_page=15")
         val conn = (apiUrl.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             setRequestProperty("Accept", "application/vnd.github.v3+json")
             setRequestProperty("User-Agent", "Gradle-NexusCloud")
-            connectTimeout = 10000
-            readTimeout = 10000
+            connectTimeout = 15000
+            readTimeout = 15000
         }
         if (conn.responseCode == 200) {
             val json = conn.inputStream.bufferedReader().readText()
-            val shas = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{40})\"")
+            // Captura apenas SHAs de commits reais (seguidos por node_id), ignorando SHAs de tree
+            val commitShas = Regex("\"sha\"\\s*:\\s*\"([0-9a-f]{40})\"\\s*,\\s*\"node_id\"")
                 .findAll(json)
                 .map { it.groupValues[1] }
                 .distinct()
                 .toList()
 
-            println("TDLib commits encontrados no GitHub: $shas")
+            println("TDLib commits reais encontrados no GitHub: $commitShas")
 
-            // Testa primeiro os commits anteriores ao último (onde TdApi.java e libtdjni.so estavam alinhados na v1.8)
-            val candidatos = if (shas.size > 1) shas.drop(1) + shas.first() else shas
-            for (sha in candidatos) {
-                val shaCurto = sha.take(10)
-                val pomUrl = URL("https://jitpack.io/com/github/capullo-tech/lib-tdlib-android/$shaCurto/lib-tdlib-android-$shaCurto.pom")
-                val pomConn = (pomUrl.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    setRequestProperty("User-Agent", "Gradle-NexusCloud")
-                    connectTimeout = 10000
-                    readTimeout = 30000
+            // Verifica nos commits qual possui o TdApi.java compatível com o binário 89ebded9 (v1.8)
+            for (sha in commitShas) {
+                try {
+                    val treeUrl = URL("https://api.github.com/repos/capullo-tech/lib-tdlib-android/git/trees/$sha?recursive=1")
+                    val treeConn = (treeUrl.openConnection() as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        setRequestProperty("Accept", "application/vnd.github.v3+json")
+                        setRequestProperty("User-Agent", "Gradle-NexusCloud")
+                        connectTimeout = 10000
+                        readTimeout = 10000
+                    }
+                    if (treeConn.responseCode == 200) {
+                        val treeJson = treeConn.inputStream.bufferedReader().readText()
+                        val tdApiPath = Regex("\"path\"\\s*:\\s*\"([^\"]*TdApi\\.java)\"")
+                            .find(treeJson)?.groupValues?.get(1)
+
+                        if (tdApiPath != null) {
+                            val rawUrl = URL("https://raw.githubusercontent.com/capullo-tech/lib-tdlib-android/$sha/$tdApiPath")
+                            val rawConn = (rawUrl.openConnection() as HttpURLConnection).apply {
+                                requestMethod = "GET"
+                                setRequestProperty("User-Agent", "Gradle-NexusCloud")
+                                connectTimeout = 10000
+                                readTimeout = 15000
+                            }
+                            if (rawConn.responseCode == 200) {
+                                val conteudoTdApi = rawConn.inputStream.bufferedReader().use { r ->
+                                    val buf = CharArray(120000)
+                                    val lidos = r.read(buf)
+                                    if (lidos > 0) String(buf, 0, lidos) else ""
+                                }
+                                if (conteudoTdApi.contains("89ebded9571b7bb589ec1bd05e585fffa4c580e2") ||
+                                    (!conteudoTdApi.contains("class InputDocument ") && sha != commitShas.first())
+                                ) {
+                                    val escolhido = sha.take(10)
+                                    println("TDLib commit v1.8 compatível localizado: $escolhido")
+                                    return escolhido
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    println("Aviso ao inspecionar árvore do commit $sha: ${e.message}")
                 }
-                if (pomConn.responseCode == 200) {
-                    pomConn.inputStream.close()
-                    println("TDLib versão estável selecionada no JitPack: $shaCurto")
-                    return shaCurto
-                }
+            }
+
+            // Se o repositório empacota binários pré-compilados sem TdApi.java aberto, usa o commit anterior ao atual
+            if (commitShas.size > 1) {
+                val commitAnterior = commitShas[1].take(10)
+                println("TDLib selecionando commit anterior ao main-SNAPSHOT: $commitAnterior")
+                return commitAnterior
             }
         }
     } catch (e: Exception) {
