@@ -3402,10 +3402,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
 
-    // Perfis iniciam sempre ocultos (campos em branco) por privacidade
-    var activeVaultUser by remember { mutableStateOf("") }
+    // Recupera o último utilizador salvo para solicitar apenas o PIN ao reabrir a app
+    val ultimoUsuarioSalvo = remember { obterUltimoUsuarioCofre(context) }
+    var activeVaultUser by remember { mutableStateOf(ultimoUsuarioSalvo) }
     var vaultUnlocked by remember { mutableStateOf(false) }
-    var isSwitchingUser by remember { mutableStateOf(true) }
+    var isSwitchingUser by remember { mutableStateOf(ultimoUsuarioSalvo.isBlank()) }
     var isCreatingNewVault by remember { mutableStateOf(false) }
     var vaultNameInput by remember { mutableStateOf("") }
     var vaultPinInput by remember { mutableStateOf("") }
@@ -4012,8 +4013,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
-    // 2. ECRÃ DE COFRE INDIVIDUAL POR ETIQUETA DE PERFIL + PIN (PERFIS OCULTOS POR PRIVACIDADE)
+    // 2. ECRÃ DE COFRE: PEDE APENAS O PIN QUANDO JÁ HÁ UTILIZADOR SALVO NO APARELHO
     if (!vaultUnlocked) {
+        val pedirApenasPin = activeVaultUser.isNotBlank() && !isSwitchingUser
+
         Column(
             modifier = Modifier.fillMaxSize().background(BgBlack).padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -4043,136 +4046,243 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
 
-                    Spacer(Modifier.height(12.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
-                            colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                        Button(
-                            onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
-                            colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    Spacer(Modifier.height(14.dp))
-                    Text(
-                        if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros na nuvem SSD."
-                        else "Digite o seu Nome e PIN para restaurar e abrir o seu cofre privado na nuvem SSD.",
-                        color = TextGrey,
-                        fontSize = 12.sp,
-                        textAlign = TextAlign.Center
-                    )
-
-                    Spacer(Modifier.height(16.dp))
-                    OutlinedTextField(
-                        value = vaultNameInput,
-                        onValueChange = { vaultNameInput = it },
-                        label = { Text("Nome do Utilizador", color = TextGrey) },
-                        singleLine = true,
-                        leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = Gold,
-                            unfocusedBorderColor = Color.Gray
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    Spacer(Modifier.height(12.dp))
-                    OutlinedTextField(
-                        value = vaultPinInput,
-                        onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
-                        label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
-                        singleLine = true,
-                        leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
-                        visualTransformation = PasswordVisualTransformation('*'),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = Gold,
-                            unfocusedBorderColor = Color.Gray
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-
-                    if (vaultErrorMsg != null) {
+                    if (pedirApenasPin) {
+                        Spacer(Modifier.height(16.dp))
                         Text(
-                            vaultErrorMsg!!,
-                            color = DangerRed,
+                            "Digite o seu PIN para desbloquear o cofre:",
+                            color = TextGrey,
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(top = 10.dp)
+                            textAlign = TextAlign.Center
                         )
-                    }
 
-                    Spacer(Modifier.height(20.dp))
-                    Button(
-                        onClick = {
-                            vaultErrorMsg = null
-                            val nomeLimpo = vaultNameInput.trim()
-                            val pinLimpo = vaultPinInput.trim()
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN do Cofre", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
+                            visualTransformation = PasswordVisualTransformation('*'),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
 
-                            if (nomeLimpo.length < 3) {
-                                vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
-                                return@Button
-                            }
-                            if (pinLimpo.length < 4) {
-                                vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
-                                return@Button
-                            }
+                        if (vaultErrorMsg != null) {
+                            Text(
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
+                            )
+                        }
 
-                            val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
-                            if (pinLocalExistente != null && pinLocalExistente == pinLimpo) {
-                                salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo)
-                                activeVaultUser = nomeLimpo
-                                isSwitchingUser = false
-                                vaultNameInput = ""
-                                vaultPinInput = ""
-                                vaultUnlocked = true
-                                Toast.makeText(context, "Cofre '$nomeLimpo' desbloqueado!", Toast.LENGTH_SHORT).show()
-                                return@Button
-                            }
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val pinLimpo = vaultPinInput.trim()
+                                if (pinLimpo.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
 
-                            isCheckingVault = true
-                            verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
-                                scope.launch(Dispatchers.Main) {
-                                    isCheckingVault = false
-                                    if (ok) {
-                                        salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
-                                        activeVaultUser = nomeConfirmado
-                                        isSwitchingUser = false
-                                        vaultNameInput = ""
-                                        vaultPinInput = ""
-                                        vaultUnlocked = true
-                                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
-                                    } else {
-                                        vaultErrorMsg = msg
+                                val pinLocal = obterPinCofreLocal(context, activeVaultUser)
+                                if (pinLocal != null && pinLocal == pinLimpo) {
+                                    salvarCredenciaisCofreLocal(context, activeVaultUser, pinLimpo)
+                                    vaultPinInput = ""
+                                    vaultUnlocked = true
+                                } else {
+                                    isCheckingVault = true
+                                    verificarOuRegistarCofreNuvem(client, activeVaultUser, pinLimpo, false) { ok, nomeConfirmado, _ ->
+                                        scope.launch(Dispatchers.Main) {
+                                            isCheckingVault = false
+                                            if (ok) {
+                                                salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
+                                                activeVaultUser = nomeConfirmado
+                                                vaultPinInput = ""
+                                                vaultUnlocked = true
+                                            } else {
+                                                vaultErrorMsg = "PIN incorreto."
+                                            }
+                                        }
                                     }
                                 }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text("DESBLOQUEAR COFRE", color = Color.White, fontWeight = FontWeight.Bold)
                             }
-                        },
-                        enabled = !isCheckingVault,
-                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                        modifier = Modifier.fillMaxWidth().height(52.dp)
-                    ) {
-                        if (isCheckingVault) {
-                            CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                        } else {
+                        }
+
+                        Spacer(Modifier.height(12.dp))
+                        TextButton(
+                            onClick = {
+                                vaultErrorMsg = null
+                                vaultPinInput = ""
+                                vaultNameInput = ""
+                                isSwitchingUser = true
+                            }
+                        ) {
+                            Text("Entrar com outro utilizador / Criar Cofre", color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    } else {
+                        Spacer(Modifier.height(12.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { isCreatingNewVault = false; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (!isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("JÁ TENHO COFRE", color = if (!isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                            Button(
+                                onClick = { isCreatingNewVault = true; vaultErrorMsg = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = if (isCreatingNewVault) Gold else SurfaceDark),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("CRIAR COFRE", color = if (isCreatingNewVault) BgBlack else TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
+
+                        Spacer(Modifier.height(14.dp))
+                        Text(
+                            if (isCreatingNewVault) "Escolha um Nome único e um PIN de 4 dígitos para isolar os seus ficheiros na nuvem SSD."
+                            else "Digite o seu Nome e PIN para restaurar e abrir o seu cofre privado na nuvem SSD.",
+                            color = TextGrey,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center
+                        )
+
+                        Spacer(Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = vaultNameInput,
+                            onValueChange = { vaultNameInput = it },
+                            label = { Text("Nome do Utilizador", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Person, null, tint = Gold) },
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = vaultPinInput,
+                            onValueChange = { if (it.length <= 6) vaultPinInput = it.filter { ch -> ch.isDigit() } },
+                            label = { Text("PIN (4 a 6 dígitos)", color = TextGrey) },
+                            singleLine = true,
+                            leadingIcon = { Icon(Icons.Default.Lock, null, tint = Gold) },
+                            visualTransformation = PasswordVisualTransformation('*'),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Gold,
+                                unfocusedBorderColor = Color.Gray
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        if (vaultErrorMsg != null) {
                             Text(
-                                if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
-                                color = Color.White,
-                                fontWeight = FontWeight.Bold
+                                vaultErrorMsg!!,
+                                color = DangerRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 10.dp)
                             )
+                        }
+
+                        Spacer(Modifier.height(20.dp))
+                        Button(
+                            onClick = {
+                                vaultErrorMsg = null
+                                val nomeLimpo = vaultNameInput.trim()
+                                val pinLimpo = vaultPinInput.trim()
+
+                                if (nomeLimpo.length < 3) {
+                                    vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
+                                    return@Button
+                                }
+                                if (pinLimpo.length < 4) {
+                                    vaultErrorMsg = "O PIN deve ter pelo menos 4 dígitos."
+                                    return@Button
+                                }
+
+                                val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
+                                if (pinLocalExistente != null && pinLocalExistente == pinLimpo) {
+                                    salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo)
+                                    activeVaultUser = nomeLimpo
+                                    isSwitchingUser = false
+                                    vaultNameInput = ""
+                                    vaultPinInput = ""
+                                    vaultUnlocked = true
+                                    Toast.makeText(context, "Cofre '$nomeLimpo' desbloqueado!", Toast.LENGTH_SHORT).show()
+                                    return@Button
+                                }
+
+                                isCheckingVault = true
+                                verificarOuRegistarCofreNuvem(client, nomeLimpo, pinLimpo, isCreatingNewVault) { ok, nomeConfirmado, msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        isCheckingVault = false
+                                        if (ok) {
+                                            salvarCredenciaisCofreLocal(context, nomeConfirmado, pinLimpo)
+                                            activeVaultUser = nomeConfirmado
+                                            isSwitchingUser = false
+                                            vaultNameInput = ""
+                                            vaultPinInput = ""
+                                            vaultUnlocked = true
+                                            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        } else {
+                                            vaultErrorMsg = msg
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !isCheckingVault,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.fillMaxWidth().height(52.dp)
+                        ) {
+                            if (isCheckingVault) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
+                            } else {
+                                Text(
+                                    if (isCreatingNewVault) "CRIAR E ABRIR COFRE" else "ENTRAR E RESTAURAR COFRE",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+
+                        if (activeVaultUser.isNotBlank()) {
+                            Spacer(Modifier.height(10.dp))
+                            TextButton(
+                                onClick = {
+                                    vaultErrorMsg = null
+                                    vaultPinInput = ""
+                                    isSwitchingUser = false
+                                }
+                            ) {
+                                Text("Voltar para desbloqueio apenas com PIN", color = TextGrey, fontSize = 12.sp)
+                            }
                         }
                     }
                 }
@@ -5489,11 +5599,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         pastaAberta = null
                         selectedFileIds = emptySet()
                         isSelectionMode = false
-                        activeVaultUser = ""
                         vaultNameInput = ""
                         vaultPinInput = ""
                         vaultErrorMsg = null
-                        isSwitchingUser = true
+                        isSwitchingUser = false
                         vaultUnlocked = false
                     },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
@@ -5584,11 +5693,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     isUploading = false
                                     selectedFileIds = emptySet()
                                     isSelectionMode = false
-                                    activeVaultUser = ""
                                     vaultNameInput = ""
                                     vaultPinInput = ""
                                     vaultErrorMsg = null
-                                    isSwitchingUser = true
+                                    isSwitchingUser = false
                                     vaultUnlocked = false
                                 }) {
                                     Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
