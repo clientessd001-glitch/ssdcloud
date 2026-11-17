@@ -74,6 +74,7 @@ import java.util.Calendar
 import java.util.Collections
 import java.util.Date
 import java.util.Locale
+import java.util.zip.CRC32
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -2811,36 +2812,48 @@ fun copiarLoteParaDownloads(
     }
 }
 
-// Altera em memória o campo estático final CONSTRUCTOR de uma classe TdApi
-fun forcarConstructorIdTdApi(clazz: Class<*>, novoId: Int): Int {
+// Calcula o CRC32 TL oficial da TDLib para alinhar o método virtual getConstructor()
+fun crc32Tl(esquema: String): Int {
+    val crc = CRC32()
+    crc.update(esquema.toByteArray(Charsets.UTF_8))
+    return crc.value.toInt()
+}
+
+// Extrai diretamente do binário nativo libtdjni.so as assinaturas JNI que o C++ procura
+fun inspecionarAssinaturasNativasSo(context: Context): String {
     return try {
-        val field = clazz.getDeclaredField("CONSTRUCTOR")
-        field.isAccessible = true
-        val original = field.getInt(null)
-        try {
-            val accessFlagsField = java.lang.reflect.Field::class.java.getDeclaredField("accessFlags")
-            accessFlagsField.isAccessible = true
-            accessFlagsField.setInt(field, field.modifiers and JavaModifier.FINAL.inv())
-            field.setInt(null, novoId)
-        } catch (_: Throwable) {
-            val unsafeClass = Class.forName("sun.misc.Unsafe")
-            val theUnsafeField = unsafeClass.getDeclaredField("theUnsafe")
-            theUnsafeField.isAccessible = true
-            val unsafe = theUnsafeField.get(null)
-            val mStaticOffset = unsafeClass.getDeclaredMethod("staticFieldOffset", java.lang.reflect.Field::class.java)
-            val mStaticBase = unsafeClass.getDeclaredMethod("staticFieldBase", java.lang.reflect.Field::class.java)
-            val mPutInt = unsafeClass.getDeclaredMethod("putInt", Any::class.java, Long::class.javaPrimitiveType, Int::class.javaPrimitiveType)
-            val offset = (mStaticOffset.invoke(unsafe, field) as Number).toLong()
-            val base = mStaticBase.invoke(unsafe, field) ?: clazz
-            mPutInt.invoke(unsafe, base, offset, novoId)
+        val soFile = File(context.applicationInfo.nativeLibraryDir, "libtdjni.so")
+        if (!soFile.exists()) return "so_nao_encontrado"
+        val bytes = soFile.readBytes()
+        val ascii = String(bytes, Charsets.ISO_8859_1)
+
+        fun extrairVizinhanca(termo: String): String {
+            val idx = ascii.indexOf(termo)
+            if (idx == -1) return "$termo:ausente"
+            val ini = (idx - 120).coerceAtLeast(0)
+            val fim = (idx + 260).coerceAtMost(ascii.length)
+            val trecho = ascii.substring(ini, fim)
+            val limpo = Regex("[A-Za-z0-9_\\$/.;]{3,}").findAll(trecho).map { it.value }.toList()
+            return "$termo->${limpo.joinToString(",")}"
         }
-        original
-    } catch (_: Throwable) {
-        0
+
+        val camposSendJava = TdApi.SendMessage::class.java.declaredFields
+            .filter { !JavaModifier.isStatic(it.modifiers) }
+            .joinToString(",") { "${it.name}:${it.type.simpleName}" }
+
+        val camposDocJava = TdApi.InputMessageDocument::class.java.declaredFields
+            .filter { !JavaModifier.isStatic(it.modifiers) }
+            .joinToString(",") { "${it.name}:${it.type.simpleName}" }
+
+        "JavaSend[$camposSendJava] | JavaDoc[$camposDocJava] | " +
+            extrairVizinhanca("TdApi\$SendMessage") + " | " +
+            extrairVizinhanca("TdApi\$InputMessageDocument")
+    } catch (e: Throwable) {
+        "ErroScanSo:${e.message}"
     }
 }
 
-// Preenche qualquer wrapper de mídia da TdApi (InputDocument, InputPhoto, InputVideo, InputAudio) com o InputFile
+// Preenche qualquer wrapper de mídia da TdApi com o InputFile
 fun criarInstanciaWrapperMidia(wrapperClass: Class<*>, inputFile: TdApi.InputFile, nomeLimpo: String): Any? {
     for (ctor in wrapperClass.constructors) {
         val params = ctor.parameterTypes
@@ -2885,109 +2898,47 @@ fun criarInstanciaWrapperMidia(wrapperClass: Class<*>, inputFile: TdApi.InputFil
     }
 }
 
-// === CONSTRUTOR DINÂMICO COMPATÍVEL COM O JNI NATIVO DA TDLIB ===
+// === CONSTRUTOR DINÂMICO COM OVERRIDE REAL DE GETCONSTRUCTOR() ===
 fun construirConteudoUploadTDLib(
     inputFile: TdApi.InputFile,
     nomeLimpo: String,
     legenda: TdApi.FormattedText,
     modoTentativa: Int = 0
 ): Pair<TdApi.InputMessageContent, String> {
-    val diag = StringBuilder()
+    val idsClassicosDoc = intArrayOf(
+        TdApi.InputMessageDocument.CONSTRUCTOR,
+        crc32Tl("inputMessageDocument document:InputFile thumbnail:InputThumbnail disable_content_type_detection:Bool caption:FormattedText = InputMessageContent"),
+        crc32Tl("inputMessageDocument document:InputFile thumbnail:InputThumbnail disable_content_type_detection:Bool caption:FormattedText show_caption_above_media:Bool = InputMessageContent"),
+        crc32Tl("inputMessageDocument document:InputFile thumbnail:InputThumbnail caption:FormattedText = InputMessageContent"),
+        742562196,
+        -1497438798
+    )
 
-    // Tentativa 2: InputMessageAudio (assinatura estável em várias versões TDLib 1.8)
-    if (modoTentativa == 2) {
-        return try {
-            val audio = TdApi.InputMessageAudio()
-            for (f in audio.javaClass.declaredFields) {
-                if (JavaModifier.isStatic(f.modifiers)) continue
-                f.isAccessible = true
-                when {
-                    f.type.isAssignableFrom(inputFile.javaClass) -> f.set(audio, inputFile)
-                    f.name == "audio" && !f.type.isAssignableFrom(inputFile.javaClass) -> {
-                        f.set(audio, criarInstanciaWrapperMidia(f.type, inputFile, nomeLimpo))
-                    }
-                    f.type.isAssignableFrom(legenda.javaClass) -> f.set(audio, legenda)
-                    f.name == "title" && f.type == String::class.java -> f.set(audio, nomeLimpo)
-                    f.name == "performer" && f.type == String::class.java -> f.set(audio, "Nexus Cloud")
-                    f.type == String::class.java && f.get(audio) == null -> f.set(audio, "")
-                }
-            }
-            Pair(audio, "ModoAudio")
-        } catch (e: Exception) {
-            Pair(TdApi.InputMessageDocument(), "ErrAudio:${e.message}")
-        }
+    val idEscolhido = idsClassicosDoc[modoTentativa.coerceIn(0, idsClassicosDoc.lastIndex)]
+
+    val doc = object : TdApi.InputMessageDocument() {
+        override fun getConstructor(): Int = idEscolhido
     }
 
-    // Tentativa 1: InputMessagePhoto / InputMessageVideo com suporte a InputPhoto / InputVideo wrapper
-    if (modoTentativa == 1 && (ehArquivoImagem(nomeLimpo) || ehArquivoVideo(nomeLimpo))) {
-        if (ehArquivoImagem(nomeLimpo)) {
-            val photoContent = TdApi.InputMessagePhoto()
-            for (f in photoContent.javaClass.declaredFields) {
-                if (JavaModifier.isStatic(f.modifiers)) continue
-                f.isAccessible = true
-                try {
-                    when {
-                        f.type.isAssignableFrom(inputFile.javaClass) -> f.set(photoContent, inputFile)
-                        f.name == "photo" && !f.type.isAssignableFrom(inputFile.javaClass) -> {
-                            f.set(photoContent, criarInstanciaWrapperMidia(f.type, inputFile, nomeLimpo))
-                        }
-                        f.type.isAssignableFrom(legenda.javaClass) -> f.set(photoContent, legenda)
-                        f.type == IntArray::class.java -> f.set(photoContent, IntArray(0))
-                        f.type == Int::class.javaPrimitiveType -> f.setInt(photoContent, 0)
-                        f.type == Boolean::class.javaPrimitiveType -> f.setBoolean(photoContent, false)
-                    }
-                } catch (_: Exception) {}
-            }
-            return Pair(photoContent, "ModoPhotoFull")
-        } else {
-            val videoContent = TdApi.InputMessageVideo()
-            for (f in videoContent.javaClass.declaredFields) {
-                if (JavaModifier.isStatic(f.modifiers)) continue
-                f.isAccessible = true
-                try {
-                    when {
-                        f.type.isAssignableFrom(inputFile.javaClass) -> f.set(videoContent, inputFile)
-                        f.name == "video" && !f.type.isAssignableFrom(inputFile.javaClass) -> {
-                            f.set(videoContent, criarInstanciaWrapperMidia(f.type, inputFile, nomeLimpo))
-                        }
-                        f.type.isAssignableFrom(legenda.javaClass) -> f.set(videoContent, legenda)
-                        f.type == IntArray::class.java -> f.set(videoContent, IntArray(0))
-                        f.name == "supportsStreaming" -> f.setBoolean(videoContent, true)
-                        f.type == Int::class.javaPrimitiveType -> f.setInt(videoContent, 0)
-                        f.type == Boolean::class.javaPrimitiveType -> f.setBoolean(videoContent, false)
-                    }
-                } catch (_: Exception) {}
-            }
-            return Pair(videoContent, "ModoVideoFull")
-        }
-    }
-
-    // Tentativa 0 (Padrão): InputMessageDocument
-    val doc = TdApi.InputMessageDocument()
-    for (f in doc.javaClass.declaredFields) {
+    for (f in TdApi.InputMessageDocument::class.java.declaredFields) {
         if (JavaModifier.isStatic(f.modifiers)) continue
         f.isAccessible = true
         try {
             when {
                 f.type.isAssignableFrom(legenda.javaClass) -> f.set(doc, legenda)
-                f.type.isAssignableFrom(inputFile.javaClass) -> {
-                    f.set(doc, inputFile)
-                    diag.append("DirectFile ")
-                }
+                f.type.isAssignableFrom(inputFile.javaClass) -> f.set(doc, inputFile)
                 f.name == "document" -> {
                     val inst = criarInstanciaWrapperMidia(f.type, inputFile, nomeLimpo)
                     f.set(doc, inst)
-                    diag.append("Ctor3OK ")
                 }
             }
-        } catch (e: Exception) {
-            diag.append("[Err:${e.message}] ")
-        }
+        } catch (_: Exception) {}
     }
-    return Pair(doc, diag.toString().trim())
+
+    return Pair(doc, "DocCtor($idEscolhido)")
 }
 
-// === ENVIO PARA MENSAGENS SALVAS (COM PRÉ-UPLOAD NATIVO + FALLBACK MULTI-FORMATO) ===
+// === ENVIO PARA MENSAGENS SALVAS ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -3031,7 +2982,6 @@ fun enviarParaMensagensSalvas(
                     val leg = TdApi.FormattedText(textoCompletoLegenda, emptyArray())
                     val fileLocal = TdApi.InputFileLocal(caminhoLocal)
 
-                    // Inicia PreliminaryUploadFile em paralelo para garantir que o motor C++ registe o arquivo
                     var fileIdPreliminar = 0
                     try {
                         val prelimReq = TdApi.PreliminaryUploadFile().apply {
@@ -3046,25 +2996,9 @@ fun enviarParaMensagensSalvas(
                         }
                     } catch (_: Exception) {}
 
-                    fun extrairIdsDaMensagem(msgObj: TdApi.Message): Pair<Int, Int> {
-                        return when (val c = msgObj.content) {
-                            is TdApi.MessageDocument -> Pair(c.document?.document?.id ?: 0, c.document?.thumbnail?.file?.id ?: 0)
-                            is TdApi.MessagePhoto -> Pair(c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }?.photo?.id ?: 0, 0)
-                            is TdApi.MessageVideo -> Pair(c.video?.video?.id ?: 0, c.video?.thumbnail?.file?.id ?: 0)
-                            is TdApi.MessageAudio -> Pair(c.audio?.audio?.id ?: 0, c.audio?.albumCoverThumbnail?.file?.id ?: 0)
-                            else -> Pair(fileIdPreliminar, 0)
-                        }
-                    }
-
                     fun tentarEnvioSequencial(etapa: Int, historicoDiag: String) {
-                        val inputFileUsado: TdApi.InputFile = if (fileIdPreliminar != 0 && etapa >= 2) {
-                            TdApi.InputFileId(fileIdPreliminar)
-                        } else {
-                            fileLocal
-                        }
-
                         val (conteudo, diagAtual) = construirConteudoUploadTDLib(
-                            inputFile = inputFileUsado,
+                            inputFile = fileLocal,
                             nomeLimpo = nomeLimpo,
                             legenda = leg,
                             modoTentativa = etapa
@@ -3073,25 +3007,30 @@ fun enviarParaMensagensSalvas(
                         val req = TdApi.SendMessage().apply {
                             chatId = chatObj.id
                             inputMessageContent = conteudo
+                            for (sf in javaClass.declaredFields) {
+                                if (JavaModifier.isStatic(sf.modifiers)) continue
+                                sf.isAccessible = true
+                                try {
+                                    when {
+                                        sf.type.isAssignableFrom(conteudo.javaClass) -> sf.set(this, conteudo)
+                                        sf.type.isArray && sf.type.componentType?.isAssignableFrom(conteudo.javaClass) == true -> {
+                                            val arr = java.lang.reflect.Array.newInstance(sf.type.componentType!!, 1)
+                                            java.lang.reflect.Array.set(arr, 0, conteudo)
+                                            sf.set(this, arr)
+                                        }
+                                    }
+                                } catch (_: Exception) {}
+                            }
                         }
 
                         client.send(req) { msgObj ->
                             when (msgObj) {
                                 is TdApi.Message -> {
-                                    val (rIdBruto, tId) = extrairIdsDaMensagem(msgObj)
-                                    val rId = if (rIdBruto != 0) rIdBruto else fileIdPreliminar
+                                    val docResp = (msgObj.content as? TdApi.MessageDocument)?.document
+                                    val rId = docResp?.document?.id ?: fileIdPreliminar
+                                    val tId = docResp?.thumbnail?.file?.id ?: 0
                                     NexusTransfer.msgIdUploadAtivo = msgObj.id
                                     if (rId != 0) NexusTransfer.fileIdAtivo.value = rId
-
-                                    if (NexusTransfer.cancelado.value) {
-                                        client.send(TdApi.DeleteMessages().apply {
-                                            this.chatId = chatObj.id
-                                            this.messageIds = longArrayOf(msgObj.id)
-                                            this.revoke = true
-                                        }) {}
-                                        onResult(false, 0, "Envio cancelado.")
-                                        return@send
-                                    }
 
                                     registarMensagemSincronizada(context, usuarioAtivo, msgObj.id)
                                     if (rId != 0 && tId != 0) {
@@ -3102,16 +3041,14 @@ fun enviarParaMensagensSalvas(
                                 }
                                 is TdApi.Error -> {
                                     val novoHist = if (historicoDiag.isBlank()) diagAtual else "$historicoDiag -> $diagAtual"
-                                    if (etapa < 2) {
+                                    if (etapa < 5) {
                                         tentarEnvioSequencial(etapa + 1, novoHist)
                                     } else {
-                                        val ctorDoc = try { TdApi.InputMessageDocument.CONSTRUCTOR } catch (_: Throwable) { 0 }
-                                        val ctorPhoto = try { TdApi.InputMessagePhoto.CONSTRUCTOR } catch (_: Throwable) { 0 }
-                                        val ctorAudio = try { TdApi.InputMessageAudio.CONSTRUCTOR } catch (_: Throwable) { 0 }
+                                        val infoSo = inspecionarAssinaturasNativasSo(context)
                                         onResult(
                                             false,
                                             0,
-                                            "Erro SSD (${msgObj.code}): ${msgObj.message}\n[$novoHist | PrelimID=$fileIdPreliminar | Ctors: Doc=$ctorDoc, Photo=$ctorPhoto, Audio=$ctorAudio]"
+                                            "Erro SSD (${msgObj.code}): ${msgObj.message}\n[$novoHist | Prelim=$fileIdPreliminar]\n\n$infoSo"
                                         )
                                     }
                                 }
