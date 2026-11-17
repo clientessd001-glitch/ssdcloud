@@ -15,8 +15,8 @@ fun resolverVersaoEstavelTdlib(): String {
             requestMethod = "GET"
             setRequestProperty("Accept", "application/vnd.github.v3+json")
             setRequestProperty("User-Agent", "Gradle-NexusCloud")
-            connectTimeout = 8000
-            readTimeout = 8000
+            connectTimeout = 10000
+            readTimeout = 10000
         }
         if (conn.responseCode == 200) {
             val json = conn.inputStream.bufferedReader().readText()
@@ -34,11 +34,13 @@ fun resolverVersaoEstavelTdlib(): String {
                 val shaCurto = sha.take(10)
                 val pomUrl = URL("https://jitpack.io/com/github/capullo-tech/lib-tdlib-android/$shaCurto/lib-tdlib-android-$shaCurto.pom")
                 val pomConn = (pomUrl.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "HEAD"
-                    connectTimeout = 6000
-                    readTimeout = 6000
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", "Gradle-NexusCloud")
+                    connectTimeout = 10000
+                    readTimeout = 30000
                 }
                 if (pomConn.responseCode == 200) {
+                    pomConn.inputStream.close()
                     println("TDLib versão estável selecionada no JitPack: $shaCurto")
                     return shaCurto
                 }
