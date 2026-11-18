@@ -548,31 +548,38 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         }
     }
 
-    fun salvarArquivo(arq: ArquivoNuvem) = viewModelScope.launch {
+    fun salvarArquivo(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = viewModelScope.launch {
         val atuais = obterArquivosReais()
         val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
-        val existente = atuais.firstOrNull {
-            limparPrefixoTimestamp(it.nomeArquivo).equals(nomeLimpo, ignoreCase = true) &&
-                (it.tamanhoBytes == arq.tamanhoBytes || it.tamanhoBytes == 0L || arq.tamanhoBytes == 0L)
+        val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
+
+        // Verifica apenas registos que correspondam ao mesmo identificador/timestamp (evita conflitos entre perfis MS e CP)
+        val existente = if (forcarNovoRegistro) {
+            atuais.firstOrNull { it.dataUpload == arq.dataUpload }
+        } else {
+            atuais.firstOrNull {
+                (it.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload
+            }
         }
+
         if (existente != null) {
             val thumbAntigaOk = miniaturaExisteLocalmente(existente.caminhoMiniatura, nomeLimpo)
             val thumbNovaOk = miniaturaExisteLocalmente(arq.caminhoMiniatura, nomeLimpo)
             val precisaAtualizarFileId = arq.fileId != 0 && existente.fileId != arq.fileId
-            if ((!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
+            if (forcarNovoRegistro || (!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
                 dao.apagarArquivo(existente.id)
                 dao.salvarArquivo(
                     existente.copy(
                         id = 0,
                         nomeArquivo = nomeLimpo,
-                        caminhoMiniatura = if (thumbNovaOk) resolverCaminhoCapaJpg(arq.caminhoMiniatura) else existente.caminhoMiniatura,
+                        dataUpload = arq.dataUpload,
+                        caminhoMiniatura = if (thumbNovaOk) capaValida else existente.caminhoMiniatura,
                         fileId = if (arq.fileId != 0) arq.fileId else existente.fileId
                     )
                 )
             }
         } else {
-            val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
-            dao.salvarArquivo(arq.copy(nomeArquivo = nomeLimpo, caminhoMiniatura = capaValida))
+            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = nomeLimpo, caminhoMiniatura = capaValida))
         }
     }
 
@@ -1485,6 +1492,7 @@ fun limparDuplicadosExistentes(
                 compareByDescending<ArquivoNuvem> { miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(it), it.nomeArquivo) }
                     .thenByDescending { it.fileId != 0 }
                     .thenByDescending { !pastas[it.dataUpload].isNullOrBlank() }
+                    .thenByDescending { it.dataUpload }
                     .thenBy { it.nomeArquivo.length }
                     .thenBy { it.id }
             ).first()
@@ -2309,7 +2317,7 @@ fun sincronizarCofreDaNuvem(
                                             caminhoMiniatura = uriMiniaturaInicial
                                         )
                                         mapaExistentesPorChave[chaveUnica] = novoArq
-                                        vm.salvarArquivo(novoArq)
+                                        vm.salvarArquivo(novoArq, forcarNovoRegistro = true)
                                         importados++
                                     }
                                 }
@@ -3178,7 +3186,7 @@ fun construirConteudoUploadTDLib(
     return Pair(doc, "DocCtor($idEscolhido)")
 }
 
-// === ENVIO HÍBRIDO PARA MS (MENSAGENS SALVAS) OU CP (CANAL PRIVADO) ===
+// === ENVIO HÍBRIDO PARA MS (MENSAGENS SALVAS) OU CP (CANAL PRIVADO) COM CAPTURA DE VÍDEO/DOC ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -3232,9 +3240,26 @@ fun enviarParaMensagensSalvas(
                 client.send(req) { msgObj ->
                     when (msgObj) {
                         is TdApi.Message -> {
-                            val docResp = (msgObj.content as? TdApi.MessageDocument)?.document
-                            val rId = docResp?.document?.id ?: 0
-                            val tId = docResp?.thumbnail?.file?.id ?: 0
+                            var rId = 0
+                            var tId = 0
+                            when (val c = msgObj.content) {
+                                is TdApi.MessageDocument -> {
+                                    rId = c.document?.document?.id ?: 0
+                                    tId = c.document?.thumbnail?.file?.id ?: 0
+                                }
+                                is TdApi.MessageVideo -> {
+                                    rId = c.video?.video?.id ?: 0
+                                    tId = c.video?.thumbnail?.file?.id ?: 0
+                                }
+                                is TdApi.MessagePhoto -> {
+                                    val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                                    rId = maior?.photo?.id ?: 0
+                                }
+                                is TdApi.MessageAudio -> {
+                                    rId = c.audio?.audio?.id ?: 0
+                                    tId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
+                                }
+                            }
                             NexusTransfer.msgIdUploadAtivo = msgObj.id
                             if (rId != 0) NexusTransfer.fileIdAtivo.value = rId
 
@@ -3578,6 +3603,28 @@ private data class ResultadoEnvioSSD(
     val mensagem: String
 )
 
+private fun gerarNomeUnicoNoLote(
+    nomeBase: String,
+    nomesJaUsados: MutableSet<String>
+): String {
+    val limpo = limparPrefixoTimestamp(nomeBase).ifBlank { "Video_${System.currentTimeMillis()}.mp4" }
+    val chaveInicial = limpo.lowercase(Locale.ROOT)
+    if (nomesJaUsados.add(chaveInicial)) return limpo
+
+    val temExt = limpo.contains('.')
+    val prefixo = if (temExt) limpo.substringBeforeLast('.') else limpo
+    val ext = if (temExt) ".${limpo.substringAfterLast('.')}" else ""
+
+    var contador = 2
+    while (true) {
+        val candidato = "${prefixo}_$contador$ext"
+        if (nomesJaUsados.add(candidato.lowercase(Locale.ROOT))) {
+            return candidato
+        }
+        contador++
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
 fun NexusUI(dao: NexusDao, client: Client) {
@@ -3669,13 +3716,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showAboutDialog by remember { mutableStateOf(false) }
     var showCacheDialog by remember { mutableStateOf(false) }
     var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
+    var isUploading by remember { mutableStateOf(false) }
 
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
         if (chaveAtiva.isBlank()) emptyList()
         else todosArquivos
             .filter { mapaDonos[it.dataUpload] == chaveAtiva }
-            .distinctBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+            .distinctBy {
+                if (it.fileId != 0) "fid_${it.fileId}_${it.dataUpload}"
+                else "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}|${it.dataUpload}"
+            }
     }
 
     val pastas = remember(todasPastas, pastasDoUsuarioSet, arquivos, mapaPastas, activeVaultUser) {
@@ -3777,8 +3828,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    LaunchedEffect(todosArquivos.size, vaultUnlocked) {
-        if (todosArquivos.isNotEmpty()) {
+    // Não executa limpeza de duplicados enquanto um lote de uploads estiver em andamento
+    LaunchedEffect(todosArquivos.size, vaultUnlocked, isUploading) {
+        if (todosArquivos.isNotEmpty() && !isUploading) {
             limparDuplicadosExistentes(context, todosArquivos, vm) {
                 mapaDonos = carregarDonosFicheiros(context)
                 mapaPastas = carregarVinculosPastas(context)
@@ -3843,7 +3895,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     var pastasSync by remember(activeVaultUser) { mutableStateOf(carregarPastasSync(context, activeVaultUser)) }
 
-    var isUploading by remember { mutableStateOf(false) }
     var cloudBannerText by remember(activeVaultUser, vaultStorageMode) {
         mutableStateOf(
             if (activeVaultUser.isNotBlank()) "Cofre [$vaultStorageMode]: $activeVaultUser • Nuvem SSD Ativa"
@@ -3901,13 +3952,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Upload com BARRA ÚNICA, cancelamento imediato pelo botão "X" e confirmação real no servidor (MS ou CP)
+    // Upload em lote com confirmação individual e gravação síncrona no banco para nenhum vídeo faltar
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
         NexusTransfer.jobAtivo = scope.launch {
             var enviados = 0
             val total = uris.size
+            val nomesUsadosNoLote = mutableSetOf<String>()
             try {
                 isUploading = true
                 NexusTransfer.iniciar("Preparando envio $vaultStorageMode (1/$total)...", upload = true)
@@ -3921,7 +3973,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     if (NexusTransfer.cancelado.value) break
 
                     val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
-                    val nome = limparPrefixoTimestamp(nomeBruto)
+                    val nome = gerarNomeUnicoNoLote(nomeBruto, nomesUsadosNoLote)
                     val loteTag = "(${index + 1}/$total) "
 
                     NexusTransfer.progress.value = 8
@@ -3948,7 +4000,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             break
                         }
 
-                        val tamFinal = if (tamanho > 0) tamanho else arqTemp.length()
+                        val tamFinal = if (arqTemp.length() > 0L) arqTemp.length() else tamanho
                         desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
                         marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
 
@@ -3994,20 +4046,21 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                         cloudBannerText = res.mensagem
                         enviados++
-                        val ts = System.currentTimeMillis() + index
+                        val ts = System.currentTimeMillis() + (index * 15L) + enviados
                         salvarDonoFicheiro(context, ts, activeVaultUser)
                         if (capaJpg.isNotBlank()) {
                             NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
                         }
                         NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        mapaDonos = carregarDonosFicheiros(context)
                         if (pastaEscolhida.isNotBlank()) {
                             vm.criarPasta(pastaEscolhida)
                             associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
                             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                             salvarVinculoPasta(context, ts, pastaEscolhida)
-                            mapaPastas = carregarVinculosPastas(context)
                         }
+                        mapaDonos = carregarDonosFicheiros(context)
+                        mapaPastas = carregarVinculosPastas(context)
+
                         vm.salvarArquivo(
                             ArquivoNuvem(
                                 fileId = res.fileId,
@@ -4015,14 +4068,18 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 tamanhoBytes = tamFinal,
                                 dataUpload = ts,
                                 caminhoMiniatura = capaJpg
-                            )
-                        )
+                            ),
+                            forcarNovoRegistro = true
+                        ).join()
                     } else {
                         cloudBannerText = "Erro ao ler '$nome'."
                         Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                     }
                     delay(120)
                 }
+
+                mapaDonos = carregarDonosFicheiros(context)
+                mapaPastas = carregarVinculosPastas(context)
 
                 if (NexusTransfer.cancelado.value) {
                     cloudBannerText = "Envio cancelado ($enviados guardado(s))."
@@ -4041,13 +4098,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Sincronização de novos arquivos com BARRA ÚNICA, cancelamento no "X" e confirmação real no servidor
+    // Sincronização de novos arquivos com confirmação e gravação garantida no banco local
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
         NexusTransfer.jobAtivo?.cancel()
         NexusTransfer.jobAtivo = scope.launch {
             var enviados = 0
             val total = itensParaEnviar.size
+            val nomesUsadosNoLote = mutableSetOf<String>()
             try {
                 isUploading = true
                 NexusTransfer.iniciar("Sincronizando novos arquivos (1/$total)...", upload = true)
@@ -4060,7 +4118,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                     if (NexusTransfer.cancelado.value) break
 
-                    val nomeLimpo = limparPrefixoTimestamp(item.nome)
+                    val nomeLimpo = gerarNomeUnicoNoLote(item.nome, nomesUsadosNoLote)
                     desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
                     marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
 
@@ -4090,7 +4148,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             break
                         }
 
-                        val tamFinal = if (item.tamanho > 0) item.tamanho else arqTemp.length()
+                        val tamFinal = if (arqTemp.length() > 0L) arqTemp.length() else item.tamanho
                         marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
 
                         val deferred = CompletableDeferred<ResultadoEnvioSSD>()
@@ -4132,20 +4190,21 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                         cloudBannerText = res.mensagem
                         enviados++
-                        val ts = System.currentTimeMillis() + index
+                        val ts = System.currentTimeMillis() + (index * 15L) + enviados
                         salvarDonoFicheiro(context, ts, activeVaultUser)
                         if (capaJpg.isNotBlank()) {
                             NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
                         }
                         NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        mapaDonos = carregarDonosFicheiros(context)
                         if (pastaAlvo.isNotBlank()) {
                             vm.criarPasta(pastaAlvo)
                             associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
                             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                             salvarVinculoPasta(context, ts, pastaAlvo)
-                            mapaPastas = carregarVinculosPastas(context)
                         }
+                        mapaDonos = carregarDonosFicheiros(context)
+                        mapaPastas = carregarVinculosPastas(context)
+
                         vm.salvarArquivo(
                             ArquivoNuvem(
                                 fileId = res.fileId,
@@ -4153,11 +4212,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 tamanhoBytes = tamFinal,
                                 dataUpload = ts,
                                 caminhoMiniatura = capaJpg
-                            )
-                        )
+                            ),
+                            forcarNovoRegistro = true
+                        ).join()
                     }
                     delay(120)
                 }
+
+                mapaDonos = carregarDonosFicheiros(context)
+                mapaPastas = carregarVinculosPastas(context)
 
                 cloudBannerText = if (NexusTransfer.cancelado.value) {
                     "Sincronização interrompida ($enviados enviado(s))."
