@@ -2,6 +2,7 @@ package com.seu.nexuscloud
 
 import android.app.ActivityManager
 import android.app.Application
+import android.app.ApplicationExitInfo
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -63,7 +64,6 @@ fun alinharHashTdApiComNativo(): String {
 
     for (nomeClasse in nomesClasses) {
         try {
-            // initialize = true garante que o ART inicialize os campos estáticos antes da substituição
             val clazz = Class.forName(nomeClasse, true, NexusApp::class.java.classLoader)
             for (field in clazz.declaredFields) {
                 if (!JavaModifier.isStatic(field.modifiers) || field.type != String::class.java) continue
@@ -75,7 +75,6 @@ fun alinharHashTdApiComNativo(): String {
                     field.name.contains("COMMIT", ignoreCase = true) ||
                     valorAtual.length == 40
                 ) {
-                    // 1. Tentativa direta via Reflection removendo flag FINAL de accessFlags
                     try {
                         val accessFlagsField = java.lang.reflect.Field::class.java.getDeclaredField("accessFlags")
                         accessFlagsField.isAccessible = true
@@ -85,7 +84,6 @@ fun alinharHashTdApiComNativo(): String {
                         try { field.set(null, hashExigidoPeloSo) } catch (_: Throwable) {}
                     }
 
-                    // 2. Tentativa via sun.misc.Unsafe diretamente no endereço de memória da classe no ART
                     if ((try { field.get(null) as? String } catch (_: Throwable) { null }) != hashExigidoPeloSo) {
                         try {
                             val unsafeClass = Class.forName("sun.misc.Unsafe")
@@ -137,6 +135,25 @@ fun alinharHashTdApiComNativo(): String {
         } catch (_: Throwable) {}
     }
     return relatorio.toString().trim()
+}
+
+// Verifica se o último encerramento foi ação normal do utilizador (ex: SwipeUpClean) e não um crash
+fun foiEncerramentoNormalDoSistema(context: Context): Boolean {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        try {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            val ult = am?.getHistoricalProcessExitReasons(context.packageName, 0, 1)?.firstOrNull()
+            if (ult != null) {
+                val r = ult.reason
+                val ehFalhaCritica = r == ApplicationExitInfo.REASON_CRASH ||
+                    r == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                    r == ApplicationExitInfo.REASON_ANR ||
+                    r == ApplicationExitInfo.REASON_SIGNALED
+                return !ehFalhaCritica
+            }
+        } catch (_: Throwable) {}
+    }
+    return false
 }
 
 fun recolherDiagnosticoNativo(context: Context): String {
@@ -257,7 +274,6 @@ class NexusApp : Application() {
     @Synchronized
     fun carregarSomenteTdjni(): String? {
         return try {
-            // Alinha o hash do TdApi.java com o libtdjni.so antes de carregar a biblioteca C++
             val logHash = alinharHashTdApiComNativo()
             Log.i("NexusCloud", "Alinhamento Hash TDLib: $logHash")
 
@@ -370,7 +386,7 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                             apiHash = BuildConfig.TELEGRAM_API_HASH
                             systemLanguageCode = "pt"
                             deviceModel = modelo
-                            applicationVersion = "1.9"
+                            applicationVersion = "2.0"
 
                             for (f in javaClass.declaredFields) {
                                 if (JavaModifier.isStatic(f.modifiers)) continue
@@ -431,9 +447,13 @@ class MainActivity : ComponentActivity() {
         val nexusApp = application as NexusApp
         val prefs = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
 
-        // Limpa automaticamente o bloqueio antigo ao instalar esta correção
-        if (prefs.getString("versao_fix_hash", "") != "v1.9_hash_aligned") {
-            prefs.edit().clear().putString("versao_fix_hash", "v1.9_hash_aligned").commit()
+        if (prefs.getString("versao_fix_hash", "") != "v2.0_swipe_safe") {
+            prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
+        }
+
+        // Ignora encerramento normal quando o utilizador fecha o app nos Apps Recentes (SwipeUpClean)
+        if (foiEncerramentoNormalDoSistema(this)) {
+            prefs.edit().remove("etapa_em_curso_v2").commit()
         }
 
         val etapaInterrompida = prefs.getString("etapa_em_curso_v2", null)
@@ -462,14 +482,12 @@ class MainActivity : ComponentActivity() {
                         try {
                             etapaTexto = "Etapa 1/3: A iniciar base de dados local..."
                             prefs.edit().putString("etapa_em_curso_v2", "Etapa 1: Base de dados Room (NexusDB)").commit()
-                            delay(150)
                             val db = withContext(Dispatchers.IO) { NexusDB.get(this@MainActivity) }
                             val dao = db.dao()
 
                             etapaTexto = "Etapa 2/3: A alinhar e carregar motor nativo SSD..."
                             val statusHash = alinharHashTdApiComNativo()
                             prefs.edit().putString("etapa_em_curso_v2", "Etapa 2: System.loadLibrary(tdjni) [$statusHash]").commit()
-                            delay(150)
                             val erroLib = nexusApp.carregarSomenteTdjni()
                             if (erroLib != null) {
                                 prefs.edit().remove("etapa_em_curso_v2").commit()
@@ -480,14 +498,13 @@ class MainActivity : ComponentActivity() {
 
                             etapaTexto = "Etapa 3/3: A iniciar cliente de nuvem SSD..."
                             prefs.edit().putString("etapa_em_curso_v2", "Etapa 3: Client.create / SetTdlibParameters").commit()
-                            delay(150)
                             val cli = nexusApp.criarClienteTDLib()
                             if (cli != null) {
+                                // Limpa imediatamente a etapa de arranque para evitar falso alarme ao fechar o app
+                                prefs.edit().remove("etapa_em_curso_v2").commit()
                                 daoPronto = dao
                                 clientPronto = cli
                                 carregando = false
-                                delay(1500)
-                                prefs.edit().remove("etapa_em_curso_v2").commit()
                             } else {
                                 prefs.edit().remove("etapa_em_curso_v2").commit()
                                 erroVisivel = (nexusApp.startupError ?: "Não foi possível criar o cliente TDLib.") +
@@ -537,6 +554,17 @@ class MainActivity : ComponentActivity() {
                                 )
                             }
                             Spacer(modifier = Modifier.height(14.dp))
+                            Button(
+                                onClick = {
+                                    prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
+                                    erroVisivel = null
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
+                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                            ) {
+                                Text("CONTINUAR SEM LIMPAR DADOS", color = Color(0xFF05070A), fontWeight = FontWeight.Black, fontSize = 12.sp)
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
                             OutlinedButton(
                                 onClick = {
                                     val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -549,19 +577,19 @@ class MainActivity : ComponentActivity() {
                                 Text("COPIAR RELATÓRIO DE ERRO", color = Color(0xFFFFD700), fontWeight = FontWeight.Bold, fontSize = 12.sp)
                             }
                             Spacer(modifier = Modifier.height(10.dp))
-                            Button(
+                            OutlinedButton(
                                 onClick = {
                                     try {
                                         File(filesDir, "tdlib").deleteRecursively()
                                         File(filesDir, "tdlib_files").deleteRecursively()
                                     } catch (_: Throwable) {}
-                                    prefs.edit().clear().putString("versao_fix_hash", "v1.9_hash_aligned").commit()
+                                    prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
                                     erroVisivel = null
                                 },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
-                                modifier = Modifier.fillMaxWidth().height(48.dp)
+                                border = BorderStroke(1.dp, Color(0xFFE53935)),
+                                modifier = Modifier.fillMaxWidth().height(46.dp)
                             ) {
-                                Text("LIMPAR PASTA TDLIB E TENTAR NOVAMENTE", color = Color(0xFF05070A), fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                Text("LIMPAR PASTA TDLIB E TENTAR NOVAMENTE", color = Color(0xFFE53935), fontWeight = FontWeight.Bold, fontSize = 11.sp)
                             }
                         }
                     }
