@@ -553,28 +553,27 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
         val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
 
-        // Verifica apenas registos que correspondam ao mesmo identificador/timestamp (evita conflitos entre perfis MS e CP)
-        val existente = if (forcarNovoRegistro) {
-            atuais.firstOrNull { it.dataUpload == arq.dataUpload }
-        } else {
-            atuais.firstOrNull {
-                (it.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload
-            }
+        // Remove todos os registos existentes com o mesmo dataUpload ou id para impedir chaves duplicadas na grade
+        val correspondentes = atuais.filter {
+            (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload
         }
 
-        if (existente != null) {
-            val thumbAntigaOk = miniaturaExisteLocalmente(existente.caminhoMiniatura, nomeLimpo)
+        if (correspondentes.isNotEmpty()) {
+            val principal = correspondentes.first()
+            val thumbAntigaOk = miniaturaExisteLocalmente(principal.caminhoMiniatura, nomeLimpo)
             val thumbNovaOk = miniaturaExisteLocalmente(arq.caminhoMiniatura, nomeLimpo)
-            val precisaAtualizarFileId = arq.fileId != 0 && existente.fileId != arq.fileId
-            if (forcarNovoRegistro || (!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
-                dao.apagarArquivo(existente.id)
+            val precisaAtualizarFileId = arq.fileId != 0 && principal.fileId != arq.fileId
+
+            if (forcarNovoRegistro || correspondentes.size > 1 || (!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
+                correspondentes.forEach { dao.apagarArquivo(it.id) }
                 dao.salvarArquivo(
-                    existente.copy(
+                    principal.copy(
                         id = 0,
                         nomeArquivo = nomeLimpo,
+                        tamanhoBytes = if (arq.tamanhoBytes > 0L) arq.tamanhoBytes else principal.tamanhoBytes,
                         dataUpload = arq.dataUpload,
-                        caminhoMiniatura = if (thumbNovaOk) capaValida else existente.caminhoMiniatura,
-                        fileId = if (arq.fileId != 0) arq.fileId else existente.fileId
+                        caminhoMiniatura = if (thumbNovaOk) capaValida else principal.caminhoMiniatura,
+                        fileId = if (arq.fileId != 0) arq.fileId else principal.fileId
                     )
                 )
             }
@@ -591,8 +590,11 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
             NexusThumbCache.salvarMiniatura(context, arq.dataUpload, capaJpg)
             viewModelScope.launch(Dispatchers.IO) {
                 try {
-                    dao.apagarArquivo(arq.id)
-                    dao.salvarArquivo(arq.copy(id = 0, caminhoMiniatura = capaJpg))
+                    val atuais = dao.buscarTodos().first()
+                    val duplicados = atuais.filter { (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload }
+                    duplicados.forEach { dao.apagarArquivo(it.id) }
+                    val base = duplicados.firstOrNull() ?: arq
+                    dao.salvarArquivo(base.copy(id = 0, caminhoMiniatura = capaJpg))
                 } catch (_: Exception) {}
             }
         }
@@ -600,8 +602,11 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
 
     fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
         if (novoNome.isNotBlank()) {
-            dao.apagarArquivo(arq.id)
-            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = novoNome.trim()))
+            val atuais = obterArquivosReais()
+            val correspondentes = atuais.filter { (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload }
+            correspondentes.forEach { dao.apagarArquivo(it.id) }
+            val base = correspondentes.firstOrNull() ?: arq
+            dao.salvarArquivo(base.copy(id = 0, nomeArquivo = novoNome.trim()))
         }
     }
 }
@@ -2297,7 +2302,7 @@ fun sincronizarCofreDaNuvem(
                                     } else {
                                         registarMensagemSincronizada(context, usuarioAtivo, msg.id)
 
-                                        val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + index
+                                        val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + (index * 11L)
                                         salvarDonoFicheiro(context, ts, usuarioAtivo)
                                         if (pastaFinal.isNotBlank()) {
                                             salvarVinculoPasta(context, ts, pastaFinal)
@@ -3337,7 +3342,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS AGRUPADA POR DATA, COM PREVIEW DE VÍDEO CLARO E NÍTIDO ===
+// === GRELHA DE ARQUIVOS AGRUPADA POR DATA COM CHAVE 100% ÚNICA (SEM CRASH DE KEY DUPLICADA) ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -3354,6 +3359,7 @@ fun GrelhaArquivos(
 ) {
     val gruposPorData = remember(lista) {
         lista
+            .distinctBy { "${it.dataUpload}_${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}" }
             .sortedByDescending { it.dataUpload }
             .groupBy { formatarDataCabecalhoGaleria(it.dataUpload) }
     }
@@ -3394,11 +3400,11 @@ fun GrelhaArquivos(
                 }
             }
 
-            items(
+            itemsIndexed(
                 items = arquivosDoDia,
-                key = { "${it.dataUpload}_${it.nomeArquivo}" },
-                contentType = { "item_midia" }
-            ) { arq ->
+                key = { idx, arq -> "item_${arq.id}_${arq.dataUpload}_${arq.nomeArquivo}_$idx" },
+                contentType = { _, _ -> "item_midia" }
+            ) { _, arq ->
                 val ext = remember(arq.nomeArquivo) { arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT) }
                 val pasta = mapaPastas[arq.dataUpload]
                 val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
@@ -3718,15 +3724,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
     var isUploading by remember { mutableStateOf(false) }
 
+    // Filtro com chave única por dataUpload + nome para impedir qualquer duplicidade na grade
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
         if (chaveAtiva.isBlank()) emptyList()
         else todosArquivos
             .filter { mapaDonos[it.dataUpload] == chaveAtiva }
-            .distinctBy {
-                if (it.fileId != 0) "fid_${it.fileId}_${it.dataUpload}"
-                else "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}|${it.dataUpload}"
-            }
+            .distinctBy { "${it.dataUpload}_${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}" }
     }
 
     val pastas = remember(todasPastas, pastasDoUsuarioSet, arquivos, mapaPastas, activeVaultUser) {
@@ -6516,7 +6520,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 modifier = Modifier.padding(bottom = 10.dp)
                             )
                             LazyVerticalGrid(columns = GridCells.Fixed(2), horizontalArrangement = Arrangement.spacedBy(10.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                items(pastasFiltradas, key = { it.nomePasta.trim().lowercase(Locale.ROOT) }) { p ->
+                                itemsIndexed(
+                                    items = pastasFiltradas,
+                                    key = { idx, p -> "folder_${p.nomePasta.trim().lowercase(Locale.ROOT)}_$idx" }
+                                ) { _, p ->
                                     val arquivosDaPasta = remember(arquivos, mapaPastas, p.nomePasta) {
                                         arquivos.filter { mapaPastas[it.dataUpload]?.equals(p.nomePasta, ignoreCase = true) == true }
                                     }
