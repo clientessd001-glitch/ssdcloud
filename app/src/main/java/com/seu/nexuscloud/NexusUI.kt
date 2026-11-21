@@ -1,8 +1,10 @@
 package com.seu.nexuscloud
 
+import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -13,6 +15,7 @@ import android.graphics.pdf.PdfRenderer
 import android.media.MediaMetadataRetriever
 import android.media.ThumbnailUtils
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import android.os.StrictMode
@@ -57,6 +60,7 @@ import androidx.compose.ui.unit.*
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -87,7 +91,7 @@ import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
-const val NEXUS_VERSION = "v2.0"
+const val NEXUS_VERSION = "v2.1"
 
 val BgBlack = Color(0xFF05070A)
 val SurfaceDark = Color(0xFF161A25)
@@ -103,7 +107,7 @@ fun mascararNumeroComAsterisco(numero: String): String {
     return "*".repeat(limpo.length.coerceAtLeast(8))
 }
 
-// === CONTROLADOR DE DOWNLOAD E ENVIO COM PAUSAR / CONTINUAR / CANCELAR REAL ===
+// === CONTROLADOR GLOBAL DE TRANSFERÊNCIAS COM SERVIÇO EM SEGUNDO PLANO E NOTIFICAÇÃO FIXA ===
 object NexusTransfer {
     val progress = MutableStateFlow<Int?>(null)
     val label = MutableStateFlow("")
@@ -111,27 +115,73 @@ object NexusTransfer {
     val cancelado = MutableStateFlow(false)
     val fileIdAtivo = MutableStateFlow(0)
     val ehUpload = MutableStateFlow(false)
+    val enviandoEmSegundoPlano = MutableStateFlow(false)
+    val bannerStatusGlobal = MutableStateFlow("")
 
     @Volatile var jobAtivo: Job? = null
     @Volatile var chatIdUploadAtivo: Long = 0L
     @Volatile var msgIdUploadAtivo: Long = 0L
+    @Volatile private var appContext: Context? = null
 
-    fun iniciar(texto: String, upload: Boolean, fileId: Int = 0) {
+    fun iniciar(texto: String, upload: Boolean, fileId: Int = 0, context: Context? = null) {
+        if (context != null) appContext = context.applicationContext
         pausado.value = false
         cancelado.value = false
         ehUpload.value = upload
+        enviandoEmSegundoPlano.value = upload
         fileIdAtivo.value = fileId
         chatIdUploadAtivo = 0L
         msgIdUploadAtivo = 0L
         progress.value = 5
         label.value = texto
+
+        if (upload) {
+            appContext?.let {
+                NexusUploadService.iniciar(
+                    context = it,
+                    titulo = "Nexus Cloud $NEXUS_VERSION • Upload Ativo",
+                    texto = texto,
+                    progresso = 5
+                )
+            }
+        }
+    }
+
+    fun atualizarProgresso(pct: Int, texto: String? = null, forcarNotif: Boolean = false) {
+        val pctSafe = pct.coerceIn(1, 100)
+        progress.value = pctSafe
+        if (texto != null) label.value = texto
+        if (ehUpload.value) {
+            appContext?.let {
+                NexusUploadService.atualizar(
+                    context = it,
+                    titulo = if (pausado.value) "Nexus Cloud $NEXUS_VERSION • Envio Pausado" else "Nexus Cloud $NEXUS_VERSION • Enviando ($pctSafe%)",
+                    texto = texto ?: label.value,
+                    progresso = pctSafe,
+                    pausado = pausado.value,
+                    forcar = forcarNotif
+                )
+            }
+        }
     }
 
     fun alternarPausa(client: Client? = null) {
         val novoEstado = !pausado.value
         pausado.value = novoEstado
         val fId = fileIdAtivo.value
-        if (client != null && fId != 0 && !ehUpload.value) {
+        if (ehUpload.value) {
+            appContext?.let {
+                val pctAtual = progress.value ?: 10
+                NexusUploadService.atualizar(
+                    context = it,
+                    titulo = if (novoEstado) "Nexus Cloud $NEXUS_VERSION • Envio Pausado" else "Nexus Cloud $NEXUS_VERSION • Enviando ($pctAtual%)",
+                    texto = label.value.ifBlank { "Transferência SSD" },
+                    progresso = pctAtual,
+                    pausado = novoEstado,
+                    forcar = true
+                )
+            }
+        } else if (client != null && fId != 0) {
             if (novoEstado) {
                 client.send(TdApi.CancelDownloadFile().apply {
                     this.fileId = fId
@@ -191,20 +241,25 @@ object NexusTransfer {
         } catch (_: Exception) {}
         jobAtivo = null
 
+        appContext?.let { NexusUploadService.encerrar(it) }
+
         progress.value = null
         label.value = ""
         fileIdAtivo.value = 0
         ehUpload.value = false
+        enviandoEmSegundoPlano.value = false
         chatIdUploadAtivo = 0L
         msgIdUploadAtivo = 0L
     }
 
     fun encerrar() {
+        appContext?.let { NexusUploadService.encerrar(it) }
         progress.value = null
         label.value = ""
         pausado.value = false
         fileIdAtivo.value = 0
         ehUpload.value = false
+        enviandoEmSegundoPlano.value = false
         chatIdUploadAtivo = 0L
         msgIdUploadAtivo = 0L
     }
@@ -548,12 +603,11 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         }
     }
 
-    fun salvarArquivo(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = viewModelScope.launch {
-        val atuais = obterArquivosReais()
+    suspend fun salvarArquivoSincrono(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = withContext(Dispatchers.IO) {
+        val atuais = dao.buscarTodos().first()
         val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
         val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
 
-        // Remove todos os registos existentes com o mesmo dataUpload ou id para impedir chaves duplicadas na grade
         val correspondentes = atuais.filter {
             (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload
         }
@@ -580,6 +634,10 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
         } else {
             dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = nomeLimpo, caminhoMiniatura = capaValida))
         }
+    }
+
+    fun salvarArquivo(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = viewModelScope.launch {
+        salvarArquivoSincrono(arq, forcarNovoRegistro)
     }
 
     fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
@@ -611,7 +669,7 @@ class UIViewModel(private val dao: NexusDao) : ViewModel() {
     }
 }
 
-// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA E CANCELAMENTO ===
+// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA, CANCELAMENTO E NOTIFICAÇÃO ===
 suspend fun obterInfoArquivoTDLib(client: Client, fileId: Int): TdApi.File? {
     if (fileId == 0) return null
     val def = CompletableDeferred<TdApi.File?>()
@@ -809,7 +867,7 @@ suspend fun aguardarUploadTDLibComPausa(
         val uploadArquivoOk = (fileId == 0) || (remote != null && remote.isUploadingCompleted && !remote.id.isNullOrEmpty())
 
         if (uploadArquivoOk && msgConfirmadaNoServidor) {
-            NexusTransfer.progress.value = 100
+            NexusTransfer.atualizarProgresso(100, "Concluído $loteTag'$nomeArquivo' (100%)", forcarNotif = true)
             return Pair(true, "OK")
         }
 
@@ -818,15 +876,14 @@ suspend fun aguardarUploadTDLibComPausa(
             val pctTotal = (40 + (pctRede * 58) / 100).coerceIn(40, 98)
             val mbEnv = String.format(Locale.US, "%.1f", enviado / (1024.0 * 1024.0))
             val mbTot = String.format(Locale.US, "%.1f", total / (1024.0 * 1024.0))
-            NexusTransfer.progress.value = pctTotal
-            NexusTransfer.label.value = if (uploadArquivoOk) {
+            val txtStatus = if (uploadArquivoOk) {
                 "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)..."
             } else {
                 "Enviando $loteTag'$nomeArquivo': $mbEnv / $mbTot MB ($pctTotal%)"
             }
+            NexusTransfer.atualizarProgresso(pctTotal, txtStatus)
         } else if (uploadArquivoOk) {
-            NexusTransfer.progress.value = 99
-            NexusTransfer.label.value = "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)..."
+            NexusTransfer.atualizarProgresso(99, "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)...")
         }
 
         if (remote != null && !remote.isUploadingActive && !uploadArquivoOk) {
@@ -838,6 +895,906 @@ suspend fun aguardarUploadTDLibComPausa(
     }
     return Pair(true, "OK")
 }
+// === FIM DA PARTE 1 DE 3 ===
+package com.seu.nexuscloud
+
+import android.Manifest
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
+import android.graphics.pdf.PdfRenderer
+import android.media.MediaMetadataRetriever
+import android.media.ThumbnailUtils
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.os.StrictMode
+import android.provider.DocumentsContract
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.grid.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
+import androidx.compose.runtime.*
+import androidx.compose.ui.*
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import coil.compose.AsyncImage
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.lang.reflect.Modifier as JavaModifier
+import java.text.SimpleDateFormat
+import java.util.ArrayList
+import java.util.Calendar
+import java.util.Collections
+import java.util.Date
+import java.util.Locale
+import java.util.zip.CRC32
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import org.drinkless.tdlib.Client
+import org.drinkless.tdlib.TdApi
+
+const val NEXUS_VERSION = "v2.1"
+
+val BgBlack = Color(0xFF05070A)
+val SurfaceDark = Color(0xFF161A25)
+val SurfaceDarker = Color(0xFF10131B)
+val Gold = Color(0xFFFFD700)
+val DangerRed = Color(0xFFE53935)
+val TextGrey = Color(0xFFA0AABF)
+
+// Mascara o número SSD visualmente com asteriscos
+fun mascararNumeroComAsterisco(numero: String): String {
+    val limpo = numero.trim()
+    if (limpo.isEmpty()) return "********"
+    return "*".repeat(limpo.length.coerceAtLeast(8))
+}
+
+// === CONTROLADOR GLOBAL DE TRANSFERÊNCIAS COM SERVIÇO EM SEGUNDO PLANO E NOTIFICAÇÃO FIXA ===
+object NexusTransfer {
+    val progress = MutableStateFlow<Int?>(null)
+    val label = MutableStateFlow("")
+    val pausado = MutableStateFlow(false)
+    val cancelado = MutableStateFlow(false)
+    val fileIdAtivo = MutableStateFlow(0)
+    val ehUpload = MutableStateFlow(false)
+    val enviandoEmSegundoPlano = MutableStateFlow(false)
+    val bannerStatusGlobal = MutableStateFlow("")
+
+    @Volatile var jobAtivo: Job? = null
+    @Volatile var chatIdUploadAtivo: Long = 0L
+    @Volatile var msgIdUploadAtivo: Long = 0L
+    @Volatile private var appContext: Context? = null
+
+    fun iniciar(texto: String, upload: Boolean, fileId: Int = 0, context: Context? = null) {
+        if (context != null) appContext = context.applicationContext
+        pausado.value = false
+        cancelado.value = false
+        ehUpload.value = upload
+        enviandoEmSegundoPlano.value = upload
+        fileIdAtivo.value = fileId
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
+        progress.value = 5
+        label.value = texto
+
+        if (upload) {
+            appContext?.let {
+                NexusUploadService.iniciar(
+                    context = it,
+                    titulo = "Nexus Cloud $NEXUS_VERSION • Upload Ativo",
+                    texto = texto,
+                    progresso = 5
+                )
+            }
+        }
+    }
+
+    fun atualizarProgresso(pct: Int, texto: String? = null, forcarNotif: Boolean = false) {
+        val pctSafe = pct.coerceIn(1, 100)
+        progress.value = pctSafe
+        if (texto != null) label.value = texto
+        if (ehUpload.value) {
+            appContext?.let {
+                NexusUploadService.atualizar(
+                    context = it,
+                    titulo = if (pausado.value) "Nexus Cloud $NEXUS_VERSION • Envio Pausado" else "Nexus Cloud $NEXUS_VERSION • Enviando ($pctSafe%)",
+                    texto = texto ?: label.value,
+                    progresso = pctSafe,
+                    pausado = pausado.value,
+                    forcar = forcarNotif
+                )
+            }
+        }
+    }
+
+    fun alternarPausa(client: Client? = null) {
+        val novoEstado = !pausado.value
+        pausado.value = novoEstado
+        val fId = fileIdAtivo.value
+        if (ehUpload.value) {
+            appContext?.let {
+                val pctAtual = progress.value ?: 10
+                NexusUploadService.atualizar(
+                    context = it,
+                    titulo = if (novoEstado) "Nexus Cloud $NEXUS_VERSION • Envio Pausado" else "Nexus Cloud $NEXUS_VERSION • Enviando ($pctAtual%)",
+                    texto = label.value.ifBlank { "Transferência SSD" },
+                    progresso = pctAtual,
+                    pausado = novoEstado,
+                    forcar = true
+                )
+            }
+        } else if (client != null && fId != 0) {
+            if (novoEstado) {
+                client.send(TdApi.CancelDownloadFile().apply {
+                    this.fileId = fId
+                    this.onlyIfPending = false
+                }) {}
+            } else {
+                client.send(TdApi.DownloadFile().apply {
+                    this.fileId = fId
+                    this.priority = 32
+                    this.offset = 0
+                    this.limit = 0
+                    this.synchronous = false
+                }) {}
+            }
+        }
+    }
+
+    fun cancelar(client: Client? = null) {
+        cancelado.value = true
+        pausado.value = false
+        val fId = fileIdAtivo.value
+        val cId = chatIdUploadAtivo
+        val mId = msgIdUploadAtivo
+
+        if (client != null) {
+            if (cId != 0L && mId != 0L) {
+                try {
+                    client.send(TdApi.DeleteMessages().apply {
+                        this.chatId = cId
+                        this.messageIds = longArrayOf(mId)
+                        this.revoke = true
+                    }) {}
+                } catch (_: Exception) {}
+            }
+            if (fId != 0) {
+                try {
+                    client.send(TdApi.CancelDownloadFile().apply {
+                        this.fileId = fId
+                        this.onlyIfPending = false
+                    }) {}
+                } catch (_: Exception) {}
+                try {
+                    client.send(TdApi.CancelPreliminaryUploadFile().apply {
+                        this.fileId = fId
+                    }) {}
+                } catch (_: Exception) {}
+                try {
+                    client.send(TdApi.DeleteFile().apply {
+                        this.fileId = fId
+                    }) {}
+                } catch (_: Exception) {}
+            }
+        }
+
+        try {
+            jobAtivo?.cancel()
+        } catch (_: Exception) {}
+        jobAtivo = null
+
+        appContext?.let { NexusUploadService.encerrar(it) }
+
+        progress.value = null
+        label.value = ""
+        fileIdAtivo.value = 0
+        ehUpload.value = false
+        enviandoEmSegundoPlano.value = false
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
+    }
+
+    fun encerrar() {
+        appContext?.let { NexusUploadService.encerrar(it) }
+        progress.value = null
+        label.value = ""
+        pausado.value = false
+        fileIdAtivo.value = 0
+        ehUpload.value = false
+        enviandoEmSegundoPlano.value = false
+        chatIdUploadAtivo = 0L
+        msgIdUploadAtivo = 0L
+    }
+}
+
+// === CONTROLADOR DE BARRA DE LEITURA E CONTADOR DE ARQUIVOS NA NUVEM ===
+object NexusLeituraNuvem {
+    val ativo = MutableStateFlow(false)
+    val lidos = MutableStateFlow(0)
+    val total = MutableStateFlow(0)
+    val subProgressoItem = MutableStateFlow(0)
+    val titulo = MutableStateFlow("")
+    val pausado = MutableStateFlow(false)
+
+    fun iniciar(totalItens: Int, texto: String) {
+        if (totalItens <= 0) {
+            encerrar()
+            return
+        }
+        pausado.value = false
+        total.value = totalItens
+        lidos.value = 0
+        subProgressoItem.value = 0
+        titulo.value = texto
+        ativo.value = true
+    }
+
+    fun alternarPausa() {
+        pausado.value = !pausado.value
+    }
+
+    fun avancar(novoLido: Int, novoTotal: Int = total.value, texto: String? = null) {
+        if (novoTotal > 0) total.value = novoTotal
+        lidos.value = novoLido.coerceIn(0, total.value.coerceAtLeast(1))
+        subProgressoItem.value = 0
+        if (texto != null) titulo.value = texto
+        ativo.value = true
+    }
+
+    fun atualizarSubProgresso(pctItem: Int, texto: String? = null) {
+        subProgressoItem.value = pctItem.coerceIn(0, 99)
+        if (texto != null) titulo.value = texto
+    }
+
+    fun concluirItem() {
+        val t = total.value
+        if (t <= 0) {
+            encerrar()
+            return
+        }
+        val prox = (lidos.value + 1).coerceAtMost(t)
+        lidos.value = prox
+        subProgressoItem.value = 0
+        if (prox >= t) {
+            encerrar()
+        }
+    }
+
+    fun encerrar() {
+        ativo.value = false
+        pausado.value = false
+        lidos.value = 0
+        total.value = 0
+        subProgressoItem.value = 0
+        titulo.value = ""
+    }
+}
+
+// === CACHE RÁPIDO DE MINIATURAS (.JPG) E GESTOR DE CACHE DO SSD NEXUS ===
+object NexusThumbCache {
+    val mapaMiniaturas = mutableStateMapOf<Long, String>()
+    val mapaArquivosCompletos = mutableStateMapOf<Long, String>()
+    val mapaThumbIdsNuvem = mutableStateMapOf<Int, Int>()
+    val downloadSemaphore = Semaphore(4)
+    val emProgresso = Collections.synchronizedSet(mutableSetOf<Long>())
+    private var inicializado = false
+
+    fun inicializar(context: Context) {
+        if (inicializado) return
+        inicializado = true
+        val prefs = context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+        for ((k, v) in prefs.all) {
+            if (v is String && v.isNotBlank()) {
+                when {
+                    k.startsWith("ts_") -> {
+                        val ts = k.removePrefix("ts_").toLongOrNull()
+                        if (ts != null) {
+                            val resolvido = resolverCaminhoCapaJpg(v)
+                            if (resolvido.isNotBlank()) {
+                                mapaMiniaturas[ts] = resolvido
+                            }
+                        }
+                    }
+                    k.startsWith("full_") -> {
+                        val ts = k.removePrefix("full_").toLongOrNull()
+                        if (ts != null && arquivoCompletoExisteLocalmente(v)) {
+                            mapaArquivosCompletos[ts] = v
+                        }
+                    }
+                    k.startsWith("thid_") -> {
+                        val fId = k.removePrefix("thid_").toIntOrNull()
+                        val tId = v.toIntOrNull()
+                        if (fId != null && tId != null && tId != 0) mapaThumbIdsNuvem[fId] = tId
+                    }
+                }
+            }
+        }
+    }
+
+    fun obterMiniatura(arq: ArquivoNuvem): String {
+        val emCache = mapaMiniaturas[arq.dataUpload]
+        if (!emCache.isNullOrBlank() && miniaturaExisteLocalmente(emCache, arq.nomeArquivo)) {
+            return resolverCaminhoCapaJpg(emCache)
+        }
+        val doArq = arq.caminhoMiniatura ?: ""
+        if (doArq.isNotBlank() && miniaturaExisteLocalmente(doArq, arq.nomeArquivo)) {
+            val resolvido = resolverCaminhoCapaJpg(doArq)
+            if (resolvido.isNotBlank()) {
+                mapaMiniaturas[arq.dataUpload] = resolvido
+                return resolvido
+            }
+        }
+        return ""
+    }
+
+    fun obterArquivoCompleto(arq: ArquivoNuvem): String {
+        val emCache = mapaArquivosCompletos[arq.dataUpload]
+        if (!emCache.isNullOrBlank() && arquivoCompletoExisteLocalmente(emCache)) return emCache
+        val doArq = arq.caminhoMiniatura ?: ""
+        if (doArq.isNotBlank() && arquivoCompletoExisteLocalmente(doArq)) return doArq
+        return ""
+    }
+
+    fun salvarMiniatura(context: Context, dataUpload: Long, caminho: String) {
+        val capaLimpa = resolverCaminhoCapaJpg(caminho)
+        if (capaLimpa.isBlank()) return
+        mapaMiniaturas[dataUpload] = capaLimpa
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("ts_$dataUpload", capaLimpa)
+            .apply()
+    }
+
+    fun salvarArquivoCompleto(context: Context, dataUpload: Long, caminho: String) {
+        if (caminho.isBlank() || !arquivoCompletoExisteLocalmente(caminho)) return
+        mapaArquivosCompletos[dataUpload] = caminho
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("full_$dataUpload", caminho)
+            .apply()
+    }
+
+    fun salvarThumbIdNuvem(context: Context, fileId: Int, thumbFileId: Int) {
+        if (fileId == 0 || thumbFileId == 0) return
+        mapaThumbIdsNuvem[fileId] = thumbFileId
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("thid_$fileId", thumbFileId.toString())
+            .apply()
+    }
+
+    fun limparCapasDeVideos(context: Context, arquivos: List<ArquivoNuvem>): Int {
+        var removidas = 0
+        val prefs = context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+        val dir = File(context.filesDir, "nexus_thumbs")
+
+        arquivos.filter { ehArquivoVideo(it.nomeArquivo) }.forEach { vid ->
+            val atual = mapaMiniaturas[vid.dataUpload] ?: vid.caminhoMiniatura ?: ""
+            if (atual.isNotBlank()) {
+                val limpo = if (atual.startsWith("file://")) Uri.parse(atual).path ?: atual.removePrefix("file://") else atual
+                val f = File(limpo)
+                if (f.exists()) f.delete()
+                val fFrame = File("${limpo}_frame.jpg")
+                if (fFrame.exists()) fFrame.delete()
+            }
+            mapaMiniaturas.remove(vid.dataUpload)
+            editor.remove("ts_${vid.dataUpload}")
+            emProgresso.remove(vid.dataUpload)
+            removidas++
+        }
+
+        if (dir.exists()) {
+            dir.listFiles()?.forEach { f ->
+                if (f.name.startsWith("fast_") || ehArquivoVideo(f.name.removeSuffix("_frame.jpg"))) {
+                    f.delete()
+                }
+            }
+        }
+        editor.apply()
+        return removidas
+    }
+
+    fun limparTodoCacheLocal(context: Context) {
+        mapaMiniaturas.clear()
+        mapaArquivosCompletos.clear()
+        emProgresso.clear()
+        context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE).edit().clear().apply()
+        try {
+            File(context.filesDir, "nexus_thumbs").deleteRecursively()
+            File(context.filesDir, "tdlib_upload_cache").deleteRecursively()
+            context.cacheDir.deleteRecursively()
+        } catch (_: Exception) {}
+    }
+}
+
+fun calcularUsoCacheLocal(context: Context): Triple<Long, Int, Int> {
+    var totalBytes = 0L
+    var qtdThumbs = 0
+    var qtdTemp = 0
+
+    val dirThumbs = File(context.filesDir, "nexus_thumbs")
+    if (dirThumbs.exists()) {
+        dirThumbs.walkTopDown().forEach { f ->
+            if (f.isFile) {
+                totalBytes += f.length()
+                if (f.name.endsWith("_frame.jpg")) qtdThumbs++ else qtdTemp++
+            }
+        }
+    }
+
+    val dirUpload = File(context.filesDir, "tdlib_upload_cache")
+    if (dirUpload.exists()) {
+        dirUpload.walkTopDown().forEach { f ->
+            if (f.isFile) {
+                totalBytes += f.length()
+                qtdTemp++
+            }
+        }
+    }
+
+    context.cacheDir?.walkTopDown()?.forEach { f ->
+        if (f.isFile) {
+            totalBytes += f.length()
+            qtdTemp++
+        }
+    }
+
+    return Triple(totalBytes, qtdThumbs, qtdTemp)
+}
+
+fun limparCacheUploadsTemporarios(context: Context): Long {
+    var liberado = 0L
+    try {
+        val dirUpload = File(context.filesDir, "tdlib_upload_cache")
+        if (dirUpload.exists()) {
+            dirUpload.walkTopDown().forEach { if (it.isFile) liberado += it.length() }
+            dirUpload.deleteRecursively()
+        }
+        val dirThumbs = File(context.filesDir, "nexus_thumbs")
+        if (dirThumbs.exists()) {
+            dirThumbs.listFiles()?.forEach { f ->
+                if (f.isFile && !f.name.endsWith("_frame.jpg")) {
+                    liberado += f.length()
+                    f.delete()
+                }
+            }
+        }
+        context.cacheDir?.listFiles()?.forEach { f ->
+            if (f.isFile) liberado += f.length()
+            f.deleteRecursively()
+        }
+        NexusThumbCache.mapaArquivosCompletos.clear()
+    } catch (_: Exception) {}
+    return liberado
+}
+
+fun resolverCaminhoCapaJpg(caminho: String?): String {
+    val c = caminho ?: return ""
+    if (c.isBlank()) return ""
+    if (c.startsWith("content://")) return c
+    val limpo = if (c.startsWith("file://")) Uri.parse(c).path ?: c.removePrefix("file://") else c
+    if (limpo.isBlank()) return ""
+
+    if (limpo.endsWith("_frame.jpg")) {
+        val f = File(limpo)
+        return if (f.exists() && f.length() > 256L) Uri.fromFile(f).toString() else ""
+    }
+
+    val fFrame = File("${limpo}_frame.jpg")
+    if (fFrame.exists() && fFrame.length() > 256L) {
+        return Uri.fromFile(fFrame).toString()
+    }
+
+    val fOriginal = File(limpo)
+    if (fOriginal.exists() && fOriginal.length() > 256L && ehArquivoImagem(fOriginal.name)) {
+        return Uri.fromFile(fOriginal).toString()
+    }
+    return ""
+}
+
+fun limparPrefixoTimestamp(nome: String): String {
+    return nome.trim()
+        .replace(Regex("^fast_\\d+_"), "")
+        .replace(Regex("^thumb_\\d+_"), "")
+        .replace(Regex("^\\d{10,16}_"), "")
+        .removeSuffix("_frame.jpg")
+        .trim()
+}
+
+fun ehArquivoImagem(nomeArquivo: String): Boolean {
+    val limpo = nomeArquivo.trim()
+    val ext = limpo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+    return ext in listOf("JPG", "JPEG", "JPE", "JFIF", "PNG", "WEBP", "HEIC", "HEIF", "GIF", "BMP", "AVIF") ||
+        ext.startsWith("JP") ||
+        limpo.contains("IMG", ignoreCase = true) ||
+        limpo.contains("PHOTO", ignoreCase = true) ||
+        limpo.contains("Screenshot", ignoreCase = true) ||
+        (Regex("^\\d{8}_\\d{6}.*").matches(limpo) && !ehArquivoVideo(limpo))
+}
+
+fun ehArquivoVideo(nomeArquivo: String): Boolean {
+    val limpo = nomeArquivo.trim()
+    val ext = limpo.substringAfterLast('.', "").uppercase(Locale.ROOT)
+    return ext in listOf("MP4", "MKV", "MOV", "AVI", "WEBM", "3GP", "M4V") ||
+        limpo.contains("VID", ignoreCase = true) ||
+        limpo.contains("Video", ignoreCase = true)
+}
+
+class UIViewModel(private val dao: NexusDao) : ViewModel() {
+    val arquivos = dao.buscarTodos().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val pastas = dao.buscarPastas().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+    val armazenamento = dao.calcularUsoTotal().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 0L)
+
+    suspend fun obterArquivosReais(): List<ArquivoNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarTodos().first()
+    }
+
+    suspend fun obterPastasReais(): List<PastaNuvem> = withContext(Dispatchers.IO) {
+        dao.buscarPastas().first()
+    }
+
+    fun criarPasta(nome: String) = viewModelScope.launch {
+        val limpo = nome.trim()
+        if (limpo.isNotBlank()) {
+            val atuais = obterPastasReais()
+            val jaExiste = atuais.any { it.nomePasta.trim().equals(limpo, ignoreCase = true) }
+            if (!jaExiste) {
+                dao.criarPasta(PastaNuvem(nomePasta = limpo))
+            }
+        }
+    }
+
+    suspend fun salvarArquivoSincrono(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = withContext(Dispatchers.IO) {
+        val atuais = dao.buscarTodos().first()
+        val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
+        val capaValida = resolverCaminhoCapaJpg(arq.caminhoMiniatura).ifBlank { arq.caminhoMiniatura }
+
+        val correspondentes = atuais.filter {
+            (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload
+        }
+
+        if (correspondentes.isNotEmpty()) {
+            val principal = correspondentes.first()
+            val thumbAntigaOk = miniaturaExisteLocalmente(principal.caminhoMiniatura, nomeLimpo)
+            val thumbNovaOk = miniaturaExisteLocalmente(arq.caminhoMiniatura, nomeLimpo)
+            val precisaAtualizarFileId = arq.fileId != 0 && principal.fileId != arq.fileId
+
+            if (forcarNovoRegistro || correspondentes.size > 1 || (!thumbAntigaOk && thumbNovaOk) || precisaAtualizarFileId) {
+                correspondentes.forEach { dao.apagarArquivo(it.id) }
+                dao.salvarArquivo(
+                    principal.copy(
+                        id = 0,
+                        nomeArquivo = nomeLimpo,
+                        tamanhoBytes = if (arq.tamanhoBytes > 0L) arq.tamanhoBytes else principal.tamanhoBytes,
+                        dataUpload = arq.dataUpload,
+                        caminhoMiniatura = if (thumbNovaOk) capaValida else principal.caminhoMiniatura,
+                        fileId = if (arq.fileId != 0) arq.fileId else principal.fileId
+                    )
+                )
+            }
+        } else {
+            dao.salvarArquivo(arq.copy(id = 0, nomeArquivo = nomeLimpo, caminhoMiniatura = capaValida))
+        }
+    }
+
+    fun salvarArquivo(arq: ArquivoNuvem, forcarNovoRegistro: Boolean = false) = viewModelScope.launch {
+        salvarArquivoSincrono(arq, forcarNovoRegistro)
+    }
+
+    fun apagar(id: Int) = viewModelScope.launch { dao.apagarArquivo(id) }
+
+    fun atualizarCaminhoMiniatura(context: Context, arq: ArquivoNuvem, novoCaminho: String) {
+        val capaJpg = resolverCaminhoCapaJpg(novoCaminho)
+        if (capaJpg.isNotBlank()) {
+            NexusThumbCache.salvarMiniatura(context, arq.dataUpload, capaJpg)
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    val atuais = dao.buscarTodos().first()
+                    val duplicados = atuais.filter { (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload }
+                    duplicados.forEach { dao.apagarArquivo(it.id) }
+                    val base = duplicados.firstOrNull() ?: arq
+                    dao.salvarArquivo(base.copy(id = 0, caminhoMiniatura = capaJpg))
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    fun renomearArquivo(arq: ArquivoNuvem, novoNome: String) = viewModelScope.launch {
+        if (novoNome.isNotBlank()) {
+            val atuais = obterArquivosReais()
+            val correspondentes = atuais.filter { (arq.id != 0 && it.id == arq.id) || it.dataUpload == arq.dataUpload }
+            correspondentes.forEach { dao.apagarArquivo(it.id) }
+            val base = correspondentes.firstOrNull() ?: arq
+            dao.salvarArquivo(base.copy(id = 0, nomeArquivo = novoNome.trim()))
+        }
+    }
+}
+
+// === FUNÇÕES AUXILIARES TDLIB ASSÍNCRONAS COM SUPORTE A PAUSA, CANCELAMENTO E NOTIFICAÇÃO ===
+suspend fun obterInfoArquivoTDLib(client: Client, fileId: Int): TdApi.File? {
+    if (fileId == 0) return null
+    val def = CompletableDeferred<TdApi.File?>()
+    client.send(TdApi.GetFile(fileId)) { obj ->
+        def.complete(obj as? TdApi.File)
+    }
+    return def.await()
+}
+
+suspend fun baixarArquivoTDLibAssincrono(
+    client: Client,
+    fileId: Int,
+    prioridade: Int = 16,
+    maxTentativas: Int = 400,
+    controlarPausaTransfer: Boolean = false,
+    onProgress: ((Int, Long, Long) -> Unit)? = null
+): File? {
+    if (fileId == 0) return null
+
+    if (controlarPausaTransfer) {
+        NexusTransfer.fileIdAtivo.value = fileId
+    }
+
+    val infoInicial = obterInfoArquivoTDLib(client, fileId)
+    val caminhoInicial = infoInicial?.local?.path ?: ""
+    if (caminhoInicial.isNotBlank() && infoInicial?.local?.isDownloadingCompleted == true) {
+        val f = File(caminhoInicial)
+        if (f.exists() && f.length() > 100L) {
+            onProgress?.invoke(100, f.length(), f.length())
+            return f
+        }
+    }
+
+    val req = TdApi.DownloadFile().apply {
+        this.fileId = fileId
+        this.priority = prioridade
+        this.offset = 0
+        this.limit = 0
+        this.synchronous = false
+    }
+    client.send(req) {}
+
+    var tentativas = 0
+    var semEvolucao = 0
+    var ultimoBaixado = -1L
+
+    while (tentativas < maxTentativas) {
+        if (controlarPausaTransfer && NexusTransfer.cancelado.value) {
+            client.send(TdApi.CancelDownloadFile().apply {
+                this.fileId = fileId
+                this.onlyIfPending = false
+            }) {}
+            return null
+        }
+
+        var estavaPausado = false
+        while ((controlarPausaTransfer && NexusTransfer.pausado.value) ||
+            (!controlarPausaTransfer && NexusLeituraNuvem.pausado.value)
+        ) {
+            if (!estavaPausado) {
+                estavaPausado = true
+                client.send(TdApi.CancelDownloadFile().apply {
+                    this.fileId = fileId
+                    this.onlyIfPending = false
+                }) {}
+            }
+            delay(200)
+            if (controlarPausaTransfer && NexusTransfer.cancelado.value) return null
+        }
+        if (estavaPausado) {
+            client.send(req) {}
+            semEvolucao = 0
+        }
+
+        delay(150)
+        if (controlarPausaTransfer && NexusTransfer.cancelado.value) {
+            client.send(TdApi.CancelDownloadFile().apply {
+                this.fileId = fileId
+                this.onlyIfPending = false
+            }) {}
+            return null
+        }
+
+        tentativas++
+        val info = obterInfoArquivoTDLib(client, fileId) ?: break
+        val local = info.local
+        val path = local?.path ?: ""
+        val baixado = local?.downloadedSize ?: 0L
+        val total = when {
+            info.size > 0 -> info.size
+            info.expectedSize > 0 -> info.expectedSize
+            else -> 0L
+        }
+
+        if (total > 0L && baixado > 0L) {
+            val pct = ((baixado * 100L) / total).toInt().coerceIn(1, 99)
+            onProgress?.invoke(pct, baixado, total)
+        } else {
+            val pctEst = (5 + tentativas).coerceAtMost(90)
+            onProgress?.invoke(pctEst, baixado, total)
+        }
+
+        if (local?.isDownloadingCompleted == true && path.isNotBlank()) {
+            val arqFinal = File(path)
+            if (arqFinal.exists() && arqFinal.length() > 100L) {
+                onProgress?.invoke(100, arqFinal.length(), arqFinal.length())
+                return arqFinal
+            }
+        }
+
+        if (baixado == ultimoBaixado) {
+            semEvolucao++
+        } else {
+            semEvolucao = 0
+            ultimoBaixado = baixado
+        }
+
+        if (local?.isDownloadingActive == false && local.isDownloadingCompleted == false) {
+            if (tentativas == 4 || tentativas == 12 || tentativas == 24) {
+                client.send(req) {}
+            } else if (semEvolucao > 25) {
+                break
+            }
+        }
+    }
+    return null
+}
+
+suspend fun aguardarUploadTDLibComPausa(
+    client: Client,
+    fileId: Int,
+    nomeArquivo: String,
+    loteTag: String = "",
+    chatId: Long = 0L,
+    messageId: Long = 0L
+): Pair<Boolean, String> {
+    NexusTransfer.fileIdAtivo.value = fileId
+    var tentativas = 0
+    var inativoCount = 0
+
+    while (tentativas < 1800) {
+        if (NexusTransfer.cancelado.value) {
+            if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return Pair(false, "Envio cancelado.")
+        }
+        while (NexusTransfer.pausado.value) {
+            delay(200)
+            if (NexusTransfer.cancelado.value) {
+                if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+                return Pair(false, "Envio cancelado.")
+            }
+        }
+
+        delay(200)
+        if (NexusTransfer.cancelado.value) {
+            if (fileId != 0) client.send(TdApi.DeleteFile().apply { this.fileId = fileId }) {}
+            return Pair(false, "Envio cancelado.")
+        }
+
+        tentativas++
+
+        var msgConfirmadaNoServidor = (chatId == 0L || messageId == 0L)
+        if (!msgConfirmadaNoServidor) {
+            val defMsg = CompletableDeferred<TdApi.Object?>()
+            client.send(TdApi.GetMessage(chatId, messageId)) { defMsg.complete(it) }
+            when (val mObj = defMsg.await()) {
+                is TdApi.Message -> {
+                    when (val st = mObj.sendingState) {
+                        null -> msgConfirmadaNoServidor = true
+                        is TdApi.MessageSendingStateFailed -> {
+                            val errObj = try { st.javaClass.getField("error").get(st) as? TdApi.Error } catch (_: Throwable) { null }
+                            val code = errObj?.code ?: 0
+                            val msg = errObj?.message ?: st.toString()
+                            return Pair(false, "Falha no servidor SSD ($code): $msg")
+                        }
+                    }
+                }
+                is TdApi.Error -> {
+                    if (mObj.code == 404 && !NexusTransfer.cancelado.value) {
+                        msgConfirmadaNoServidor = true
+                    }
+                }
+            }
+        }
+
+        val info = if (fileId != 0) obterInfoArquivoTDLib(client, fileId) else null
+        val remote = info?.remote
+        val enviado = remote?.uploadedSize ?: 0L
+        val total = when {
+            (info?.size ?: 0L) > 0L -> info!!.size
+            (info?.expectedSize ?: 0L) > 0L -> info!!.expectedSize
+            else -> 0L
+        }
+
+        val uploadArquivoOk = (fileId == 0) || (remote != null && remote.isUploadingCompleted && !remote.id.isNullOrEmpty())
+
+        if (uploadArquivoOk && msgConfirmadaNoServidor) {
+            NexusTransfer.atualizarProgresso(100, "Concluído $loteTag'$nomeArquivo' (100%)", forcarNotif = true)
+            return Pair(true, "OK")
+        }
+
+        if (total > 0L && enviado > 0L) {
+            val pctRede = ((enviado * 100L) / total).toInt().coerceIn(1, 99)
+            val pctTotal = (40 + (pctRede * 58) / 100).coerceIn(40, 98)
+            val mbEnv = String.format(Locale.US, "%.1f", enviado / (1024.0 * 1024.0))
+            val mbTot = String.format(Locale.US, "%.1f", total / (1024.0 * 1024.0))
+            val txtStatus = if (uploadArquivoOk) {
+                "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)..."
+            } else {
+                "Enviando $loteTag'$nomeArquivo': $mbEnv / $mbTot MB ($pctTotal%)"
+            }
+            NexusTransfer.atualizarProgresso(pctTotal, txtStatus)
+        } else if (uploadArquivoOk) {
+            NexusTransfer.atualizarProgresso(99, "Confirmando na nuvem SSD $loteTag'$nomeArquivo' (99%)...")
+        }
+
+        if (remote != null && !remote.isUploadingActive && !uploadArquivoOk) {
+            inativoCount++
+            if (inativoCount >= 80 && msgConfirmadaNoServidor) return Pair(true, "OK")
+        } else {
+            inativoCount = 0
+        }
+    }
+    return Pair(true, "OK")
+}
+// === FIM DA PARTE 1 DE 3 ===
+// === CONTINUAÇÃO: PARTE 2 DE 3 (COLE LOGO ABAIXO DA PARTE 1) ===
 
 // === GESTÃO DE COFRES HÍBRIDOS (MS = MENSAGENS SALVAS | CP = CANAL PRIVADO) ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
@@ -1336,6 +2293,7 @@ fun eliminarMultiplosFicheiros(
 
         marcarFicheiroComoDeletado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
         marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+        NexusAI.removerIndice(context, arq.dataUpload)
 
         try {
             val thumb = NexusThumbCache.obterMiniatura(arq)
@@ -1887,10 +2845,6 @@ fun calcularBrilhoMedioBitmap(bmp: Bitmap): Int {
     return if (totalAmostras > 0) (somaBrilho / totalAmostras).toInt() else 0
 }
 
-fun bitmapNaoEhTotalmentePreto(bmp: Bitmap): Boolean {
-    return calcularBrilhoMedioBitmap(bmp) >= 26
-}
-
 fun clarearBitmapVideoSeNecessario(origem: Bitmap): Bitmap {
     val brilho = calcularBrilhoMedioBitmap(origem)
     if (brilho >= 68) return origem
@@ -2340,7 +3294,7 @@ fun sincronizarCofreDaNuvem(
     }
 }
 
-// === FILA DE CARREGAMENTO DE MINIATURAS EM SEGUNDO PLANO ===
+// === FILA DE CARREGAMENTO DE MINIATURAS EM SEGUNDO PLANO (PRIORIZA CAPAS ULTRALEVES DA NUVEM) ===
 suspend fun carregarMiniaturaIndividualDaNuvem(
     context: Context,
     client: Client,
@@ -2388,7 +3342,7 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     if (thumbIdLeve != 0) {
         val arqThumb = baixarArquivoTDLibAssincrono(client, thumbIdLeve, prioridade = 30, maxTentativas = 80, controlarPausaTransfer = false) { pct, _, _ ->
             if (atualizarSubBarra) {
-                NexusLeituraNuvem.atualizarSubProgresso(pct, "Carregando capa: ${arq.nomeArquivo}")
+                NexusLeituraNuvem.atualizarSubProgresso(pct, "Capa rápida SSD: ${arq.nomeArquivo}")
             }
         }
         if (arqThumb != null && arqThumb.exists() && arqThumb.length() > 100L) {
@@ -2402,7 +3356,7 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
         ext == "PDF"
 
     if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && arq.tamanhoBytes <= 250L * 1024L * 1024L) {
-        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 24, maxTentativas = 450, controlarPausaTransfer = false) { pct, _, _ ->
+        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 20, maxTentativas = 450, controlarPausaTransfer = false) { pct, _, _ ->
             if (atualizarSubBarra) {
                 NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
             }
@@ -2421,7 +3375,7 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     return@withContext miniaturaPronta
 }
 
-// === ABERTURA E DOWNLOAD DE FICHEIROS COM SUPORTE A PAUSAR, CONTINUAR E CANCELAR NO "X" ===
+// === ABERTURA COM PRIORIDADE TOTAL DE BANDA (PAUSA A FILA DE CAPAS AUTOMATICAMENTE AO ABRIR) ===
 fun garantirFicheiroLocal(
     context: Context,
     client: Client,
@@ -2446,59 +3400,27 @@ fun garantirFicheiroLocal(
         }
     }
 
+    val leituraEstavaAtiva = NexusLeituraNuvem.ativo.value && !NexusLeituraNuvem.pausado.value
+    if (leituraEstavaAtiva) {
+        NexusLeituraNuvem.pausado.value = true
+    }
+
     NexusTransfer.jobAtivo?.cancel()
     NexusTransfer.jobAtivo = kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
-        var targetFileId = arq.fileId
-        NexusTransfer.iniciar(
-            texto = "Baixando '${arq.nomeArquivo}' (5%)...",
-            upload = false,
-            fileId = targetFileId
-        )
+        try {
+            var targetFileId = arq.fileId
+            NexusTransfer.iniciar(
+                texto = "Baixando '${arq.nomeArquivo}' (Prioridade máxima)...",
+                upload = false,
+                fileId = targetFileId,
+                context = context
+            )
 
-        var arquivoBaixado = withContext(Dispatchers.IO) {
-            if (targetFileId != 0) {
-                baixarArquivoTDLibAssincrono(
-                    client = client,
-                    fileId = targetFileId,
-                    prioridade = 32,
-                    maxTentativas = 800,
-                    controlarPausaTransfer = true
-                ) { pct, baixadoBytes, totalBytes ->
-                    if (!NexusTransfer.cancelado.value) {
-                        val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
-                        val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
-                        NexusTransfer.progress.value = pct
-                        NexusTransfer.label.value = if (totalBytes > 0) {
-                            "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
-                        } else {
-                            "Baixando '${arq.nomeArquivo}' ($pct%)..."
-                        }
-                    }
-                }
-            } else null
-        }
-
-        if (NexusTransfer.cancelado.value) {
-            NexusTransfer.encerrar()
-            Toast.makeText(context, "Download de '${arq.nomeArquivo}' cancelado.", Toast.LENGTH_SHORT).show()
-            return@launch
-        }
-
-        if (arquivoBaixado == null && usuarioAtivo.isNotBlank() && !NexusTransfer.cancelado.value) {
-            NexusTransfer.label.value = "Localizando '${arq.nomeArquivo}' na nuvem SSD..."
-            val (novoId, novoThumbId) = withContext(Dispatchers.IO) {
-                recuperarFileIdNaNuvemPorNome(context, client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
-            }
-            if (novoId != 0 && !NexusTransfer.cancelado.value) {
-                targetFileId = novoId
-                NexusTransfer.fileIdAtivo.value = novoId
-                if (novoThumbId != 0) {
-                    NexusThumbCache.salvarThumbIdNuvem(context, novoId, novoThumbId)
-                }
-                arquivoBaixado = withContext(Dispatchers.IO) {
+            var arquivoBaixado = withContext(Dispatchers.IO) {
+                if (targetFileId != 0) {
                     baixarArquivoTDLibAssincrono(
                         client = client,
-                        fileId = novoId,
+                        fileId = targetFileId,
                         prioridade = 32,
                         maxTentativas = 800,
                         controlarPausaTransfer = true
@@ -2506,42 +3428,86 @@ fun garantirFicheiroLocal(
                         if (!NexusTransfer.cancelado.value) {
                             val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
                             val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
-                            NexusTransfer.progress.value = pct
-                            NexusTransfer.label.value = if (totalBytes > 0) {
+                            val txt = if (totalBytes > 0) {
                                 "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
                             } else {
                                 "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                            }
+                            NexusTransfer.atualizarProgresso(pct, txt)
+                        }
+                    }
+                } else null
+            }
+
+            if (NexusTransfer.cancelado.value) {
+                NexusTransfer.encerrar()
+                Toast.makeText(context, "Download de '${arq.nomeArquivo}' cancelado.", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+
+            if (arquivoBaixado == null && usuarioAtivo.isNotBlank() && !NexusTransfer.cancelado.value) {
+                NexusTransfer.label.value = "Localizando '${arq.nomeArquivo}' na nuvem SSD..."
+                val (novoId, novoThumbId) = withContext(Dispatchers.IO) {
+                    recuperarFileIdNaNuvemPorNome(context, client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
+                }
+                if (novoId != 0 && !NexusTransfer.cancelado.value) {
+                    targetFileId = novoId
+                    NexusTransfer.fileIdAtivo.value = novoId
+                    if (novoThumbId != 0) {
+                        NexusThumbCache.salvarThumbIdNuvem(context, novoId, novoThumbId)
+                    }
+                    arquivoBaixado = withContext(Dispatchers.IO) {
+                        baixarArquivoTDLibAssincrono(
+                            client = client,
+                            fileId = novoId,
+                            prioridade = 32,
+                            maxTentativas = 800,
+                            controlarPausaTransfer = true
+                        ) { pct, baixadoBytes, totalBytes ->
+                            if (!NexusTransfer.cancelado.value) {
+                                val mbBaixado = String.format(Locale.US, "%.1f", baixadoBytes / (1024.0 * 1024.0))
+                                val mbTotal = String.format(Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                                val txt = if (totalBytes > 0) {
+                                    "Baixando '${arq.nomeArquivo}': $mbBaixado / $mbTotal MB ($pct%)"
+                                } else {
+                                    "Baixando '${arq.nomeArquivo}' ($pct%)..."
+                                }
+                                NexusTransfer.atualizarProgresso(pct, txt)
                             }
                         }
                     }
                 }
             }
-        }
 
-        val foiCancelado = NexusTransfer.cancelado.value
-        NexusTransfer.encerrar()
-        if (foiCancelado) {
-            Toast.makeText(context, "Download cancelado.", Toast.LENGTH_SHORT).show()
-            return@launch
-        }
+            val foiCancelado = NexusTransfer.cancelado.value
+            NexusTransfer.encerrar()
+            if (foiCancelado) {
+                Toast.makeText(context, "Download cancelado.", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
 
-        if (arquivoBaixado != null && arquivoBaixado.exists() && arquivoBaixado.length() > 100L) {
-            val capaJpg = withContext(Dispatchers.IO) {
-                prepararMiniaturaDeFicheiroBaixado(context, arquivoBaixado, arq.nomeArquivo)
-            }
-            val uriRealCompleto = Uri.fromFile(arquivoBaixado).toString()
-            NexusThumbCache.salvarArquivoCompleto(context, arq.dataUpload, uriRealCompleto)
-            if (capaJpg.isNotBlank()) {
-                vm.atualizarCaminhoMiniatura(context, arq, capaJpg)
-            }
-            onReady(
-                arq.copy(
-                    fileId = if (targetFileId != 0) targetFileId else arq.fileId,
-                    caminhoMiniatura = uriRealCompleto
+            if (arquivoBaixado != null && arquivoBaixado.exists() && arquivoBaixado.length() > 100L) {
+                val capaJpg = withContext(Dispatchers.IO) {
+                    prepararMiniaturaDeFicheiroBaixado(context, arquivoBaixado, arq.nomeArquivo)
+                }
+                val uriRealCompleto = Uri.fromFile(arquivoBaixado).toString()
+                NexusThumbCache.salvarArquivoCompleto(context, arq.dataUpload, uriRealCompleto)
+                if (capaJpg.isNotBlank()) {
+                    vm.atualizarCaminhoMiniatura(context, arq, capaJpg)
+                }
+                onReady(
+                    arq.copy(
+                        fileId = if (targetFileId != 0) targetFileId else arq.fileId,
+                        caminhoMiniatura = uriRealCompleto
+                    )
                 )
-            )
-        } else {
-            Toast.makeText(context, "Não foi possível carregar '${arq.nomeArquivo}' da nuvem agora.", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(context, "Não foi possível carregar '${arq.nomeArquivo}' da nuvem agora.", Toast.LENGTH_SHORT).show()
+            }
+        } finally {
+            if (leituraEstavaAtiva && NexusLeituraNuvem.ativo.value) {
+                NexusLeituraNuvem.pausado.value = false
+            }
         }
     }
 }
@@ -2885,8 +3851,7 @@ suspend fun copiarUriParaCacheTDLib(
                     lidosTotal += read
                     if (tamanhoEsperado > 0L && !NexusTransfer.cancelado.value) {
                         val pctCopia = ((lidosTotal * 35L) / tamanhoEsperado).toInt().coerceIn(5, 35)
-                        NexusTransfer.progress.value = pctCopia
-                        NexusTransfer.label.value = "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)..."
+                        NexusTransfer.atualizarProgresso(pctCopia, "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)...")
                     }
                 }
             }
@@ -3061,14 +4026,64 @@ fun copiarLoteParaDownloads(
     }
 }
 
-// Calcula o CRC32 TL oficial da TDLib para alinhar o método virtual getConstructor()
+// === ACELERAÇÃO DE CAPAS: CRIA INPUTTHUMBNAIL LEVE (<= 320px, <= 180KB) PARA ANEXAR NO UPLOAD ===
+fun criarInputThumbnailLeve(context: Context, caminhoCapaJpg: String): TdApi.InputThumbnail? {
+    if (caminhoCapaJpg.isBlank()) return null
+    return try {
+        val limpo = if (caminhoCapaJpg.startsWith("file://")) Uri.parse(caminhoCapaJpg).path ?: caminhoCapaJpg.removePrefix("file://") else caminhoCapaJpg
+        val origem = File(limpo)
+        if (!origem.exists() || origem.length() <= 256L) return null
+
+        val bmpOrig = BitmapFactory.decodeFile(origem.absolutePath) ?: return null
+        val maxLado = 320
+        val wOrig = bmpOrig.width
+        val hOrig = bmpOrig.height
+        if (wOrig <= 0 || hOrig <= 0) {
+            bmpOrig.recycle()
+            return null
+        }
+
+        val escala = minOf(maxLado.toFloat() / wOrig.toFloat(), maxLado.toFloat() / hOrig.toFloat(), 1f)
+        val wFinal = (wOrig * escala).toInt().coerceIn(32, maxLado)
+        val hFinal = (hOrig * escala).toInt().coerceIn(32, maxLado)
+        val bmpScaled = if (escala < 0.99f) Bitmap.createScaledBitmap(bmpOrig, wFinal, hFinal, true) else bmpOrig
+
+        val dir = File(context.filesDir, "tdlib_upload_cache/thumbs").apply { if (!exists()) mkdirs() }
+        val thumbFile = File(dir, "tdthumb_${System.currentTimeMillis()}_${wFinal}x${hFinal}.jpg")
+        FileOutputStream(thumbFile).use { out ->
+            bmpScaled.compress(Bitmap.CompressFormat.JPEG, 78, out)
+        }
+        if (bmpScaled !== bmpOrig) bmpScaled.recycle()
+        bmpOrig.recycle()
+
+        if (!thumbFile.exists() || thumbFile.length() <= 128L || thumbFile.length() > 195_000L) {
+            thumbFile.delete()
+            return null
+        }
+
+        val inputThumb = TdApi.InputThumbnail()
+        val thumbInputFile = TdApi.InputFileLocal(thumbFile.absolutePath)
+        for (f in TdApi.InputThumbnail::class.java.declaredFields) {
+            if (JavaModifier.isStatic(f.modifiers)) continue
+            f.isAccessible = true
+            when {
+                f.type.isAssignableFrom(thumbInputFile.javaClass) || f.name == "thumbnail" -> f.set(inputThumb, thumbInputFile)
+                f.name == "width" -> f.setInt(inputThumb, wFinal)
+                f.name == "height" -> f.setInt(inputThumb, hFinal)
+            }
+        }
+        inputThumb
+    } catch (_: Throwable) {
+        null
+    }
+}
+
 fun crc32Tl(esquema: String): Int {
     val crc = CRC32()
     crc.update(esquema.toByteArray(Charsets.UTF_8))
     return crc.value.toInt()
 }
 
-// Extrai diretamente do binário nativo libtdjni.so as assinaturas JNI que o C++ procura
 fun inspecionarAssinaturasNativasSo(context: Context): String {
     return try {
         val soFile = File(context.applicationInfo.nativeLibraryDir, "libtdjni.so")
@@ -3102,7 +4117,6 @@ fun inspecionarAssinaturasNativasSo(context: Context): String {
     }
 }
 
-// Preenche qualquer wrapper de mídia da TdApi com o InputFile
 fun criarInstanciaWrapperMidia(wrapperClass: Class<*>, inputFile: TdApi.InputFile, nomeLimpo: String): Any? {
     for (ctor in wrapperClass.constructors) {
         val params = ctor.parameterTypes
@@ -3147,11 +4161,12 @@ fun criarInstanciaWrapperMidia(wrapperClass: Class<*>, inputFile: TdApi.InputFil
     }
 }
 
-// === CONSTRUTOR DINÂMICO COMPATÍVEL COM A TDLIB ESTÁVEL E SNAPSHOT ===
+// === CONSTRUTOR DINÂMICO COM ANEXO AUTOMÁTICO DE INPUTTHUMBNAIL (ACELERAÇÃO DE CAPAS) ===
 fun construirConteudoUploadTDLib(
     inputFile: TdApi.InputFile,
     nomeLimpo: String,
     legenda: TdApi.FormattedText,
+    inputThumb: TdApi.InputThumbnail? = null,
     modoTentativa: Int = 0
 ): Pair<TdApi.InputMessageContent, String> {
     val idsClassicosDoc = intArrayOf(
@@ -3164,6 +4179,7 @@ fun construirConteudoUploadTDLib(
     )
 
     val idEscolhido = idsClassicosDoc[modoTentativa.coerceIn(0, idsClassicosDoc.lastIndex)]
+    val thumbParaEnviar = if (modoTentativa < 3) inputThumb else null
 
     val doc = if (modoTentativa == 0) {
         TdApi.InputMessageDocument()
@@ -3179,6 +4195,9 @@ fun construirConteudoUploadTDLib(
         try {
             when {
                 f.type.isAssignableFrom(legenda.javaClass) -> f.set(doc, legenda)
+                thumbParaEnviar != null && (TdApi.InputThumbnail::class.java.isAssignableFrom(f.type) || f.name == "thumbnail") -> {
+                    f.set(doc, thumbParaEnviar)
+                }
                 f.type.isAssignableFrom(inputFile.javaClass) -> f.set(doc, inputFile)
                 f.name == "document" -> {
                     val inst = criarInstanciaWrapperMidia(f.type, inputFile, nomeLimpo)
@@ -3191,7 +4210,7 @@ fun construirConteudoUploadTDLib(
     return Pair(doc, "DocCtor($idEscolhido)")
 }
 
-// === ENVIO HÍBRIDO PARA MS (MENSAGENS SALVAS) OU CP (CANAL PRIVADO) COM CAPTURA DE VÍDEO/DOC ===
+// === ENVIO HÍBRIDO PARA MS OU CP COM CAPA ULTRALEVE ANEXADA (INPUTTHUMBNAIL) ===
 fun enviarParaMensagensSalvas(
     context: Context,
     client: Client,
@@ -3213,6 +4232,7 @@ fun enviarParaMensagensSalvas(
     }
 
     val nomeLimpo = limparPrefixoTimestamp(nomeOriginal)
+    val inputThumbLeve = criarInputThumbnailLeve(context, caminhoCapaJpg)
 
     obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, modoCofre, erroChat ->
         if (NexusTransfer.cancelado.value) {
@@ -3234,6 +4254,7 @@ fun enviarParaMensagensSalvas(
                     inputFile = fileLocal,
                     nomeLimpo = nomeLimpo,
                     legenda = leg,
+                    inputThumb = inputThumbLeve,
                     modoTentativa = etapa
                 )
 
@@ -3342,7 +4363,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS AGRUPADA POR DATA COM CHAVE 100% ÚNICA (SEM CRASH DE KEY DUPLICADA) ===
+// === GRELHA DE ARQUIVOS AGRUPADA POR DATA COM CHAVE BLINDADA E SELO DE INDEXAÇÃO IA ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -3598,8 +4619,8 @@ fun GrelhaArquivos(
         }
     }
 }
-// === FIM DA PARTE 1 (ENVIE "parte 2" PARA RECEBER O RESTANTE DO CÓDIGO) ===
-// === CONTINUAÇÃO: PARTE 2 DE 2 (COLE LOGO ABAIXO DA PARTE 1) ===
+// === FIM DA PARTE 2 DE 3 ===
+// === CONTINUAÇÃO: PARTE 3 DE 3 (COLE LOGO ABAIXO DA PARTE 2) ===
 
 private data class ResultadoEnvioSSD(
     val ok: Boolean,
@@ -3648,6 +4669,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val transferLabel by NexusTransfer.label.collectAsState()
     val transferPaused by NexusTransfer.pausado.collectAsState()
     val transferIsUpload by NexusTransfer.ehUpload.collectAsState()
+    val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
+    val bannerStatusGlobal by NexusTransfer.bannerStatusGlobal.collectAsState()
 
     val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
     val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
@@ -3657,13 +4680,34 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
 
     val context = LocalContext.current
+    val appContext = remember(context) { context.applicationContext }
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val sheetState = rememberModalBottomSheetState()
     var jobFilaMiniaturas by remember { mutableStateOf<Job?>(null) }
 
+    // Permissão de notificação (Android 13+) para manter o progresso fixo de upload em segundo plano
+    val notifPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    fun solicitarPermissaoNotificacaoSeNecessario() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val concedida = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!concedida) {
+                try {
+                    notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         NexusThumbCache.inicializar(context)
+        NexusAI.inicializar(context)
     }
 
     var phoneNumber by remember { mutableStateOf("+5585") }
@@ -3683,6 +4727,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
     var isCheckingVault by remember { mutableStateOf(false) }
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
+
+    // Estados da Nexus IA (Leitura Offline OCR + Extrator PIX/Boletos/Valores)
+    var arquivoAnaliseIA by remember { mutableStateOf<ArquivoNuvem?>(null) }
+    var analisandoIA by remember { mutableStateOf(false) }
+    var resultadoIA by remember { mutableStateOf<ResultadoAnaliseIA?>(null) }
+    var iaIndexTick by remember { mutableIntStateOf(0) }
+    var indexandoLoteIA by remember { mutableStateOf(false) }
 
     // Sincroniza silenciosamente os registos (MS e CP) na nuvem sem exibir nomes de perfis na tela
     LaunchedEffect(loginStep, vaultUnlocked) {
@@ -3722,7 +4773,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showAboutDialog by remember { mutableStateOf(false) }
     var showCacheDialog by remember { mutableStateOf(false) }
     var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
-    var isUploading by remember { mutableStateOf(false) }
+
+    // Atualiza donos/pastas sempre que um upload em segundo plano grava novos itens no Room
+    LaunchedEffect(todosArquivos.size) {
+        mapaDonos = carregarDonosFicheiros(context)
+        mapaPastas = carregarVinculosPastas(context)
+        if (activeVaultUser.isNotBlank()) {
+            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+        }
+    }
 
     // Filtro com chave única por dataUpload + nome para impedir qualquer duplicidade na grade
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
@@ -3752,6 +4811,30 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     val armazenamentoUsuario = remember(arquivos) {
         arquivos.sumOf { it.tamanhoBytes }
+    }
+
+    // Função auxiliar para disparar a análise Nexus IA (OCR + PIX/Boletos/Valores) em qualquer arquivo
+    fun abrirAnaliseIA(arq: ArquivoNuvem, forcarReleitura: Boolean = false) {
+        arquivoAnaliseIA = arq
+        analisandoIA = true
+        resultadoIA = null
+        garantirFicheiroLocal(context, client, activeVaultUser, arq, vm) { arqPronto ->
+            scope.launch {
+                val caminhoAlvo = NexusThumbCache.obterArquivoCompleto(arqPronto)
+                    .ifBlank { arqPronto.caminhoMiniatura ?: "" }
+                    .ifBlank { NexusThumbCache.obterMiniatura(arqPronto) }
+                val texto = NexusAI.extrairTextoDeArquivo(
+                    context = context,
+                    caminhoArquivo = caminhoAlvo,
+                    nomeArquivo = arqPronto.nomeArquivo,
+                    dataUpload = arqPronto.dataUpload,
+                    forcarReleitura = forcarReleitura
+                )
+                resultadoIA = NexusAI.analisarConteudo(texto, arqPronto.nomeArquivo)
+                analisandoIA = false
+                iaIndexTick++
+            }
+        }
     }
 
     // Fila contínua em segundo plano com suporte a Pausa/Retomada
@@ -3845,6 +4928,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
+            solicitarPermissaoNotificacaoSeNecessario()
             vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
             val arquivosIniciais = vm.obterArquivosReais()
             val pastasIniciais = vm.obterPastasReais()
@@ -3906,12 +4990,23 @@ fun NexusUI(dao: NexusDao, client: Client) {
         )
     }
 
-    val listaVisivelAtual = remember(arquivos, selectedTab, pastaAberta, mapaPastas, searchQuery) {
+    LaunchedEffect(bannerStatusGlobal) {
+        if (bannerStatusGlobal.isNotBlank()) {
+            cloudBannerText = bannerStatusGlobal
+        }
+    }
+
+    // Busca inteligente: encontra tanto pelo nome do ficheiro quanto pelo texto lido dentro da imagem/PDF via Nexus IA
+    val listaVisivelAtual = remember(arquivos, selectedTab, pastaAberta, mapaPastas, searchQuery, iaIndexTick) {
+        val filtraPorConsulta: (ArquivoNuvem) -> Boolean = { arq ->
+            searchQuery.isBlank() ||
+                arq.nomeArquivo.contains(searchQuery, ignoreCase = true) ||
+                NexusAI.correspondeBuscaIA(context, arq.dataUpload, searchQuery)
+        }
         if (selectedTab == 1) {
             if (pastaAberta != null) {
                 arquivos.filter {
-                    mapaPastas[it.dataUpload]?.equals(pastaAberta, ignoreCase = true) == true &&
-                        (searchQuery.isBlank() || it.nomeArquivo.contains(searchQuery, ignoreCase = true))
+                    mapaPastas[it.dataUpload]?.equals(pastaAberta, ignoreCase = true) == true && filtraPorConsulta(it)
                 }
             } else {
                 emptyList()
@@ -3923,8 +5018,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 4 -> arquivos.filter { !ehArquivoImagem(it.nomeArquivo) && !ehArquivoVideo(it.nomeArquivo) }
                 else -> arquivos
             }
-            if (searchQuery.isBlank()) base
-            else base.filter { it.nomeArquivo.contains(searchQuery, ignoreCase = true) }
+            if (searchQuery.isBlank()) base else base.filter(filtraPorConsulta)
         }
     }
 
@@ -3940,11 +5034,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     LaunchedEffect(isUploading, transferPaused) {
         while (isUploading) {
-            delay(350)
+            delay(450)
             if (!transferPaused && !NexusTransfer.cancelado.value) {
                 val atual = NexusTransfer.progress.value ?: 10
                 if (atual in 35..88) {
-                    NexusTransfer.progress.value = (atual + 4).coerceAtMost(90)
+                    NexusTransfer.atualizarProgresso((atual + 3).coerceAtMost(90))
                 }
             }
         }
@@ -3956,17 +5050,25 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Upload em lote com confirmação individual e gravação síncrona no banco para nenhum vídeo faltar
+    // === UPLOAD REAL EM SEGUNDO PLANO (FORA DA TELA VIA NexusBackgroundScope + NexusUploadService) ===
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
+        solicitarPermissaoNotificacaoSeNecessario()
+
+        val usuarioAlvo = activeVaultUser
+        val modoAlvo = vaultStorageMode
+
         NexusTransfer.jobAtivo?.cancel()
-        NexusTransfer.jobAtivo = scope.launch {
+        NexusTransfer.jobAtivo = NexusBackgroundScope.scope.launch {
             var enviados = 0
             val total = uris.size
             val nomesUsadosNoLote = mutableSetOf<String>()
             try {
-                isUploading = true
-                NexusTransfer.iniciar("Preparando envio $vaultStorageMode (1/$total)...", upload = true)
+                NexusTransfer.iniciar(
+                    texto = "Preparando envio $modoAlvo (1/$total)...",
+                    upload = true,
+                    context = appContext
+                )
 
                 for ((index, uri) in uris.withIndex()) {
                     if (NexusTransfer.cancelado.value) break
@@ -3976,22 +5078,21 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                     if (NexusTransfer.cancelado.value) break
 
-                    val (nomeBruto, tamanho) = obterDetalhesFicheiro(context, uri)
+                    val (nomeBruto, tamanho) = obterDetalhesFicheiro(appContext, uri)
                     val nome = gerarNomeUnicoNoLote(nomeBruto, nomesUsadosNoLote)
                     val loteTag = "(${index + 1}/$total) "
 
-                    NexusTransfer.progress.value = 8
-                    NexusTransfer.label.value = "Preparando $loteTag'$nome'..."
-                    cloudBannerText = "Enviando [$vaultStorageMode] $loteTag'$nome'..."
+                    NexusTransfer.atualizarProgresso(8, "Preparando $loteTag'$nome'...", forcarNotif = true)
+                    NexusTransfer.bannerStatusGlobal.value = "Enviando [$modoAlvo] $loteTag'$nome'..."
 
-                    val arqTemp = copiarUriParaCacheTDLib(context, uri, nome, tamanho, loteTag)
+                    val arqTemp = copiarUriParaCacheTDLib(appContext, uri, nome, tamanho, loteTag)
                     if (NexusTransfer.cancelado.value) {
                         arqTemp?.delete()
                         break
                     }
 
                     val capaJpg = if (arqTemp != null) {
-                        withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, uri, nome, arqTemp) }
+                        salvarMiniaturaPrivada(appContext, uri, nome, arqTemp)
                     } else ""
 
                     if (arqTemp != null) {
@@ -4005,14 +5106,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
 
                         val tamFinal = if (arqTemp.length() > 0L) arqTemp.length() else tamanho
-                        desmarcarFicheiroDeletado(context, activeVaultUser, nome, tamFinal)
-                        marcarFicheiroComoSincronizado(context, activeVaultUser, nome, tamFinal, uri.toString())
+                        desmarcarFicheiroDeletado(appContext, usuarioAlvo, nome, tamFinal)
+                        marcarFicheiroComoSincronizado(appContext, usuarioAlvo, nome, tamFinal, uri.toString())
 
-                        NexusTransfer.progress.value = 40
-                        NexusTransfer.label.value = "Enviando para nuvem SSD [$vaultStorageMode] $loteTag'$nome'..."
+                        NexusTransfer.atualizarProgresso(40, "Enviando para nuvem SSD [$modoAlvo] $loteTag'$nome'...", forcarNotif = true)
 
                         val deferred = CompletableDeferred<ResultadoEnvioSSD>()
-                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, cId, mId, msg ->
+                        enviarParaMensagensSalvas(appContext, client, usuarioAlvo, arqTemp.absolutePath, capaJpg, nome, pastaEscolhida) { ok, rId, cId, mId, msg ->
                             deferred.complete(ResultadoEnvioSSD(ok, rId, cId, mId, msg))
                         }
                         val res = deferred.await()
@@ -4024,8 +5124,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                         if (!res.ok) {
                             arqTemp.delete()
-                            cloudBannerText = res.mensagem
-                            erroUploadDetalhado = res.mensagem
+                            NexusTransfer.bannerStatusGlobal.value = res.mensagem
+                            withContext(Dispatchers.Main) { erroUploadDetalhado = res.mensagem }
                             continue
                         }
 
@@ -4041,31 +5141,34 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
                             val motivo = if (NexusTransfer.cancelado.value) "Envio de '$nome' cancelado." else erroRede
-                            cloudBannerText = motivo
+                            NexusTransfer.bannerStatusGlobal.value = motivo
                             if (!NexusTransfer.cancelado.value && erroRede.isNotBlank() && erroRede != "OK") {
-                                erroUploadDetalhado = erroRede
+                                withContext(Dispatchers.Main) { erroUploadDetalhado = erroRede }
                             }
                             break
                         }
 
-                        cloudBannerText = res.mensagem
+                        NexusTransfer.bannerStatusGlobal.value = res.mensagem
                         enviados++
                         val ts = System.currentTimeMillis() + (index * 15L) + enviados
-                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        salvarDonoFicheiro(appContext, ts, usuarioAlvo)
                         if (capaJpg.isNotBlank()) {
-                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                            NexusThumbCache.salvarMiniatura(appContext, ts, capaJpg)
                         }
-                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        if (pastaEscolhida.isNotBlank()) {
-                            vm.criarPasta(pastaEscolhida)
-                            associarPastaAoUsuario(context, activeVaultUser, pastaEscolhida)
-                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                            salvarVinculoPasta(context, ts, pastaEscolhida)
-                        }
-                        mapaDonos = carregarDonosFicheiros(context)
-                        mapaPastas = carregarVinculosPastas(context)
+                        NexusThumbCache.salvarArquivoCompleto(appContext, ts, Uri.fromFile(arqTemp).toString())
 
-                        vm.salvarArquivo(
+                        if (pastaEscolhida.isNotBlank()) {
+                            try {
+                                val atuaisP = dao.buscarPastas().first()
+                                if (atuaisP.none { it.nomePasta.trim().equals(pastaEscolhida.trim(), ignoreCase = true) }) {
+                                    dao.criarPasta(PastaNuvem(nomePasta = pastaEscolhida.trim()))
+                                }
+                            } catch (_: Throwable) {}
+                            associarPastaAoUsuario(appContext, usuarioAlvo, pastaEscolhida)
+                            salvarVinculoPasta(appContext, ts, pastaEscolhida)
+                        }
+
+                        vm.salvarArquivoSincrono(
                             ArquivoNuvem(
                                 fileId = res.fileId,
                                 nomeArquivo = nome,
@@ -4074,45 +5177,75 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 caminhoMiniatura = capaJpg
                             ),
                             forcarNovoRegistro = true
-                        ).join()
+                        )
+
+                        // Indexação automática silenciosa via Nexus IA para imagens, PDFs e textos recém-enviados
+                        if (NexusAI.suportaLeituraIA(nome)) {
+                            NexusBackgroundScope.scope.launch {
+                                NexusAI.extrairTextoDeArquivo(appContext, arqTemp.absolutePath, nome, ts)
+                            }
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            mapaDonos = carregarDonosFicheiros(appContext)
+                            mapaPastas = carregarVinculosPastas(appContext)
+                            if (pastaEscolhida.isNotBlank()) {
+                                pastasDoUsuarioSet = carregarPastasDoUsuario(appContext, usuarioAlvo)
+                            }
+                        }
                     } else {
-                        cloudBannerText = "Erro ao ler '$nome'."
-                        Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                        val erroLeitura = "Erro ao ler '$nome'."
+                        NexusTransfer.bannerStatusGlobal.value = erroLeitura
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(appContext, erroLeitura, Toast.LENGTH_SHORT).show()
+                        }
                     }
                     delay(120)
                 }
 
-                mapaDonos = carregarDonosFicheiros(context)
-                mapaPastas = carregarVinculosPastas(context)
-
-                if (NexusTransfer.cancelado.value) {
-                    cloudBannerText = "Envio cancelado ($enviados guardado(s))."
+                val msgFinal = if (NexusTransfer.cancelado.value) {
+                    "Envio cancelado ($enviados guardado(s))."
                 } else if (enviados > 0) {
-                    cloudBannerText = if (total > 1) {
-                        "$enviados de $total ficheiros guardados no cofre [$vaultStorageMode] de $activeVaultUser!"
+                    if (total > 1) {
+                        "$enviados de $total ficheiros guardados no cofre [$modoAlvo] de $usuarioAlvo!"
                     } else {
-                        "Guardado no cofre [$vaultStorageMode] de $activeVaultUser!"
+                        "Guardado no cofre [$modoAlvo] de $usuarioAlvo!"
                     }
-                    Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                } else ""
+
+                if (msgFinal.isNotBlank()) {
+                    NexusTransfer.bannerStatusGlobal.value = msgFinal
+                    withContext(Dispatchers.Main) {
+                        mapaDonos = carregarDonosFicheiros(appContext)
+                        mapaPastas = carregarVinculosPastas(appContext)
+                        Toast.makeText(appContext, msgFinal, Toast.LENGTH_SHORT).show()
+                    }
                 }
             } finally {
-                isUploading = false
                 NexusTransfer.encerrar()
             }
         }
     }
 
-    // Sincronização de novos arquivos com confirmação e gravação garantida no banco local
+    // === SINCRONIZAÇÃO AUTOMÁTICA REAL EM SEGUNDO PLANO (FORA DA TELA) ===
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
+        solicitarPermissaoNotificacaoSeNecessario()
+
+        val usuarioAlvo = activeVaultUser
+        val modoAlvo = vaultStorageMode
+
         NexusTransfer.jobAtivo?.cancel()
-        NexusTransfer.jobAtivo = scope.launch {
+        NexusTransfer.jobAtivo = NexusBackgroundScope.scope.launch {
             var enviados = 0
             val total = itensParaEnviar.size
             val nomesUsadosNoLote = mutableSetOf<String>()
             try {
-                isUploading = true
-                NexusTransfer.iniciar("Sincronizando novos arquivos (1/$total)...", upload = true)
+                NexusTransfer.iniciar(
+                    texto = "Sincronizando novos arquivos (1/$total)...",
+                    upload = true,
+                    context = appContext
+                )
 
                 for ((index, item) in itensParaEnviar.withIndex()) {
                     if (NexusTransfer.cancelado.value) break
@@ -4123,23 +5256,22 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     if (NexusTransfer.cancelado.value) break
 
                     val nomeLimpo = gerarNomeUnicoNoLote(item.nome, nomesUsadosNoLote)
-                    desmarcarFicheiroDeletado(context, activeVaultUser, nomeLimpo, item.tamanho)
-                    marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, item.tamanho, item.uri.toString())
+                    desmarcarFicheiroDeletado(appContext, usuarioAlvo, nomeLimpo, item.tamanho)
+                    marcarFicheiroComoSincronizado(appContext, usuarioAlvo, nomeLimpo, item.tamanho, item.uri.toString())
 
                     val pastaAlvo = if (manterPastasOrigem) item.nomePastaOrigem.trim() else ""
                     val loteTag = "(${index + 1}/$total) "
-                    NexusTransfer.progress.value = 10
-                    NexusTransfer.label.value = "Sincronizando $loteTag'$nomeLimpo'..."
-                    cloudBannerText = "Sincronizando [$vaultStorageMode] $loteTag'$nomeLimpo'..."
+                    NexusTransfer.atualizarProgresso(10, "Sincronizando $loteTag'$nomeLimpo'...", forcarNotif = true)
+                    NexusTransfer.bannerStatusGlobal.value = "Sincronizando [$modoAlvo] $loteTag'$nomeLimpo'..."
 
-                    val arqTemp = copiarUriParaCacheTDLib(context, item.uri, nomeLimpo, item.tamanho, loteTag)
+                    val arqTemp = copiarUriParaCacheTDLib(appContext, item.uri, nomeLimpo, item.tamanho, loteTag)
                     if (NexusTransfer.cancelado.value) {
                         arqTemp?.delete()
                         break
                     }
 
                     val capaJpg = if (arqTemp != null) {
-                        withContext(Dispatchers.IO) { salvarMiniaturaPrivada(context, item.uri, nomeLimpo, arqTemp) }
+                        salvarMiniaturaPrivada(appContext, item.uri, nomeLimpo, arqTemp)
                     } else ""
 
                     if (arqTemp != null) {
@@ -4153,10 +5285,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
 
                         val tamFinal = if (arqTemp.length() > 0L) arqTemp.length() else item.tamanho
-                        marcarFicheiroComoSincronizado(context, activeVaultUser, nomeLimpo, tamFinal, item.uri.toString())
+                        marcarFicheiroComoSincronizado(appContext, usuarioAlvo, nomeLimpo, tamFinal, item.uri.toString())
 
                         val deferred = CompletableDeferred<ResultadoEnvioSSD>()
-                        enviarParaMensagensSalvas(context, client, activeVaultUser, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, cId, mId, msg ->
+                        enviarParaMensagensSalvas(appContext, client, usuarioAlvo, arqTemp.absolutePath, capaJpg, nomeLimpo, pastaAlvo) { ok, rId, cId, mId, msg ->
                             deferred.complete(ResultadoEnvioSSD(ok, rId, cId, mId, msg))
                         }
                         val res = deferred.await()
@@ -4168,8 +5300,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
                         if (!res.ok) {
                             arqTemp.delete()
-                            cloudBannerText = res.mensagem
-                            erroUploadDetalhado = res.mensagem
+                            NexusTransfer.bannerStatusGlobal.value = res.mensagem
+                            withContext(Dispatchers.Main) { erroUploadDetalhado = res.mensagem }
                             continue
                         }
 
@@ -4185,31 +5317,34 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         if (NexusTransfer.cancelado.value || !concluiuRede) {
                             arqTemp.delete()
                             val motivo = if (NexusTransfer.cancelado.value) "Sincronização cancelada." else erroRede
-                            cloudBannerText = motivo
+                            NexusTransfer.bannerStatusGlobal.value = motivo
                             if (!NexusTransfer.cancelado.value && erroRede.isNotBlank() && erroRede != "OK") {
-                                erroUploadDetalhado = erroRede
+                                withContext(Dispatchers.Main) { erroUploadDetalhado = erroRede }
                             }
                             break
                         }
 
-                        cloudBannerText = res.mensagem
+                        NexusTransfer.bannerStatusGlobal.value = res.mensagem
                         enviados++
                         val ts = System.currentTimeMillis() + (index * 15L) + enviados
-                        salvarDonoFicheiro(context, ts, activeVaultUser)
+                        salvarDonoFicheiro(appContext, ts, usuarioAlvo)
                         if (capaJpg.isNotBlank()) {
-                            NexusThumbCache.salvarMiniatura(context, ts, capaJpg)
+                            NexusThumbCache.salvarMiniatura(appContext, ts, capaJpg)
                         }
-                        NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(arqTemp).toString())
-                        if (pastaAlvo.isNotBlank()) {
-                            vm.criarPasta(pastaAlvo)
-                            associarPastaAoUsuario(context, activeVaultUser, pastaAlvo)
-                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                            salvarVinculoPasta(context, ts, pastaAlvo)
-                        }
-                        mapaDonos = carregarDonosFicheiros(context)
-                        mapaPastas = carregarVinculosPastas(context)
+                        NexusThumbCache.salvarArquivoCompleto(appContext, ts, Uri.fromFile(arqTemp).toString())
 
-                        vm.salvarArquivo(
+                        if (pastaAlvo.isNotBlank()) {
+                            try {
+                                val atuaisP = dao.buscarPastas().first()
+                                if (atuaisP.none { it.nomePasta.trim().equals(pastaAlvo.trim(), ignoreCase = true) }) {
+                                    dao.criarPasta(PastaNuvem(nomePasta = pastaAlvo.trim()))
+                                }
+                            } catch (_: Throwable) {}
+                            associarPastaAoUsuario(appContext, usuarioAlvo, pastaAlvo)
+                            salvarVinculoPasta(appContext, ts, pastaAlvo)
+                        }
+
+                        vm.salvarArquivoSincrono(
                             ArquivoNuvem(
                                 fileId = res.fileId,
                                 nomeArquivo = nomeLimpo,
@@ -4218,22 +5353,37 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 caminhoMiniatura = capaJpg
                             ),
                             forcarNovoRegistro = true
-                        ).join()
+                        )
+
+                        if (NexusAI.suportaLeituraIA(nomeLimpo)) {
+                            NexusBackgroundScope.scope.launch {
+                                NexusAI.extrairTextoDeArquivo(appContext, arqTemp.absolutePath, nomeLimpo, ts)
+                            }
+                        }
+
+                        withContext(Dispatchers.Main) {
+                            mapaDonos = carregarDonosFicheiros(appContext)
+                            mapaPastas = carregarVinculosPastas(appContext)
+                            if (pastaAlvo.isNotBlank()) {
+                                pastasDoUsuarioSet = carregarPastasDoUsuario(appContext, usuarioAlvo)
+                            }
+                        }
                     }
                     delay(120)
                 }
 
-                mapaDonos = carregarDonosFicheiros(context)
-                mapaPastas = carregarVinculosPastas(context)
-
-                cloudBannerText = if (NexusTransfer.cancelado.value) {
+                val msgSync = if (NexusTransfer.cancelado.value) {
                     "Sincronização interrompida ($enviados enviado(s))."
                 } else {
-                    "$enviados novo(s) ficheiro(s) sincronizados na nuvem SSD ($vaultStorageMode)!"
+                    "$enviados novo(s) ficheiro(s) sincronizados na nuvem SSD ($modoAlvo)!"
                 }
-                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                NexusTransfer.bannerStatusGlobal.value = msgSync
+                withContext(Dispatchers.Main) {
+                    mapaDonos = carregarDonosFicheiros(appContext)
+                    mapaPastas = carregarVinculosPastas(appContext)
+                    Toast.makeText(appContext, msgSync, Toast.LENGTH_SHORT).show()
+                }
             } finally {
-                isUploading = false
                 NexusTransfer.encerrar()
             }
         }
@@ -4360,7 +5510,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Icon(Icons.Default.Lock, null, tint = Gold, modifier = Modifier.size(56.dp))
                     Spacer(Modifier.height(12.dp))
                     Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontSize = 20.sp, fontWeight = FontWeight.Black)
-                    Text("SSD SOLUÇÕES • PERFIL HÍBRIDO", color = TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("SSD SOLUÇÕES • PERFIL HÍBRIDO + IA", color = TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
 
                     if (procurandoPerfisNuvem) {
                         Spacer(Modifier.height(10.dp))
@@ -4719,6 +5869,22 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
         }
         return
+    }
+
+    // === JANELA DE RESULTADO DA NEXUS IA (OCR + EXTRAÇÃO PIX / BOLETOS / VALORES) ===
+    if (arquivoAnaliseIA != null) {
+        val arqIA = arquivoAnaliseIA!!
+        DialogAnaliseIA(
+            context = context,
+            nomeArquivo = arqIA.nomeArquivo,
+            analisando = analisandoIA,
+            resultado = resultadoIA,
+            onReanalisar = { abrirAnaliseIA(arqIA, forcarReleitura = true) },
+            onDismiss = {
+                arquivoAnaliseIA = null
+                analisandoIA = false
+            }
+        )
     }
 
     // === JANELA DE ALERTA DETALHADO CASO O UPLOAD RETORNE ERRO ===
@@ -5119,7 +6285,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     Icon(Icons.Default.Cloud, null, tint = Gold, modifier = Modifier.size(60.dp))
                     Spacer(Modifier.height(10.dp))
                     Text("NEXUS CLOUD $NEXUS_VERSION", color = Gold, fontWeight = FontWeight.Black, fontSize = 22.sp)
-                    Text("Cofres Híbridos (MS & CP)", color = TextGrey, fontSize = 12.sp)
+                    Text("Cofres Híbridos (MS & CP) • Segundo Plano • Nexus IA", color = TextGrey, fontSize = 11.sp, textAlign = TextAlign.Center)
 
                     Spacer(Modifier.height(20.dp))
                     Column(
@@ -5540,7 +6706,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // VISUALIZADOR EM ECRÃ INTEIRO COM ZOOM INTERATIVO
+    // VISUALIZADOR EM ECRÃ INTEIRO COM ZOOM INTERATIVO + BOTÃO NEXUS IA
     if (viewerFile != null) {
         val cur = viewerFile!!
         val curMediaPath = NexusThumbCache.obterArquivoCompleto(cur).ifBlank { NexusThumbCache.obterMiniatura(cur) }
@@ -5549,6 +6715,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         val isVideo = ehArquivoVideo(cur.nomeArquivo)
         val isPdf = ext == "PDF"
         val isText = ext in listOf("TXT", "CSV", "LOG", "JSON", "XML", "MD")
+        val suportaIA = NexusAI.suportaLeituraIA(cur.nomeArquivo)
 
         var zoomScale by remember(cur.id) { mutableFloatStateOf(1f) }
         var zoomOffset by remember(cur.id) { mutableStateOf(Offset.Zero) }
@@ -5771,6 +6938,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Text(cur.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
                     }
+                    if (suportaIA) {
+                        IconButton(onClick = { abrirAnaliseIA(cur) }) {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = "Ler com Nexus IA", tint = Gold)
+                        }
+                    }
                     IconButton(onClick = {
                         novoNomeInput = cur.nomeArquivo.substringBeforeLast('.')
                         fileToRename = cur
@@ -5965,6 +7137,49 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
                 )
                 NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.AutoAwesome, null) },
+                    label = {
+                        val totalIdx = remember(iaIndexTick, arquivos.size) { NexusAI.totalIndexados(context) }
+                        Text(if (indexandoLoteIA) "Indexando com Nexus IA..." else "Indexar Busca IA ($totalIdx lido(s))")
+                    },
+                    selected = false,
+                    onClick = {
+                        scope.launch {
+                            drawerState.close()
+                            if (indexandoLoteIA) return@launch
+                            val candidatos = arquivos.filter { arq ->
+                                NexusAI.suportaLeituraIA(arq.nomeArquivo) &&
+                                    NexusAI.obterTextoIndexado(context, arq.dataUpload).isBlank() &&
+                                    (NexusThumbCache.obterArquivoCompleto(arq).isNotBlank() ||
+                                        NexusThumbCache.obterMiniatura(arq).isNotBlank())
+                            }
+                            if (candidatos.isEmpty()) {
+                                Toast.makeText(context, "Todos os arquivos locais já estão indexados pela Nexus IA!", Toast.LENGTH_SHORT).show()
+                                return@launch
+                            }
+                            indexandoLoteIA = true
+                            NexusLeituraNuvem.iniciar(candidatos.size, "Nexus IA indexando textos offline...")
+                            var lidosIA = 0
+                            withContext(Dispatchers.IO) {
+                                for ((idx, arq) in candidatos.withIndex()) {
+                                    if (!NexusLeituraNuvem.ativo.value) break
+                                    NexusLeituraNuvem.avancar(idx, candidatos.size, "Nexus IA lendo: ${arq.nomeArquivo}")
+                                    val caminho = NexusThumbCache.obterArquivoCompleto(arq)
+                                        .ifBlank { NexusThumbCache.obterMiniatura(arq) }
+                                    val txt = NexusAI.extrairTextoDeArquivo(appContext, caminho, arq.nomeArquivo, arq.dataUpload)
+                                    if (txt.isNotBlank()) lidosIA++
+                                    NexusLeituraNuvem.concluirItem()
+                                }
+                            }
+                            NexusLeituraNuvem.encerrar()
+                            indexandoLoteIA = false
+                            iaIndexTick++
+                            Toast.makeText(context, "Nexus IA indexou $lidosIA arquivo(s) para busca por texto!", Toast.LENGTH_LONG).show()
+                        }
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                )
+                NavigationDrawerItem(
                     icon = { Icon(Icons.Default.Refresh, null) },
                     label = { Text("Cache do SSD Nexus") },
                     selected = false,
@@ -6025,7 +7240,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         jobFilaMiniaturas?.cancel()
                         NexusLeituraNuvem.encerrar()
                         NexusTransfer.cancelar(client)
-                        isUploading = false
                         pastaAberta = null
                         selectedFileIds = emptySet()
                         isSelectionMode = false
@@ -6120,7 +7334,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     jobFilaMiniaturas?.cancel()
                                     NexusLeituraNuvem.encerrar()
                                     NexusTransfer.cancelar(client)
-                                    isUploading = false
                                     selectedFileIds = emptySet()
                                     isSelectionMode = false
                                     vaultNameInput = ""
@@ -6135,7 +7348,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
 
-                    // === BARRA ÚNICA DE DOWNLOAD / ENVIO (UPLOAD) COM PAUSAR / CONTINUAR / CANCELAR ===
+                    // === BARRA ÚNICA DE DOWNLOAD / ENVIO EM SEGUNDO PLANO COM PAUSAR / CONTINUAR / CANCELAR ===
                     if (transferProgress != null || isUploading) {
                         val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
                         val fra = pctAtual / 100f
@@ -6157,8 +7370,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                         text = when {
                                             transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO [$vaultStorageMode] ($pctAtual%)"
                                             transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO [$vaultStorageMode] ($pctAtual%)"
-                                            transferIsUpload -> "⬆️ ENVIANDO ARQUIVO [$vaultStorageMode] ($pctAtual%)"
-                                            else -> "⬇️ BAIXANDO ARQUIVO [$vaultStorageMode] ($pctAtual%)"
+                                            transferIsUpload -> "⬆️ ENVIANDO EM SEGUNDO PLANO [$vaultStorageMode] ($pctAtual%)"
+                                            else -> "⬇️ BAIXANDO COM PRIORIDADE [$vaultStorageMode] ($pctAtual%)"
                                         },
                                         color = if (transferPaused) DangerRed else Gold,
                                         fontSize = 10.sp,
@@ -6204,7 +7417,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     IconButton(
                                         onClick = {
                                             NexusTransfer.cancelar(client)
-                                            isUploading = false
                                             cloudBannerText = "Transferência cancelada."
                                             Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
                                         },
@@ -6324,8 +7536,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it.replace("\n", "").take(100) },
-                            placeholder = { Text("Pesquisar no cofre [$vaultStorageMode] de $activeVaultUser...", color = TextGrey, fontSize = 13.sp) },
-                            leadingIcon = { Icon(Icons.Default.Search, null, tint = Gold) },
+                            placeholder = { Text("Buscar por nome ou texto na foto/PDF (Nexus IA)...", color = TextGrey, fontSize = 12.sp) },
+                            leadingIcon = { Icon(Icons.Default.AutoAwesome, null, tint = Gold) },
                             trailingIcon = {
                                 if (searchQuery.isNotBlank()) {
                                     IconButton(onClick = { searchQuery = "" }) {
@@ -6652,6 +7864,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             },
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent)
                         )
+                        if (NexusAI.suportaLeituraIA(arq.nomeArquivo)) {
+                            ListItem(
+                                headlineContent = { Text("Ler com Nexus IA (Texto, PIX e Valores)", color = Gold, fontWeight = FontWeight.Bold) },
+                                leadingContent = { Icon(Icons.Default.AutoAwesome, null, tint = Gold) },
+                                modifier = Modifier.clickable {
+                                    selectedFile = null
+                                    abrirAnaliseIA(arq)
+                                },
+                                colors = ListItemDefaults.colors(containerColor = Color.Transparent)
+                            )
+                        }
                         ListItem(
                             headlineContent = { Text("Selecionar vários ficheiros...", color = Gold) },
                             leadingContent = { Icon(Icons.Default.CheckCircle, null, tint = Gold) },
@@ -6820,4 +8043,4 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 }
-// === FIM DO FICHEIRO ===
+// === FIM DO NEXUSUI.KT v2.1 ===
