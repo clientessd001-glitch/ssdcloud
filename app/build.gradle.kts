@@ -207,5 +207,7 @@ dependencies {
 
     implementation("com.github.capullo-tech:lib-tdlib-android:$tdlibVersion") {
         exclude(group = "org.jetbrains.kotlin")
+// Nexus IA Offline (OCR de fotos, prints e PDFs sem internet)
+    implementation("com.google.mlkit:text-recognition:16.0.1")
     }
 }
