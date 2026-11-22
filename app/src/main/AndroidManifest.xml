@@ -19,6 +19,7 @@
         android:extractNativeLibs="true"
         android:label="Nexus Cloud"
         android:supportsRtl="true">
+        android:largeHeap="true"
 
         <activity
             android:name=".MainActivity"
