@@ -396,6 +396,7 @@ object NexusThumbCache {
     fun salvarMiniatura(context: Context, dataUpload: Long, caminho: String) {
         val capaLimpa = resolverCaminhoCapaJpg(caminho)
         if (capaLimpa.isBlank()) return
+        if (mapaMiniaturas[dataUpload] == capaLimpa) return
         mapaMiniaturas[dataUpload] = capaLimpa
         context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
             .edit()
@@ -405,6 +406,7 @@ object NexusThumbCache {
 
     fun salvarArquivoCompleto(context: Context, dataUpload: Long, caminho: String) {
         if (caminho.isBlank() || !arquivoCompletoExisteLocalmente(caminho)) return
+        if (mapaArquivosCompletos[dataUpload] == caminho) return
         mapaArquivosCompletos[dataUpload] = caminho
         context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
             .edit()
@@ -414,6 +416,7 @@ object NexusThumbCache {
 
     fun salvarThumbIdNuvem(context: Context, fileId: Int, thumbFileId: Int) {
         if (fileId == 0 || thumbFileId == 0) return
+        if (mapaThumbIdsNuvem[fileId] == thumbFileId) return
         mapaThumbIdsNuvem[fileId] = thumbFileId
         context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
             .edit()
@@ -525,6 +528,40 @@ fun limparCacheUploadsTemporarios(context: Context): Long {
         NexusThumbCache.mapaArquivosCompletos.clear()
     } catch (_: Exception) {}
     return liberado
+}
+
+fun obterConfigAutoLimpezaTemp(context: Context): Pair<Boolean, Int> {
+    val prefs = context.getSharedPreferences("nexus_cache_auto_prefs", Context.MODE_PRIVATE)
+    val ativo = prefs.getBoolean("auto_clean_temp_enabled", false)
+    val limite = prefs.getInt("auto_clean_temp_limit", 50).coerceIn(1, 99999)
+    return Pair(ativo, limite)
+}
+
+fun salvarConfigAutoLimpezaTemp(context: Context, ativo: Boolean, limiteQtd: Int) {
+    val limiteSeguro = limiteQtd.coerceIn(1, 99999)
+    context.getSharedPreferences("nexus_cache_auto_prefs", Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean("auto_clean_temp_enabled", ativo)
+        .putInt("auto_clean_temp_limit", limiteSeguro)
+        .apply()
+}
+
+// Verifica a quantidade atual de temporários e limpa automaticamente se atingir o limite definido
+fun verificarELimparTempAutomatico(context: Context): Pair<Boolean, Long> {
+    val (ativo, limite) = obterConfigAutoLimpezaTemp(context)
+    if (!ativo) return Pair(false, 0L)
+
+    // Trava de segurança: nunca apaga temporários durante um upload ou download ativo
+    if (NexusTransfer.enviandoEmSegundoPlano.value || NexusTransfer.progress.value != null) {
+        return Pair(false, 0L)
+    }
+
+    val (_, _, qtdTemp) = calcularUsoCacheLocal(context)
+    if (qtdTemp >= limite) {
+        val liberado = limparCacheUploadsTemporarios(context)
+        return Pair(true, liberado)
+    }
+    return Pair(false, 0L)
 }
 
 fun resolverCaminhoCapaJpg(caminho: String?): String {
@@ -1173,8 +1210,15 @@ fun carregarDonosFicheiros(context: Context): Map<Long, String> {
 
 fun salvarDonoFicheiro(context: Context, dataUpload: Long, usuario: String) {
     val prefs = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
-    if (usuario.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
-    else prefs.edit().putString(dataUpload.toString(), normalizarUsuario(usuario)).apply()
+    val chave = dataUpload.toString()
+    if (usuario.isBlank()) {
+        if (!prefs.contains(chave)) return
+        prefs.edit().remove(chave).apply()
+    } else {
+        val norm = normalizarUsuario(usuario)
+        if (prefs.getString(chave, null) == norm) return
+        prefs.edit().putString(chave, norm).apply()
+    }
 }
 
 fun carregarPastasDoUsuario(context: Context, usuario: String): Set<String> {
@@ -1200,22 +1244,26 @@ fun associarPastaAoUsuario(context: Context, usuario: String, nomePasta: String)
 fun desassociarPastaDoUsuario(context: Context, usuario: String, nomePasta: String) {
     val chave = normalizarUsuario(usuario)
     val prefs = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
-    val atuais = (prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet())
-        .filterNot { it.equals(nomePasta.trim(), ignoreCase = true) }
-        .toSet()
+    val antigos = prefs.getStringSet("folders_$chave", emptySet()) ?: emptySet()
+    val atuais = antigos.filterNot { it.equals(nomePasta.trim(), ignoreCase = true) }.toSet()
+    if (atuais.size == antigos.size) return
     prefs.edit().putStringSet("folders_$chave", atuais).apply()
 }
 
 fun marcarPastaComoEliminada(context: Context, usuario: String, nomePasta: String) {
     val chave = normalizarUsuario(usuario)
+    val k = nomePasta.trim().lowercase(Locale.ROOT)
     val prefs = context.getSharedPreferences("nexus_deleted_folders_$chave", Context.MODE_PRIVATE)
-    prefs.edit().putBoolean(nomePasta.trim().lowercase(Locale.ROOT), true).apply()
+    if (prefs.getBoolean(k, false)) return
+    prefs.edit().putBoolean(k, true).apply()
 }
 
 fun desmarcarPastaEliminada(context: Context, usuario: String, nomePasta: String) {
     val chave = normalizarUsuario(usuario)
+    val chavePasta = nomePasta.trim().lowercase(Locale.ROOT)
     val prefs = context.getSharedPreferences("nexus_deleted_folders_$chave", Context.MODE_PRIVATE)
-    prefs.edit().remove(nomePasta.trim().lowercase(Locale.ROOT)).apply()
+    if (!prefs.contains(chavePasta)) return
+    prefs.edit().remove(chavePasta).apply()
 }
 
 fun pastaFoiEliminadaPeloUsuario(context: Context, usuario: String, nomePasta: String): Boolean {
@@ -1309,8 +1357,10 @@ fun eliminarPastaCompleta(
 fun registarMensagemSincronizada(context: Context, usuario: String, msgId: Long) {
     if (msgId == 0L) return
     val chave = normalizarUsuario(usuario)
+    val k = msgId.toString()
     val prefs = context.getSharedPreferences("nexus_synced_msgs_$chave", Context.MODE_PRIVATE)
-    prefs.edit().putBoolean(msgId.toString(), true).apply()
+    if (prefs.getBoolean(k, false)) return
+    prefs.edit().putBoolean(k, true).apply()
 }
 
 fun mensagemJaSincronizada(context: Context, usuario: String, msgId: Long): Boolean {
@@ -1324,13 +1374,42 @@ fun marcarFicheiroComoSincronizado(context: Context, usuario: String, nomeArquiv
     val chave = normalizarUsuario(usuario)
     val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
     val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    val kName = "name_$nomeLimpo"
+    val kKey = "key_${nomeLimpo}|$tamanho"
+    val kUri = if (uriStr.isNotBlank()) "uri_$uriStr" else ""
+
+    val jaMarcado = prefs.getBoolean(kName, false) &&
+        prefs.getBoolean(kKey, false) &&
+        (kUri.isBlank() || prefs.getBoolean(kUri, false))
+    if (jaMarcado) return
+
     val editor = prefs.edit()
-    editor.putBoolean("name_$nomeLimpo", true)
-    editor.putBoolean("key_${nomeLimpo}|$tamanho", true)
-    if (uriStr.isNotBlank()) {
-        editor.putBoolean("uri_$uriStr", true)
+    editor.putBoolean(kName, true)
+    editor.putBoolean(kKey, true)
+    if (kUri.isNotBlank()) {
+        editor.putBoolean(kUri, true)
     }
     editor.apply()
+}
+
+// Grava centenas de arquivos em uma única transação de memória (elimina OutOfMemoryError e travamentos)
+fun marcarLoteComoSincronizado(context: Context, usuario: String, lista: List<ArquivoNuvem>) {
+    if (usuario.isBlank() || lista.isEmpty()) return
+    val chave = normalizarUsuario(usuario)
+    val prefs = context.getSharedPreferences("nexus_auto_synced_files_$chave", Context.MODE_PRIVATE)
+    var editor: android.content.SharedPreferences.Editor? = null
+
+    for (arq in lista) {
+        val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo).lowercase(Locale.ROOT)
+        val kName = "name_$nomeLimpo"
+        val kKey = "key_${nomeLimpo}|${arq.tamanhoBytes}"
+        if (!prefs.getBoolean(kName, false) || !prefs.getBoolean(kKey, false)) {
+            if (editor == null) editor = prefs.edit()
+            editor.putBoolean(kName, true)
+            editor.putBoolean(kKey, true)
+        }
+    }
+    editor?.apply()
 }
 
 fun ficheiroJaSincronizadoAntes(context: Context, usuario: String, nomeArquivo: String, tamanho: Long, uriStr: String = ""): Boolean {
@@ -1347,9 +1426,12 @@ fun marcarFicheiroComoDeletado(context: Context, usuario: String, nomeArquivo: S
     val chave = normalizarUsuario(usuario)
     val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
     val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    val kName = "del_name_$nomeLimpo"
+    val kKey = "del_key_${nomeLimpo}|$tamanho"
+    if (prefs.getBoolean(kName, false) && prefs.getBoolean(kKey, false)) return
     prefs.edit()
-        .putBoolean("del_name_$nomeLimpo", true)
-        .putBoolean("del_key_${nomeLimpo}|$tamanho", true)
+        .putBoolean(kName, true)
+        .putBoolean(kKey, true)
         .apply()
 }
 
@@ -1357,9 +1439,12 @@ fun desmarcarFicheiroDeletado(context: Context, usuario: String, nomeArquivo: St
     val chave = normalizarUsuario(usuario)
     val nomeLimpo = limparPrefixoTimestamp(nomeArquivo).lowercase(Locale.ROOT)
     val prefs = context.getSharedPreferences("nexus_deleted_files_$chave", Context.MODE_PRIVATE)
+    val kName = "del_name_$nomeLimpo"
+    val kKey = "del_key_${nomeLimpo}|$tamanho"
+    if (!prefs.contains(kName) && !prefs.contains(kKey)) return
     prefs.edit()
-        .remove("del_name_$nomeLimpo")
-        .remove("del_key_${nomeLimpo}|$tamanho")
+        .remove(kName)
+        .remove(kKey)
         .apply()
 }
 
@@ -1387,14 +1472,23 @@ fun eliminarMultiplosFicheiros(
 
     val nomesParaApagar = mutableSetOf<String>()
     val idsRemotosParaApagar = mutableSetOf<Int>()
+    val chaveAtiva = normalizarUsuario(usuarioAtivo)
+
+    val prefsDel = context.getSharedPreferences("nexus_deleted_files_$chaveAtiva", Context.MODE_PRIVATE)
+    val editorDel = prefsDel.edit()
+    val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+    val editorLinks = prefsLinks.edit()
+    val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+    val editorOwners = prefsOwners.edit()
 
     for (arq in listaArquivos) {
         val nomeLimpo = limparPrefixoTimestamp(arq.nomeArquivo)
-        nomesParaApagar.add(nomeLimpo.lowercase(Locale.ROOT))
+        val nomeLower = nomeLimpo.lowercase(Locale.ROOT)
+        nomesParaApagar.add(nomeLower)
         if (arq.fileId != 0) idsRemotosParaApagar.add(arq.fileId)
 
-        marcarFicheiroComoDeletado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
-        marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeLimpo, arq.tamanhoBytes)
+        editorDel.putBoolean("del_name_$nomeLower", true)
+        editorDel.putBoolean("del_key_${nomeLower}|${arq.tamanhoBytes}", true)
         NexusAI.removerIndice(context, arq.dataUpload)
 
         try {
@@ -1412,10 +1506,15 @@ fun eliminarMultiplosFicheiros(
 
         NexusThumbCache.mapaMiniaturas.remove(arq.dataUpload)
         NexusThumbCache.mapaArquivosCompletos.remove(arq.dataUpload)
-        salvarVinculoPasta(context, arq.dataUpload, "")
-        salvarDonoFicheiro(context, arq.dataUpload, "")
+        editorLinks.remove(arq.dataUpload.toString())
+        editorOwners.remove(arq.dataUpload.toString())
         vm.apagar(arq.id)
     }
+
+    editorDel.apply()
+    editorLinks.apply()
+    editorOwners.apply()
+    marcarLoteComoSincronizado(context, usuarioAtivo, listaArquivos)
 
     val qtd = listaArquivos.size
     if (!apagarNaNuvemSSD) {
@@ -1427,7 +1526,6 @@ fun eliminarMultiplosFicheiros(
         client.send(TdApi.DeleteFile().apply { fileId = fId }) {}
     }
 
-    val chaveAtiva = normalizarUsuario(usuarioAtivo)
     val tagPerfil = "👤 [$chaveAtiva]"
     val tagPerfilExibicao = "👤 [$usuarioAtivo]"
 
@@ -1496,11 +1594,16 @@ fun migrarDadosV11SeNecessario(context: Context, usuario: String, arquivos: List
     val prefs = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
     if (!prefs.getBoolean("migrated_v11_data", false)) {
         val donosAtuais = carregarDonosFicheiros(context)
+        val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+        var editorOwners: android.content.SharedPreferences.Editor? = null
+        val normUser = normalizarUsuario(usuario)
         arquivos.forEach { arq ->
             if (!donosAtuais.containsKey(arq.dataUpload)) {
-                salvarDonoFicheiro(context, arq.dataUpload, usuario)
+                if (editorOwners == null) editorOwners = prefsOwners.edit()
+                editorOwners?.putString(arq.dataUpload.toString(), normUser)
             }
         }
+        editorOwners?.apply()
         pastas.forEach { p ->
             associarPastaAoUsuario(context, usuario, p.nomePasta)
         }
@@ -1543,6 +1646,8 @@ fun limparDuplicadosExistentes(
     if (todosArquivos.isEmpty()) return
     val donos = carregarDonosFicheiros(context)
     val pastas = carregarVinculosPastas(context)
+    val paraSincronizarPorDono = mutableMapOf<String, MutableList<ArquivoNuvem>>()
+    val pastasPorDono = mutableMapOf<String, MutableSet<String>>()
 
     val grupos = todosArquivos.groupBy { arq ->
         val dono = donos[arq.dataUpload] ?: ""
@@ -1573,9 +1678,9 @@ fun limparDuplicadosExistentes(
                     salvarDonoFicheiro(context, principal.dataUpload, donoEncontrado)
                 }
                 if (!pastaEncontrada.isNullOrBlank()) {
-                    associarPastaAoUsuario(context, donoEncontrado, pastaEncontrada)
+                    pastasPorDono.getOrPut(donoEncontrado) { mutableSetOf() }.add(pastaEncontrada)
                 }
-                marcarFicheiroComoSincronizado(context, donoEncontrado, principal.nomeArquivo, principal.tamanhoBytes)
+                paraSincronizarPorDono.getOrPut(donoEncontrado) { mutableListOf() }.add(principal)
             }
 
             listaGrupo.forEach { item ->
@@ -1594,9 +1699,9 @@ fun limparDuplicadosExistentes(
             val donoUnico = donos[unico.dataUpload] ?: ""
             val pastaUnico = pastas[unico.dataUpload] ?: ""
             if (donoUnico.isNotBlank()) {
-                marcarFicheiroComoSincronizado(context, donoUnico, unico.nomeArquivo, unico.tamanhoBytes)
+                paraSincronizarPorDono.getOrPut(donoUnico) { mutableListOf() }.add(unico)
                 if (pastaUnico.isNotBlank()) {
-                    associarPastaAoUsuario(context, donoUnico, pastaUnico)
+                    pastasPorDono.getOrPut(donoUnico) { mutableSetOf() }.add(pastaUnico)
                 }
             }
             val nomeLimpo = limparPrefixoTimestamp(unico.nomeArquivo)
@@ -1605,6 +1710,14 @@ fun limparDuplicadosExistentes(
                 alterouAlgum = true
             }
         }
+    }
+
+    // Grava tudo em lote único por perfil (evita OOM e travamento da interface)
+    for ((dono, itens) in paraSincronizarPorDono) {
+        marcarLoteComoSincronizado(context, dono, itens)
+    }
+    for ((dono, setPastas) in pastasPorDono) {
+        setPastas.forEach { p -> associarPastaAoUsuario(context, dono, p) }
     }
 
     if (alterouAlgum) {
@@ -2178,7 +2291,7 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO HÍBRIDA DA NUVEM (SUPORTA MODO MS E MODO CP) ===
+// === SINCRONIZAÇÃO HÍBRIDA DA NUVEM COM GRAVAÇÃO EM LOTE (SEM ESTOURO DE MEMÓRIA) ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -2237,6 +2350,16 @@ fun sincronizarCofreDaNuvem(
                                 var importados = 0
                                 val donosAtuais = carregarDonosFicheiros(context)
                                 val pastasAtuais = carregarVinculosPastas(context)
+
+                                val prefsMsgs = context.getSharedPreferences("nexus_synced_msgs_$chaveAtiva", Context.MODE_PRIVATE)
+                                var editorMsgs: android.content.SharedPreferences.Editor? = null
+                                val prefsSynced = context.getSharedPreferences("nexus_auto_synced_files_$chaveAtiva", Context.MODE_PRIVATE)
+                                var editorSynced: android.content.SharedPreferences.Editor? = null
+                                val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+                                var editorOwners: android.content.SharedPreferences.Editor? = null
+                                val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+                                var editorLinks: android.content.SharedPreferences.Editor? = null
+                                val pastasEncontradas = mutableSetOf<String>()
 
                                 val mapaExistentesPorChave = arquivosAtuaisReais
                                     .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
@@ -2305,8 +2428,13 @@ fun sincronizarCofreDaNuvem(
                                         texto = "Lendo nuvem SSD ($modoReal): $nomeDoc"
                                     )
 
+                                    val msgIdKey = msg.id.toString()
+                                    if (msg.id != 0L && !prefsMsgs.getBoolean(msgIdKey, false)) {
+                                        if (editorMsgs == null) editorMsgs = prefsMsgs.edit()
+                                        editorMsgs?.putBoolean(msgIdKey, true)
+                                    }
+
                                     if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
-                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
                                         return@forEachIndexed
                                     }
 
@@ -2319,11 +2447,16 @@ fun sincronizarCofreDaNuvem(
                                     } else ""
 
                                     if (pastaFinal.isNotBlank()) {
-                                        vm.criarPasta(pastaFinal)
-                                        associarPastaAoUsuario(context, usuarioAtivo, pastaFinal)
+                                        pastasEncontradas.add(pastaFinal)
                                     }
 
-                                    marcarFicheiroComoSincronizado(context, usuarioAtivo, nomeDoc, tam)
+                                    val kName = "name_$nomeLower"
+                                    val kKey = "key_${nomeLower}|$tam"
+                                    if (!prefsSynced.getBoolean(kName, false) || !prefsSynced.getBoolean(kKey, false)) {
+                                        if (editorSynced == null) editorSynced = prefsSynced.edit()
+                                        editorSynced?.putBoolean(kName, true)
+                                        editorSynced?.putBoolean(kKey, true)
+                                    }
 
                                     val uriMiniaturaInicial = when {
                                         caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
@@ -2336,7 +2469,8 @@ fun sincronizarCofreDaNuvem(
                                     val arqExistente = mapaExistentesPorChave[chaveUnica]
                                     if (arqExistente != null) {
                                         if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
-                                            salvarVinculoPasta(context, arqExistente.dataUpload, pastaFinal)
+                                            if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                            editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal.trim())
                                         }
                                         if (uriMiniaturaInicial.isNotBlank()) {
                                             NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
@@ -2354,14 +2488,13 @@ fun sincronizarCofreDaNuvem(
                                                 )
                                             )
                                         }
-                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
                                     } else {
-                                        registarMensagemSincronizada(context, usuarioAtivo, msg.id)
-
                                         val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + (index * 11L)
-                                        salvarDonoFicheiro(context, ts, usuarioAtivo)
+                                        if (editorOwners == null) editorOwners = prefsOwners.edit()
+                                        editorOwners?.putString(ts.toString(), chaveAtiva)
                                         if (pastaFinal.isNotBlank()) {
-                                            salvarVinculoPasta(context, ts, pastaFinal)
+                                            if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                            editorLinks?.putString(ts.toString(), pastaFinal.trim())
                                         }
                                         if (uriMiniaturaInicial.isNotBlank()) {
                                             NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
@@ -2381,6 +2514,16 @@ fun sincronizarCofreDaNuvem(
                                         vm.salvarArquivo(novoArq, forcarNovoRegistro = true)
                                         importados++
                                     }
+                                }
+
+                                // Aplica todas as preferências de uma só vez no fim da varredura
+                                editorMsgs?.apply()
+                                editorSynced?.apply()
+                                editorOwners?.apply()
+                                editorLinks?.apply()
+                                pastasEncontradas.forEach { p ->
+                                    vm.criarPasta(p)
+                                    associarPastaAoUsuario(context, usuarioAtivo, p)
                                 }
 
                                 onComplete(importados)
@@ -2760,8 +2903,15 @@ fun carregarVinculosPastas(context: Context): Map<Long, String> {
 
 fun salvarVinculoPasta(context: Context, dataUpload: Long, nomePasta: String) {
     val prefs = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
-    if (nomePasta.isBlank()) prefs.edit().remove(dataUpload.toString()).apply()
-    else prefs.edit().putString(dataUpload.toString(), nomePasta.trim()).apply()
+    val chave = dataUpload.toString()
+    if (nomePasta.isBlank()) {
+        if (!prefs.contains(chave)) return
+        prefs.edit().remove(chave).apply()
+    } else {
+        val limpo = nomePasta.trim()
+        if (prefs.getString(chave, null) == limpo) return
+        prefs.edit().putString(chave, limpo).apply()
+    }
 }
 
 fun obterDetalhesFicheiro(context: Context, uri: Uri): Pair<String, Long> {
@@ -3993,6 +4143,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
+    // Marcação em lote e varredura em Dispatchers.IO (evita OOM e ANR em cofres grandes)
     fun verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio: Boolean) {
         scope.launch {
             val chaveAtiva = normalizarUsuario(activeVaultUser)
@@ -4000,12 +4151,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
             val donosAtuais = carregarDonosFicheiros(context)
             val arquivosAtuaisDoCofre = listaReal.filter { donosAtuais[it.dataUpload] == chaveAtiva }
 
-            arquivosAtuaisDoCofre.forEach { arq ->
-                marcarFicheiroComoSincronizado(context, activeVaultUser, arq.nomeArquivo, arq.tamanhoBytes)
-            }
-
             val encontrados = withContext(Dispatchers.IO) {
-                procurarNovosFicheirosNasPastas(context, activeVaultUser, arquivosAtuaisDoCofre)
+                marcarLoteComoSincronizado(appContext, activeVaultUser, arquivosAtuaisDoCofre)
+                procurarNovosFicheirosNasPastas(appContext, activeVaultUser, arquivosAtuaisDoCofre)
             }
             if (encontrados.isNotEmpty()) {
                 novosFicheirosSync = encontrados
@@ -4017,10 +4165,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Não executa limpeza de duplicados enquanto um lote de uploads estiver em andamento
+    // Não executa limpeza de duplicados enquanto um lote de uploads estiver em andamento; roda em IO
     LaunchedEffect(todosArquivos.size, vaultUnlocked, isUploading) {
         if (todosArquivos.isNotEmpty() && !isUploading) {
-            limparDuplicadosExistentes(context, todosArquivos, vm) {
+            val alterou = withContext(Dispatchers.IO) {
+                var mudou = false
+                limparDuplicadosExistentes(appContext, todosArquivos, vm) { mudou = true }
+                mudou
+            }
+            if (alterou) {
                 mapaDonos = carregarDonosFicheiros(context)
                 mapaPastas = carregarVinculosPastas(context)
                 pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
@@ -4031,11 +4184,26 @@ fun NexusUI(dao: NexusDao, client: Client) {
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
             solicitarPermissaoNotificacaoSeNecessario()
+
+            // Verifica e limpa temporários automaticamente se o limite configurado foi atingido
+            val (limpouIni, bytesIni) = withContext(Dispatchers.IO) {
+                verificarELimparTempAutomatico(appContext)
+            }
+            if (limpouIni) {
+                Toast.makeText(
+                    context,
+                    "Auto-limpeza SSD: temporários removidos (${formatarTamanhoNuvem(bytesIni)} liberados).",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+
             vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
             val arquivosIniciais = vm.obterArquivosReais()
             val pastasIniciais = vm.obterPastasReais()
-            migrarDadosV11SeNecessario(context, activeVaultUser, arquivosIniciais, pastasIniciais)
-            limparDuplicadosExistentes(context, arquivosIniciais, vm) {}
+            withContext(Dispatchers.IO) {
+                migrarDadosV11SeNecessario(appContext, activeVaultUser, arquivosIniciais, pastasIniciais)
+                limparDuplicadosExistentes(appContext, arquivosIniciais, vm) {}
+            }
             mapaDonos = carregarDonosFicheiros(context)
             mapaPastas = carregarVinculosPastas(context)
             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
@@ -4046,7 +4214,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     delay(250)
                     vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
                     val atualizados = vm.obterArquivosReais()
-                    limparDuplicadosExistentes(context, atualizados, vm) {}
+                    withContext(Dispatchers.IO) {
+                        limparDuplicadosExistentes(appContext, atualizados, vm) {}
+                    }
                     mapaDonos = carregarDonosFicheiros(context)
                     mapaPastas = carregarVinculosPastas(context)
                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
@@ -4325,6 +4495,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             } finally {
                 NexusTransfer.encerrar()
+                val (limpouAuto, bytesAuto) = verificarELimparTempAutomatico(appContext)
+                if (limpouAuto) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            appContext,
+                            "Auto-limpeza SSD: temporários removidos (${formatarTamanhoNuvem(bytesAuto)} liberados).",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
             }
         }
     }
@@ -4487,6 +4667,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 }
             } finally {
                 NexusTransfer.encerrar()
+                val (limpouAuto, bytesAuto) = verificarELimparTempAutomatico(appContext)
+                if (limpouAuto) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            appContext,
+                            "Auto-limpeza SSD: temporários removidos (${formatarTamanhoNuvem(bytesAuto)} liberados).",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
             }
         }
     }
@@ -5025,39 +5215,47 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // === JANELA DE CACHE DO SSD NEXUS ===
+    // === JANELA DE CACHE DO SSD NEXUS (COM AUTO-LIMPEZA DE TEMPORÁRIOS POR QUANTIDADE CONFIGURÁVEL) ===
     if (showCacheDialog) {
         var statsCache by remember { mutableStateOf(calcularUsoCacheLocal(context)) }
         val (bytesCache, qtdCapas, qtdTemps) = statsCache
+
+        val configInicial = remember { obterConfigAutoLimpezaTemp(context) }
+        var autoLimpezaAtiva by remember { mutableStateOf(configInicial.first) }
+        var limiteTempInput by remember { mutableStateOf(configInicial.second.toString()) }
 
         Dialog(onDismissRequest = { showCacheDialog = false }) {
             Surface(
                 shape = RoundedCornerShape(20.dp),
                 color = SurfaceDarker,
                 border = BorderStroke(1.5.dp, Gold),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 640.dp)
             ) {
                 Column(
-                    modifier = Modifier.padding(24.dp),
+                    modifier = Modifier
+                        .padding(22.dp)
+                        .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Icon(Icons.Default.Storage, null, tint = Gold, modifier = Modifier.size(52.dp))
-                    Spacer(Modifier.height(10.dp))
-                    Text("CACHE DO SSD NEXUS", color = Gold, fontWeight = FontWeight.Black, fontSize = 20.sp)
+                    Icon(Icons.Default.Storage, null, tint = Gold, modifier = Modifier.size(48.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text("CACHE DO SSD NEXUS", color = Gold, fontWeight = FontWeight.Black, fontSize = 19.sp)
                     Text("Gestão de Miniaturas e Arquivos Locais", color = TextGrey, fontSize = 11.sp)
 
-                    Spacer(Modifier.height(18.dp))
+                    Spacer(Modifier.height(14.dp))
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(SurfaceDark, RoundedCornerShape(14.dp))
                             .border(1.dp, Gold.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
-                            .padding(16.dp),
+                            .padding(14.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text("ESPAÇO OCUPADO PELO CACHE", color = TextGrey, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.height(4.dp))
-                        Text(formatarTamanhoNuvem(bytesCache), color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.Black)
+                        Text(formatarTamanhoNuvem(bytesCache), color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.Black)
                         Spacer(Modifier.height(10.dp))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -5074,7 +5272,105 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
 
-                    Spacer(Modifier.height(18.dp))
+                    // === REGRA DE LIMPEZA AUTOMÁTICA DE TEMPORÁRIOS POR QUANTIDADE ===
+                    Spacer(Modifier.height(14.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(SurfaceDark, RoundedCornerShape(14.dp))
+                            .border(1.dp, if (autoLimpezaAtiva) Gold else TextGrey.copy(alpha = 0.3f), RoundedCornerShape(14.dp))
+                            .padding(14.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                                Text("AUTO-LIMPAR TEMPORÁRIOS", color = Gold, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                Text(
+                                    "Apaga só arquivos temporários ao atingir a quantidade abaixo (mantém capas .jpg).",
+                                    color = TextGrey,
+                                    fontSize = 10.sp
+                                )
+                            }
+                            Switch(
+                                checked = autoLimpezaAtiva,
+                                onCheckedChange = { novoEstado ->
+                                    autoLimpezaAtiva = novoEstado
+                                    val qtd = limiteTempInput.toIntOrNull()?.coerceIn(1, 99999) ?: 50
+                                    salvarConfigAutoLimpezaTemp(context, novoEstado, qtd)
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = BgBlack,
+                                    checkedTrackColor = Gold,
+                                    uncheckedThumbColor = TextGrey,
+                                    uncheckedTrackColor = SurfaceDarker
+                                )
+                            )
+                        }
+
+                        Spacer(Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = limiteTempInput,
+                                onValueChange = { txt ->
+                                    limiteTempInput = txt.filter { it.isDigit() }.take(5)
+                                },
+                                label = { Text("Qtd. máxima", color = TextGrey, fontSize = 11.sp) },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = Color.White,
+                                    unfocusedTextColor = Color.White,
+                                    focusedBorderColor = Gold,
+                                    unfocusedBorderColor = Color.Gray
+                                ),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                onClick = {
+                                    val limiteValido = limiteTempInput.toIntOrNull()?.coerceIn(1, 99999)
+                                    if (limiteValido == null) {
+                                        Toast.makeText(context, "Digite uma quantidade válida (ex: 30).", Toast.LENGTH_SHORT).show()
+                                    } else {
+                                        limiteTempInput = limiteValido.toString()
+                                        salvarConfigAutoLimpezaTemp(context, autoLimpezaAtiva, limiteValido)
+                                        val (limpouAgora, bytesLib) = verificarELimparTempAutomatico(context)
+                                        statsCache = calcularUsoCacheLocal(context)
+                                        val msg = if (limpouAgora) {
+                                            "Limite ($limiteValido) atingido! Temporários limpos (${formatarTamanhoNuvem(bytesLib)} liberados)."
+                                        } else if (autoLimpezaAtiva) {
+                                            "Auto-limpeza ativada ao atingir $limiteValido temporários!"
+                                        } else {
+                                            "Limite salvo ($limiteValido), mas a auto-limpeza está desativada."
+                                        }
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                                modifier = Modifier.height(54.dp)
+                            ) {
+                                Text("SALVAR", color = BgBlack, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                            }
+                        }
+
+                        val limiteExib = limiteTempInput.toIntOrNull() ?: 50
+                        Text(
+                            text = if (autoLimpezaAtiva) "Status: $qtdTemps / $limiteExib temporários acumulados"
+                            else "Status: Desativado (atual: $qtdTemps temporários)",
+                            color = if (autoLimpezaAtiva && qtdTemps >= limiteExib) DangerRed else TextGrey,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 6.dp)
+                        )
+                    }
+
+                    Spacer(Modifier.height(14.dp))
 
                     Button(
                         onClick = {
@@ -5085,14 +5381,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             processarFilaMiniaturasNuvem(arquivos)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Gold),
-                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                        modifier = Modifier.fillMaxWidth().height(46.dp)
                     ) {
                         Icon(Icons.Default.Refresh, null, tint = BgBlack, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("RECARREGAR CAPAS DE VÍDEOS", color = BgBlack, fontWeight = FontWeight.Black, fontSize = 11.sp)
                     }
 
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(8.dp))
 
                     OutlinedButton(
                         onClick = {
@@ -5105,14 +5401,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             ).show()
                         },
                         border = BorderStroke(1.dp, Gold),
-                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                        modifier = Modifier.fillMaxWidth().height(46.dp)
                     ) {
                         Icon(Icons.Default.Delete, null, tint = Gold, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("LIMPAR ARQUIVOS TEMPORÁRIOS", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        Text("LIMPAR TEMPORÁRIOS AGORA", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                     }
 
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(8.dp))
 
                     Button(
                         onClick = {
@@ -5123,14 +5419,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             processarFilaMiniaturasNuvem(arquivos)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
-                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                        modifier = Modifier.fillMaxWidth().height(46.dp)
                     ) {
                         Icon(Icons.Default.DeleteForever, null, tint = Color.White, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
                         Text("LIMPAR TODO O CACHE LOCAL", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
                     }
 
-                    Spacer(Modifier.height(10.dp))
+                    Spacer(Modifier.height(8.dp))
                     TextButton(onClick = { showCacheDialog = false }) {
                         Text("FECHAR", color = TextGrey, fontWeight = FontWeight.Bold)
                     }
@@ -6308,7 +6604,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 scope.launch(Dispatchers.Main) {
                                     delay(250)
                                     val aposSync = vm.obterArquivosReais()
-                                    limparDuplicadosExistentes(context, aposSync, vm) {}
+                                    withContext(Dispatchers.IO) {
+                                        limparDuplicadosExistentes(appContext, aposSync, vm) {}
+                                    }
                                     mapaDonos = carregarDonosFicheiros(context)
                                     mapaPastas = carregarVinculosPastas(context)
                                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
