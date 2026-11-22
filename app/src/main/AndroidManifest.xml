@@ -15,6 +15,9 @@
 
     <application
         android:name=".NexusApp"
+        android:largeHeap="true"
+        ...>
+        android:name=".NexusApp"
         android:allowBackup="true"
         android:extractNativeLibs="true"
         android:label="Nexus Cloud"
