@@ -1405,8 +1405,8 @@ fun marcarLoteComoSincronizado(context: Context, usuario: String, lista: List<Ar
         val kKey = "key_${nomeLimpo}|${arq.tamanhoBytes}"
         if (!prefs.getBoolean(kName, false) || !prefs.getBoolean(kKey, false)) {
             if (editor == null) editor = prefs.edit()
-            editor.putBoolean(kName, true)
-            editor.putBoolean(kKey, true)
+            editor?.putBoolean(kName, true)
+            editor?.putBoolean(kKey, true)
         }
     }
     editor?.apply()
