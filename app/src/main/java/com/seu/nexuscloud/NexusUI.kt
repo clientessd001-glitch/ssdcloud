@@ -7015,20 +7015,15 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                         }
                     } else {
-                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-                            IconButton(onClick = { scope.launch { drawerState.open() } }) { Icon(Icons.Default.Menu, null, tint = Color.White) }
-                            Column(Modifier.weight(1f)) {
-                                Text("NEXUS CLOUD $NEXUS_VERSION [$vaultStorageMode]", color = Gold, fontWeight = FontWeight.Black, fontSize = 16.sp)
-                                Text(
-                                    text = if (transferProgress != null) {
-                                        if (transferPaused) "⏸ PAUSADO • $transferLabel" else transferLabel
-                                    } else cloudBannerText,
-                                    color = if (transferProgress != null) Gold else TextGrey,
-                                    fontSize = 10.sp,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                        // Barra superior limpa: sem o texto "NEXUS CLOUD v2.1", apenas menu e botões de ação
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                                Icon(Icons.Default.Menu, null, tint = Color.White)
                             }
+                            Spacer(Modifier.weight(1f))
                             if (listaVisivelAtual.isNotEmpty()) {
                                 IconButton(onClick = { isSelectionMode = true }) {
                                     Icon(Icons.Default.CheckCircle, contentDescription = "Selecionar vários", tint = Gold)
