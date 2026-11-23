@@ -4395,25 +4395,34 @@ fun GrelhaArquivos(
                             scopeGrid.launch { gridState.scrollToItem(target) }
                         }
                     }
-                    .pointerInput(totalItensGrid, usableTrackPx) {
-                        androidx.compose.foundation.gestures.detectVerticalDragGestures(
-                            onDragStart = { offset ->
-                                isDraggingScrollbar = true
-                                val frac = ((offset.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
-                                dragFraction = frac
-                                val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
-                                scopeGrid.launch { gridState.scrollToItem(target) }
-                            },
-                            onVerticalDrag = { change, _ ->
-                                change.consume()
-                                val frac = ((change.position.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
-                                dragFraction = frac
-                                val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
-                                scopeGrid.launch { gridState.scrollToItem(target) }
-                            },
-                            onDragEnd = { isDraggingScrollbar = false },
-                            onDragCancel = { isDraggingScrollbar = false }
-                        )
+            .pointerInput(totalItensGrid, usableTrackPx) {
+                        try {
+                            awaitPointerEventScope {
+                                var lastTarget = -1
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change = event.changes.firstOrNull()
+                                    if (change != null) {
+                                        if (change.pressed) {
+                                            change.consume()
+                                            isDraggingScrollbar = true
+                                            val frac = ((change.position.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
+                                            dragFraction = frac
+                                            val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
+                                            if (target != lastTarget) {
+                                                lastTarget = target
+                                                scopeGrid.launch { gridState.scrollToItem(target) }
+                                            }
+                                        } else {
+                                            lastTarget = -1
+                                            isDraggingScrollbar = false
+                                        }
+                                    }
+                                }
+                            }
+                        } finally {
+                            isDraggingScrollbar = false
+                        }
                     }
             ) {
                 if (isDraggingScrollbar) {
