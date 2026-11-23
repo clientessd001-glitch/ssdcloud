@@ -4048,7 +4048,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS AGRUPADA POR DATA COM CHAVE BLINDADA E SELO DE INDEXAÇÃO IA ===
+// === GRELHA DE ARQUIVOS COM BARRA LATERAL DE VELOCIDADE E PREVIEWS ULTRALEVES ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -4070,234 +4070,392 @@ fun GrelhaArquivos(
             .groupBy { formatarDataCabecalhoGaleria(it.dataUpload) }
     }
 
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(3),
-        modifier = Modifier.fillMaxSize().padding(1.dp),
-        horizontalArrangement = Arrangement.spacedBy(2.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
+    // Mapeia cada índice da grade para sua data (alimenta o balão flutuante da barra lateral)
+    val indicesParaData = remember(gruposPorData) {
+        val mapa = ArrayList<String>()
         gruposPorData.forEach { (dataCabecalho, arquivosDoDia) ->
+            mapa.add(dataCabecalho)
+            repeat(arquivosDoDia.size) { mapa.add(dataCabecalho) }
+        }
+        mapa
+    }
+    val totalItensGrid = indicesParaData.size
 
-            item(
-                key = "header_$dataCabecalho",
-                span = { GridItemSpan(maxLineSpan) },
-                contentType = "cabecalho_data"
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(BgBlack)
-                        .padding(start = 10.dp, end = 10.dp, top = 14.dp, bottom = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = dataCabecalho,
-                        color = Color.White,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "${arquivosDoDia.size}",
-                        color = Gold,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
+    val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
+    val scopeGrid = rememberCoroutineScope()
+    var isDraggingScrollbar by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(0f) }
+
+    val thumbFraction by remember(totalItensGrid) {
+        derivedStateOf {
+            if (isDraggingScrollbar) {
+                dragFraction
+            } else {
+                val visibleCount = gridState.layoutInfo.visibleItemsInfo.size.coerceAtLeast(1)
+                val maxFirst = (totalItensGrid - visibleCount).coerceAtLeast(1)
+                (gridState.firstVisibleItemIndex.toFloat() / maxFirst.toFloat()).coerceIn(0f, 1f)
             }
+        }
+    }
 
-            itemsIndexed(
-                items = arquivosDoDia,
-                key = { idx, arq -> "item_${arq.id}_${arq.dataUpload}_${arq.nomeArquivo}_$idx" },
-                contentType = { _, _ -> "item_midia" }
-            ) { _, arq ->
-                val ext = remember(arq.nomeArquivo) { arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT) }
-                val pasta = mapaPastas[arq.dataUpload]
-                val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
-                val estaSelecionado = idsSelecionados.contains(arq.id)
+    val barAlpha by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = if (isDraggingScrollbar || gridState.isScrollInProgress) 1f else 0.58f,
+        label = "scrollbarAlpha"
+    )
 
-                val isImage = remember(arq.nomeArquivo) { ehArquivoImagem(arq.nomeArquivo) }
-                val isVideo = remember(arq.nomeArquivo) { ehArquivoVideo(arq.nomeArquivo) }
+    val dataAtualArrasto = remember(indicesParaData, thumbFraction) {
+        if (indicesParaData.isEmpty()) ""
+        else {
+            val idx = (thumbFraction * (indicesParaData.size - 1)).toInt()
+                .coerceIn(0, indicesParaData.lastIndex)
+            indicesParaData[idx]
+        }
+    }
 
-                val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo) {
-                    miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
-                }
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        val density = androidx.compose.ui.platform.LocalDensity.current
+        val thumbHeightPx = with(density) { 54.dp.toPx() }
+        val trackHeightPx = constraints.maxHeight.toFloat()
+        val usableTrackPx = (trackHeightPx - thumbHeightPx).coerceAtLeast(1f)
 
-                val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura) {
-                    if (temArquivoMiniatura && thumbSafe.isNotBlank()) {
-                        val targetUri = obterUriCapaMidia(thumbSafe)
-                        ImageRequest.Builder(context)
-                            .data(targetUri)
-                            .size(320, 320)
-                            .bitmapConfig(Bitmap.Config.ARGB_8888)
-                            .allowHardware(true)
-                            .memoryCachePolicy(CachePolicy.ENABLED)
-                            .diskCachePolicy(CachePolicy.ENABLED)
-                            .crossfade(false)
-                            .build()
-                    } else null
-                }
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(3),
+            state = gridState,
+            modifier = Modifier.fillMaxSize().padding(1.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            gruposPorData.forEach { (dataCabecalho, arquivosDoDia) ->
 
-                LaunchedEffect(arq.dataUpload, temArquivoMiniatura) {
-                    if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
-                        NexusThumbCache.emProgresso.add(arq.dataUpload)
-                        try {
-                            NexusThumbCache.downloadSemaphore.withPermit {
-                                carregarMiniaturaIndividualDaNuvem(
-                                    context = context,
-                                    client = client,
-                                    usuarioAtivo = usuarioAtivo,
-                                    arq = arq,
-                                    vm = vm,
-                                    atualizarSubBarra = false
-                                )
-                            }
-                        } finally {
-                            NexusThumbCache.emProgresso.remove(arq.dataUpload)
-                        }
+                item(
+                    key = "header_$dataCabecalho",
+                    span = { GridItemSpan(maxLineSpan) },
+                    contentType = "cabecalho_data"
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(BgBlack)
+                            .padding(start = 10.dp, end = 28.dp, top = 14.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = dataCabecalho,
+                            color = Color.White,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "${arquivosDoDia.size}",
+                            color = Gold,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
                     }
                 }
 
-                Box(
-                    Modifier
-                        .aspectRatio(1f)
-                        .background(SurfaceDark)
-                        .border(
-                            width = if (estaSelecionado) 3.dp else 0.dp,
-                            color = if (estaSelecionado) Gold else Color.Transparent
-                        )
-                        .combinedClickable(
-                            onClick = { onFileClick(arq) },
-                            onLongClick = { onFileLongClick(arq) }
-                        ),
-                    contentAlignment = Alignment.Center
-                ) {
-                    when {
-                        isImage -> {
-                            if (thumbModelRequest != null) {
-                                AsyncImage(
-                                    model = thumbModelRequest,
-                                    contentDescription = arq.nomeArquivo,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            } else {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                                }
-                            }
-                        }
-                        isVideo -> {
-                            Box(Modifier.fillMaxSize()) {
-                                if (thumbModelRequest != null) {
-                                    AsyncImage(
-                                        model = thumbModelRequest,
-                                        contentDescription = "Video Preview",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                } else {
-                                    Column(
-                                        modifier = Modifier.align(Alignment.Center),
-                                        horizontalAlignment = Alignment.CenterHorizontally
-                                    ) {
-                                        CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
-                                        Spacer(Modifier.height(28.dp))
-                                        Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                itemsIndexed(
+                    items = arquivosDoDia,
+                    key = { idx, arq -> "item_${arq.id}_${arq.dataUpload}_${arq.nomeArquivo}_$idx" },
+                    contentType = { _, _ -> "item_midia" }
+                ) { _, arq ->
+                    val ext = remember(arq.nomeArquivo) { arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT) }
+                    val pasta = mapaPastas[arq.dataUpload]
+                    val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
+                    val estaSelecionado = idsSelecionados.contains(arq.id)
+
+                    val isImage = remember(arq.nomeArquivo) { ehArquivoImagem(arq.nomeArquivo) }
+                    val isVideo = remember(arq.nomeArquivo) { ehArquivoVideo(arq.nomeArquivo) }
+
+                    val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo) {
+                        miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
+                    }
+
+                    // Preview leve (220x220 + RGB_565 = quase 4x menos RAM) com transição suave de 160ms
+                    val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura) {
+                        if (temArquivoMiniatura && thumbSafe.isNotBlank()) {
+                            val targetUri = obterUriCapaMidia(thumbSafe)
+                            ImageRequest.Builder(context)
+                                .data(targetUri)
+                                .size(220, 220)
+                                .bitmapConfig(Bitmap.Config.RGB_565)
+                                .allowHardware(true)
+                                .memoryCachePolicy(CachePolicy.ENABLED)
+                                .diskCachePolicy(CachePolicy.ENABLED)
+                                .crossfade(160)
+                                .build()
+                        } else null
+                    }
+
+                    // Pausa de 150ms impede disparos inúteis de download ao arrastar rápido na barra lateral
+                    LaunchedEffect(arq.dataUpload, temArquivoMiniatura) {
+                        if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
+                            delay(150)
+                            if (!NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
+                                NexusThumbCache.emProgresso.add(arq.dataUpload)
+                                try {
+                                    NexusThumbCache.downloadSemaphore.withPermit {
+                                        carregarMiniaturaIndividualDaNuvem(
+                                            context = context,
+                                            client = client,
+                                            usuarioAtivo = usuarioAtivo,
+                                            arq = arq,
+                                            vm = vm,
+                                            atualizarSubBarra = false
+                                        )
                                     }
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .size(38.dp)
-                                        .align(Alignment.Center)
-                                        .background(BgBlack.copy(alpha = 0.45f), CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        Icons.Default.PlayArrow,
-                                        null,
-                                        tint = Color.White,
-                                        modifier = Modifier.size(24.dp)
-                                    )
-                                }
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomEnd)
-                                        .padding(4.dp)
-                                        .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
-                                        .padding(horizontal = 4.dp, vertical = 1.dp)
-                                ) {
-                                    Text("VÍDEO", color = Gold, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                                } finally {
+                                    NexusThumbCache.emProgresso.remove(arq.dataUpload)
                                 }
                             }
                         }
-                        ext == "PDF" -> {
-                            val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
-                            if (possuiCapa && thumbModelRequest != null) {
-                                Box(Modifier.fillMaxSize()) {
+                    }
+
+                    Box(
+                        Modifier
+                            .aspectRatio(1f)
+                            .background(SurfaceDark)
+                            .border(
+                                width = if (estaSelecionado) 3.dp else 0.dp,
+                                color = if (estaSelecionado) Gold else Color.Transparent
+                            )
+                            .combinedClickable(
+                                onClick = { onFileClick(arq) },
+                                onLongClick = { onFileLongClick(arq) }
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        when {
+                            isImage -> {
+                                if (thumbModelRequest != null) {
                                     AsyncImage(
                                         model = thumbModelRequest,
                                         contentDescription = arq.nomeArquivo,
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier.fillMaxSize()
                                     )
-                                    Box(
-                                        Modifier
-                                            .align(Alignment.BottomEnd)
-                                            .padding(4.dp)
-                                            .background(DangerRed, RoundedCornerShape(4.dp))
-                                            .padding(horizontal = 4.dp, vertical = 2.dp)
-                                    ) {
-                                        Text("PDF", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
                                     }
                                 }
-                            } else {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                                    Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
-                                    Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            isVideo -> {
+                                Box(Modifier.fillMaxSize()) {
+                                    if (thumbModelRequest != null) {
+                                        AsyncImage(
+                                            model = thumbModelRequest,
+                                            contentDescription = "Video Preview",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    } else {
+                                        Column(
+                                            modifier = Modifier.align(Alignment.Center),
+                                            horizontalAlignment = Alignment.CenterHorizontally
+                                        ) {
+                                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                                            Spacer(Modifier.height(28.dp))
+                                            Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                                        }
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .size(38.dp)
+                                            .align(Alignment.Center)
+                                            .background(BgBlack.copy(alpha = 0.45f), CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Default.PlayArrow,
+                                            null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(24.dp)
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(4.dp)
+                                            .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                    ) {
+                                        Text("VÍDEO", color = Gold, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                            ext == "PDF" -> {
+                                val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                                if (possuiCapa && thumbModelRequest != null) {
+                                    Box(Modifier.fillMaxSize()) {
+                                        AsyncImage(
+                                            model = thumbModelRequest,
+                                            contentDescription = arq.nomeArquivo,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                        Box(
+                                            Modifier
+                                                .align(Alignment.BottomEnd)
+                                                .padding(4.dp)
+                                                .background(DangerRed, RoundedCornerShape(4.dp))
+                                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                                        ) {
+                                            Text("PDF", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                } else {
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                        Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
+                                        Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                            }
+                            ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
+                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp))
+                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+
+                        if (estaSelecionado) {
+                            Box(Modifier.fillMaxSize().background(Gold.copy(alpha = 0.22f)))
+                        }
+
+                        if (modoSelecao) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(6.dp)
+                                    .size(24.dp)
+                                    .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
+                                    .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (estaSelecionado) {
+                                    Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(16.dp))
                                 }
                             }
                         }
-                        ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                            Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
-                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                        else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                            Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp))
-                            Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                    }
 
-                    if (estaSelecionado) {
-                        Box(Modifier.fillMaxSize().background(Gold.copy(alpha = 0.22f)))
-                    }
-
-                    if (modoSelecao) {
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(6.dp)
-                                .size(24.dp)
-                                .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
-                                .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (estaSelecionado) {
-                                Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(16.dp))
+                        if (!pasta.isNullOrBlank()) {
+                            Box(
+                                Modifier
+                                    .align(Alignment.TopStart)
+                                    .padding(4.dp)
+                                    .background(BgBlack.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
+                                    .padding(horizontal = 5.dp, vertical = 2.dp)
+                            ) {
+                                Text(pasta, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                             }
                         }
                     }
+                }
+            }
+        }
 
-                    if (!pasta.isNullOrBlank()) {
-                        Box(
-                            Modifier
-                                .align(Alignment.TopStart)
-                                .padding(4.dp)
-                                .background(BgBlack.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
-                                .padding(horizontal = 5.dp, vertical = 2.dp)
-                        ) {
-                            Text(pasta, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+        // === BARRA LATERAL DE VELOCIDADE (APARECE AUTOMATICAMENTE QUANDO HÁ MAIS DE 15 ITENS) ===
+        if (totalItensGrid > 15) {
+            val thumbOffsetY = (thumbFraction * usableTrackPx).toInt()
+
+            // Balão flutuante com a data enquanto você arrasta a barra lateral
+            if (isDraggingScrollbar && dataAtualArrasto.isNotBlank()) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(end = 42.dp)
+                        .offset { androidx.compose.ui.unit.IntOffset(0, (thumbOffsetY + 10.dp.roundToPx()).coerceAtLeast(0)) }
+                        .background(SurfaceDarker.copy(alpha = 0.95f), RoundedCornerShape(10.dp))
+                        .border(1.dp, Gold, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = dataAtualArrasto,
+                        color = Gold,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                }
+            }
+
+            // Trilha interativa na borda direita (toque para pular ou arraste para voar entre topo e fim)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .width(34.dp)
+                    .fillMaxHeight()
+                    .pointerInput(totalItensGrid, usableTrackPx) {
+                        detectTapGestures { offset ->
+                            val frac = ((offset.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
+                            val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
+                            scopeGrid.launch { gridState.scrollToItem(target) }
                         }
+                    }
+                    .pointerInput(totalItensGrid, usableTrackPx) {
+                        androidx.compose.foundation.gestures.detectVerticalDragGestures(
+                            onDragStart = { offset ->
+                                isDraggingScrollbar = true
+                                val frac = ((offset.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
+                                dragFraction = frac
+                                val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
+                                scopeGrid.launch { gridState.scrollToItem(target) }
+                            },
+                            onVerticalDrag = { change, _ ->
+                                change.consume()
+                                val frac = ((change.position.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
+                                dragFraction = frac
+                                val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
+                                scopeGrid.launch { gridState.scrollToItem(target) }
+                            },
+                            onDragEnd = { isDraggingScrollbar = false },
+                            onDragCancel = { isDraggingScrollbar = false }
+                        )
+                    }
+            ) {
+                if (isDraggingScrollbar) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterEnd)
+                            .padding(end = 10.dp)
+                            .width(3.dp)
+                            .fillMaxHeight()
+                            .background(Gold.copy(alpha = 0.25f), RoundedCornerShape(2.dp))
+                    )
+                }
+
+                // Alça dourada arrastável
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(end = 2.dp)
+                        .offset { androidx.compose.ui.unit.IntOffset(0, thumbOffsetY) }
+                        .graphicsLayer { alpha = barAlpha }
+                        .width(if (isDraggingScrollbar) 24.dp else 18.dp)
+                        .height(54.dp)
+                        .background(
+                            if (isDraggingScrollbar) Gold else SurfaceDarker.copy(alpha = 0.92f),
+                            RoundedCornerShape(12.dp)
+                        )
+                        .border(1.5.dp, Gold, RoundedCornerShape(12.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = Icons.Default.KeyboardArrowUp,
+                            contentDescription = "Topo",
+                            tint = if (isDraggingScrollbar) BgBlack else Gold,
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Icon(
+                            imageVector = Icons.Default.KeyboardArrowDown,
+                            contentDescription = "Fim",
+                            tint = if (isDraggingScrollbar) BgBlack else Gold,
+                            modifier = Modifier.size(13.dp)
+                        )
                     }
                 }
             }
