@@ -935,6 +935,11 @@ suspend fun aguardarUploadTDLibComPausa(
 // === FIM DA PARTE 1 DE 3 ===
 // === CONTINUAÇÃO: PARTE 2 DE 3 (COLE LOGO ABAIXO DA PARTE 1) ===
 
+// Trava global para impedir limpezas repetidas no Room enquanto o cofre sincroniza com a nuvem
+object NexusSyncState {
+    val emAndamento = MutableStateFlow(false)
+}
+
 // === GESTÃO DE COFRES HÍBRIDOS (MS = MENSAGENS SALVAS | CP = CANAL PRIVADO) ===
 fun normalizarUsuario(nome: String): String = nome.trim().lowercase(Locale.ROOT)
 
@@ -1032,6 +1037,34 @@ fun obterChatCofreUsuario(
     val tituloEsperadoCanal = "Nexus Cloud • ${usuarioAtivo.trim()}"
 
     if (modo == "CP") {
+        fun buscarCanalPorTitulo() {
+            client.send(TdApi.GetChats(null, 200)) { chatsObj ->
+                val ids = (chatsObj as? TdApi.Chats)?.chatIds ?: LongArray(0)
+                if (ids.isEmpty()) {
+                    onChatReady(null, "CP", "Nenhum Canal Privado localizado.")
+                    return@send
+                }
+                var verificados = 0
+                var concluido = false
+                for (cid in ids) {
+                    client.send(TdApi.GetChat(cid)) { cObj ->
+                        synchronized(ids) {
+                            verificados++
+                            if (!concluido && cObj is TdApi.Chat && cObj.title.equals(tituloEsperadoCanal, ignoreCase = true)) {
+                                concluido = true
+                                val pinAtual = obterPinCofreLocal(context, usuarioAtivo) ?: ""
+                                salvarCredenciaisCofreLocal(context, usuarioAtivo, pinAtual, false, "CP", cObj.id)
+                                onChatReady(cObj, "CP", null)
+                            } else if (!concluido && verificados == ids.size) {
+                                concluido = true
+                                onChatReady(null, "CP", "Canal Privado de '$usuarioAtivo' não encontrado.")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         fun abrirCanalPorIdOuTitulo(idAlvo: Long, jaCarregouLista: Boolean) {
             if (idAlvo != 0L) {
                 client.send(TdApi.GetChat(idAlvo)) { chatObj ->
@@ -1042,35 +1075,11 @@ fun obterChatCofreUsuario(
                             abrirCanalPorIdOuTitulo(idAlvo, true)
                         }
                     } else {
-                        onChatReady(null, "CP", "Canal Privado ($idAlvo) não encontrado na conta SSD.")
+                        buscarCanalPorTitulo()
                     }
                 }
             } else {
-                client.send(TdApi.GetChats(null, 200)) { chatsObj ->
-                    val ids = (chatsObj as? TdApi.Chats)?.chatIds ?: LongArray(0)
-                    if (ids.isEmpty()) {
-                        onChatReady(null, "CP", "Nenhum Canal Privado localizado.")
-                        return@send
-                    }
-                    var encontrados = 0
-                    var concluido = false
-                    for (cid in ids) {
-                        client.send(TdApi.GetChat(cid)) { cObj ->
-                            synchronized(ids) {
-                                encontrados++
-                                if (!concluido && cObj is TdApi.Chat && cObj.title.equals(tituloEsperadoCanal, ignoreCase = true)) {
-                                    concluido = true
-                                    val pinAtual = obterPinCofreLocal(context, usuarioAtivo) ?: ""
-                                    salvarCredenciaisCofreLocal(context, usuarioAtivo, pinAtual, false, "CP", cObj.id)
-                                    onChatReady(cObj, "CP", null)
-                                } else if (!concluido && encontrados == ids.size) {
-                                    concluido = true
-                                    onChatReady(null, "CP", "Canal Privado de '$usuarioAtivo' não encontrado.")
-                                }
-                            }
-                        }
-                    }
-                }
+                buscarCanalPorTitulo()
             }
         }
 
@@ -1115,69 +1124,71 @@ suspend fun recuperarFileIdNaNuvemPorNome(
         if (chatObj != null) {
             buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeAlvoLimpo.take(25)) { msgsBusca ->
                 buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHist ->
-                    val todasMensagens = (msgsBusca + msgsHist).distinctBy { it.id }
-                    var achouFileId = 0
-                    var achouThumbId = 0
-                    for (msg in todasMensagens) {
-                        when (val c = msg.content) {
-                            is TdApi.MessageDocument -> {
-                                val legenda = c.caption?.text ?: ""
-                                if (modoCofre == "CP" ||
-                                    legenda.contains(tagPerfil, ignoreCase = true) ||
-                                    legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
-                                    legenda.contains("☁️ Nexus Cloud")
-                                ) {
-                                    val nomeBruto = c.document?.fileName ?: ""
-                                    val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
-                                    val tamMsg = c.document?.document?.size ?: 0L
-                                    if (nomeMsg == nomeAlvoLimpo || (tamanhoAlvo > 0L && tamMsg == tamanhoAlvo && nomeMsg.contains(nomeAlvoLimpo.take(8)))) {
-                                        achouFileId = c.document?.document?.id ?: 0
-                                        achouThumbId = c.document?.thumbnail?.file?.id ?: 0
-                                        if (achouFileId != 0) break
+                    NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                        val todasMensagens = (msgsBusca + msgsHist).distinctBy { it.id }
+                        var achouFileId = 0
+                        var achouThumbId = 0
+                        for (msg in todasMensagens) {
+                            when (val c = msg.content) {
+                                is TdApi.MessageDocument -> {
+                                    val legenda = c.caption?.text ?: ""
+                                    if (modoCofre == "CP" ||
+                                        legenda.contains(tagPerfil, ignoreCase = true) ||
+                                        legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                        legenda.contains("☁️ Nexus Cloud")
+                                    ) {
+                                        val nomeBruto = c.document?.fileName ?: ""
+                                        val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+                                        val tamMsg = c.document?.document?.size ?: 0L
+                                        if (nomeMsg == nomeAlvoLimpo || (tamanhoAlvo > 0L && tamMsg == tamanhoAlvo && nomeMsg.contains(nomeAlvoLimpo.take(8)))) {
+                                            achouFileId = c.document?.document?.id ?: 0
+                                            achouThumbId = c.document?.thumbnail?.file?.id ?: 0
+                                            if (achouFileId != 0) break
+                                        }
                                     }
                                 }
-                            }
-                            is TdApi.MessageAudio -> {
-                                val legenda = c.caption?.text ?: ""
-                                if (modoCofre == "CP" ||
-                                    legenda.contains(tagPerfil, ignoreCase = true) ||
-                                    legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
-                                    legenda.contains("☁️ Nexus Cloud")
-                                ) {
-                                    val nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "" } ?: ""
-                                    val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
-                                    if (nomeMsg == nomeAlvoLimpo) {
-                                        achouFileId = c.audio?.audio?.id ?: 0
-                                        achouThumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
-                                        if (achouFileId != 0) break
+                                is TdApi.MessageAudio -> {
+                                    val legenda = c.caption?.text ?: ""
+                                    if (modoCofre == "CP" ||
+                                        legenda.contains(tagPerfil, ignoreCase = true) ||
+                                        legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                        legenda.contains("☁️ Nexus Cloud")
+                                    ) {
+                                        val nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "" } ?: ""
+                                        val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+                                        if (nomeMsg == nomeAlvoLimpo) {
+                                            achouFileId = c.audio?.audio?.id ?: 0
+                                            achouThumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
+                                            if (achouFileId != 0) break
+                                        }
                                     }
                                 }
-                            }
-                            is TdApi.MessagePhoto -> {
-                                val legenda = c.caption?.text ?: ""
-                                if (modoCofre == "CP" || legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)) {
-                                    val nomeMsg = extrairNomeLimpoDaMensagem("", legenda).lowercase(Locale.ROOT)
-                                    if (nomeMsg == nomeAlvoLimpo) {
-                                        val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
-                                        achouFileId = maior?.photo?.id ?: 0
-                                        if (achouFileId != 0) break
+                                is TdApi.MessagePhoto -> {
+                                    val legenda = c.caption?.text ?: ""
+                                    if (modoCofre == "CP" || legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)) {
+                                        val nomeMsg = extrairNomeLimpoDaMensagem("", legenda).lowercase(Locale.ROOT)
+                                        if (nomeMsg == nomeAlvoLimpo) {
+                                            val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                                            achouFileId = maior?.photo?.id ?: 0
+                                            if (achouFileId != 0) break
+                                        }
                                     }
                                 }
-                            }
-                            is TdApi.MessageVideo -> {
-                                val legenda = c.caption?.text ?: ""
-                                if (modoCofre == "CP" || legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)) {
-                                    val nomeMsg = extrairNomeLimpoDaMensagem(c.video?.fileName ?: "", legenda).lowercase(Locale.ROOT)
-                                    if (nomeMsg == nomeAlvoLimpo) {
-                                        achouFileId = c.video?.video?.id ?: 0
-                                        achouThumbId = c.video?.thumbnail?.file?.id ?: 0
-                                        if (achouFileId != 0) break
+                                is TdApi.MessageVideo -> {
+                                    val legenda = c.caption?.text ?: ""
+                                    if (modoCofre == "CP" || legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)) {
+                                        val nomeMsg = extrairNomeLimpoDaMensagem(c.video?.fileName ?: "", legenda).lowercase(Locale.ROOT)
+                                        if (nomeMsg == nomeAlvoLimpo) {
+                                            achouFileId = c.video?.video?.id ?: 0
+                                            achouThumbId = c.video?.thumbnail?.file?.id ?: 0
+                                            if (achouFileId != 0) break
+                                        }
                                     }
                                 }
                             }
                         }
+                        def.complete(Pair(achouFileId, achouThumbId))
                     }
-                    def.complete(Pair(achouFileId, achouThumbId))
                 }
             }
         } else {
@@ -1475,7 +1486,7 @@ fun backupCompletoPastasNaNuvem(
             return@obterChatCofreUsuario
         }
 
-        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        NexusBackgroundScope.scope.launch(Dispatchers.IO) {
             mensagensTexto.forEach { txt ->
                 val def = CompletableDeferred<Unit>()
                 val req = TdApi.SendMessage().apply {
@@ -1674,54 +1685,56 @@ fun eliminarMultiplosFicheiros(
         if (chatObj != null) {
             buscarMensagensPorTermoNaNuvem(client, chatObj.id, tagPerfil) { msgsTag ->
                 buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHist ->
-                    val todasMensagens = (msgsTag + msgsHist).distinctBy { it.id }
-                    val msgIdsParaApagar = mutableListOf<Long>()
-                    for (msg in todasMensagens) {
-                        val legenda = when (val c = msg.content) {
-                            is TdApi.MessageDocument -> c.caption?.text ?: ""
-                            is TdApi.MessageAudio -> c.caption?.text ?: ""
-                            is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                            is TdApi.MessageVideo -> c.caption?.text ?: ""
-                            else -> ""
-                        }
-                        val pertenceAoUsuario = modoCofre == "CP" ||
-                            legenda.contains(tagPerfil, ignoreCase = true) ||
-                            legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
-                            legenda.contains("☁️ Nexus Cloud")
-
-                        if (pertenceAoUsuario) {
-                            val rId = when (val c = msg.content) {
-                                is TdApi.MessageDocument -> c.document?.document?.id ?: 0
-                                is TdApi.MessageAudio -> c.audio?.audio?.id ?: 0
-                                is TdApi.MessagePhoto -> c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }?.photo?.id ?: 0
-                                is TdApi.MessageVideo -> c.video?.video?.id ?: 0
-                                else -> 0
-                            }
-                            val nomeBruto = when (val c = msg.content) {
-                                is TdApi.MessageDocument -> c.document?.fileName ?: ""
-                                is TdApi.MessageAudio -> c.audio?.fileName?.ifBlank { c.audio?.title ?: "" } ?: ""
-                                is TdApi.MessageVideo -> c.video?.fileName ?: ""
+                    NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                        val todasMensagens = (msgsTag + msgsHist).distinctBy { it.id }
+                        val msgIdsParaApagar = mutableListOf<Long>()
+                        for (msg in todasMensagens) {
+                            val legenda = when (val c = msg.content) {
+                                is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                                is TdApi.MessageVideo -> c.caption?.text ?: ""
                                 else -> ""
                             }
-                            val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+                            val pertenceAoUsuario = modoCofre == "CP" ||
+                                legenda.contains(tagPerfil, ignoreCase = true) ||
+                                legenda.contains(tagPerfilExibicao, ignoreCase = true) ||
+                                legenda.contains("☁️ Nexus Cloud")
 
-                            if ((rId != 0 && idsRemotosParaApagar.contains(rId)) || nomesParaApagar.contains(nomeMsg)) {
-                                msgIdsParaApagar.add(msg.id)
+                            if (pertenceAoUsuario) {
+                                val rId = when (val c = msg.content) {
+                                    is TdApi.MessageDocument -> c.document?.document?.id ?: 0
+                                    is TdApi.MessageAudio -> c.audio?.audio?.id ?: 0
+                                    is TdApi.MessagePhoto -> c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }?.photo?.id ?: 0
+                                    is TdApi.MessageVideo -> c.video?.video?.id ?: 0
+                                    else -> 0
+                                }
+                                val nomeBruto = when (val c = msg.content) {
+                                    is TdApi.MessageDocument -> c.document?.fileName ?: ""
+                                    is TdApi.MessageAudio -> c.audio?.fileName?.ifBlank { c.audio?.title ?: "" } ?: ""
+                                    is TdApi.MessageVideo -> c.video?.fileName ?: ""
+                                    else -> ""
+                                }
+                                val nomeMsg = extrairNomeLimpoDaMensagem(nomeBruto, legenda).lowercase(Locale.ROOT)
+
+                                if ((rId != 0 && idsRemotosParaApagar.contains(rId)) || nomesParaApagar.contains(nomeMsg)) {
+                                    msgIdsParaApagar.add(msg.id)
+                                }
                             }
                         }
-                    }
 
-                    if (msgIdsParaApagar.isNotEmpty()) {
-                        val delReq = TdApi.DeleteMessages().apply {
-                            this.chatId = chatObj.id
-                            this.messageIds = msgIdsParaApagar.toLongArray()
-                            this.revoke = true
+                        if (msgIdsParaApagar.isNotEmpty()) {
+                            val delReq = TdApi.DeleteMessages().apply {
+                                this.chatId = chatObj.id
+                                this.messageIds = msgIdsParaApagar.toLongArray()
+                                this.revoke = true
+                            }
+                            client.send(delReq) {
+                                onComplete("$qtd ficheiro(s) deletado(s) do app e da nuvem SSD ($modoCofre)!")
+                            }
+                        } else {
+                            onComplete("$qtd ficheiro(s) deletado(s)!")
                         }
-                        client.send(delReq) {
-                            onComplete("$qtd ficheiro(s) deletado(s) do app e da nuvem SSD ($modoCofre)!")
-                        }
-                    } else {
-                        onComplete("$qtd ficheiro(s) deletado(s)!")
                     }
                 }
             }
@@ -1853,7 +1866,6 @@ fun limparDuplicadosExistentes(
         }
     }
 
-    // Grava tudo em lote único por perfil (evita OOM e travamento da interface)
     for ((dono, itens) in paraSincronizarPorDono) {
         marcarLoteComoSincronizado(context, dono, itens)
     }
@@ -1904,7 +1916,7 @@ fun buscarMensagensPorTermoNaNuvem(
     }
 }
 
-// Paginação otimizada para avançar direto no servidor já na primeira abertura após reinstalar
+// Paginação leve fora da thread nativa da TDLib com progresso em tempo real
 fun buscarHistoricoPaginado(
     client: Client,
     chatId: Long,
@@ -1912,6 +1924,7 @@ fun buscarHistoricoPaginado(
     lotesRestantes: Int,
     acumulado: MutableList<TdApi.Message>,
     tentativasVazio: Int = 0,
+    onProgress: ((Int) -> Unit)? = null,
     onComplete: (List<TdApi.Message>) -> Unit
 ) {
     if (lotesRestantes <= 0) {
@@ -1934,16 +1947,20 @@ fun buscarHistoricoPaginado(
 
         if (msgs.isNotEmpty()) {
             acumulado.addAll(msgs)
+            onProgress?.invoke(acumulado.size)
             val ultimoId = msgs.minOf { it.id }
             if (ultimoId != 0L && ultimoId != fromMsgId) {
-                buscarHistoricoPaginado(client, chatId, ultimoId, lotesRestantes - 1, acumulado, 0, onComplete)
+                NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                    delay(35)
+                    buscarHistoricoPaginado(client, chatId, ultimoId, lotesRestantes - 1, acumulado, 0, onProgress, onComplete)
+                }
             } else {
                 onComplete(acumulado.distinctBy { it.id })
             }
         } else if (tentativasVazio < 3 && (fromMsgId == 0L || acumulado.size <= 3)) {
-            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                delay(550)
-                buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
+            NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                delay(500)
+                buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onProgress, onComplete)
             }
         } else {
             onComplete(acumulado.distinctBy { it.id })
@@ -1963,45 +1980,47 @@ fun descobrirPerfisExistentesNaNuvem(
                 if (chatObj is TdApi.Chat) {
                     buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsBusca ->
                         buscarHistoricoPaginado(client, chatObj.id, 0L, 10, mutableListOf()) { msgsHist ->
-                            val todas = (msgsBusca + msgsHist).distinctBy { it.id }
-                            val nomesEncontrados = mutableMapOf<String, String>()
+                            NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                val todas = (msgsBusca + msgsHist).distinctBy { it.id }
+                                val nomesEncontrados = mutableMapOf<String, String>()
 
-                            for (msg in todas) {
-                                val texto = when (val c = msg.content) {
-                                    is TdApi.MessageText -> c.text?.text ?: ""
-                                    is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                    is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                    else -> ""
-                                }
-                                if (texto.contains("[REGISTO_COFRE]")) {
-                                    val partes = texto.split("|").map { it.trim() }
-                                    val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                    val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                    val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                    val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                    val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
+                                for (msg in todas) {
+                                    val texto = when (val c = msg.content) {
+                                        is TdApi.MessageText -> c.text?.text ?: ""
+                                        is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                        is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                        else -> ""
+                                    }
+                                    if (texto.contains("[REGISTO_COFRE]")) {
+                                        val partes = texto.split("|").map { it.trim() }
+                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                        val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
 
-                                    val chave = normalizarUsuario(userPart ?: nomePart ?: "")
-                                    val exibicao = (nomePart ?: userPart ?: "").trim()
-                                    if (chave.isNotBlank() && exibicao.isNotBlank()) {
-                                        if (!nomesEncontrados.containsKey(chave)) {
-                                            nomesEncontrados[chave] = exibicao
-                                        }
-                                        if (!pinPart.isNullOrBlank()) {
-                                            salvarCredenciaisCofreLocal(
-                                                context = context,
-                                                nomeOriginal = exibicao,
-                                                pin = pinPart,
-                                                definirComoAtivo = false,
-                                                modoArmazenamento = modePart,
-                                                canalChatId = chatPart
-                                            )
+                                        val chave = normalizarUsuario(userPart ?: nomePart ?: "")
+                                        val exibicao = (nomePart ?: userPart ?: "").trim()
+                                        if (chave.isNotBlank() && exibicao.isNotBlank()) {
+                                            if (!nomesEncontrados.containsKey(chave)) {
+                                                nomesEncontrados[chave] = exibicao
+                                            }
+                                            if (!pinPart.isNullOrBlank()) {
+                                                salvarCredenciaisCofreLocal(
+                                                    context = context,
+                                                    nomeOriginal = exibicao,
+                                                    pin = pinPart,
+                                                    definirComoAtivo = false,
+                                                    modoArmazenamento = modePart,
+                                                    canalChatId = chatPart
+                                                )
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            onFound(nomesEncontrados.values.toList())
+                                onFound(nomesEncontrados.values.toList())
+                            }
                         }
                     }
                 } else onFound(emptyList())
@@ -2033,128 +2052,130 @@ fun verificarOuRegistarCofreNuvem(
                     buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsRegisto ->
                         buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeUsuario.trim()) { msgsUsuario ->
                             buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
-                                val todasMensagens = (msgsRegisto + msgsUsuario + msgsHistorico).distinctBy { it.id }
+                                NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                    val todasMensagens = (msgsRegisto + msgsUsuario + msgsHistorico).distinctBy { it.id }
 
-                                var pinEncontrado: String? = null
-                                var nomeOriginalEncontrado = nomeUsuario.trim()
-                                var modoEncontrado = "MS"
-                                var chatIdCanalEncontrado = 0L
-                                var temArquivosDoUsuarioNaNuvem = false
+                                    var pinEncontrado: String? = null
+                                    var nomeOriginalEncontrado = nomeUsuario.trim()
+                                    var modoEncontrado = "MS"
+                                    var chatIdCanalEncontrado = 0L
+                                    var temArquivosDoUsuarioNaNuvem = false
 
-                                for (msg in todasMensagens) {
-                                    val texto = when (val c = msg.content) {
-                                        is TdApi.MessageText -> c.text?.text ?: ""
-                                        is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                        is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                        is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                                        is TdApi.MessageVideo -> c.caption?.text ?: ""
-                                        else -> ""
-                                    }
-
-                                    if (texto.contains("[REGISTO_COFRE]") && pinEncontrado == null) {
-                                        val partes = texto.split("|").map { it.trim() }
-                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
-
-                                        val chaveMsg = normalizarUsuario(userPart ?: nomePart ?: "")
-                                        if (chaveMsg == chaveDesejada && !pinPart.isNullOrBlank()) {
-                                            pinEncontrado = pinPart
-                                            if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
-                                            if (!modePart.isNullOrBlank()) modoEncontrado = modePart.uppercase(Locale.ROOT)
-                                            if (chatPart != null && chatPart != 0L) chatIdCanalEncontrado = chatPart
+                                    for (msg in todasMensagens) {
+                                        val texto = when (val c = msg.content) {
+                                            is TdApi.MessageText -> c.text?.text ?: ""
+                                            is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                            is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                            is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                                            is TdApi.MessageVideo -> c.caption?.text ?: ""
+                                            else -> ""
                                         }
-                                    }
 
-                                    if (msg.content is TdApi.MessageDocument ||
-                                        msg.content is TdApi.MessageAudio ||
-                                        msg.content is TdApi.MessagePhoto ||
-                                        msg.content is TdApi.MessageVideo
-                                    ) {
-                                        if (texto.contains("👤 [$chaveDesejada]", ignoreCase = true) ||
-                                            texto.contains("👤 [${nomeUsuario.trim()}]", ignoreCase = true)
+                                        if (texto.contains("[REGISTO_COFRE]") && pinEncontrado == null) {
+                                            val partes = texto.split("|").map { it.trim() }
+                                            val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
+
+                                            val chaveMsg = normalizarUsuario(userPart ?: nomePart ?: "")
+                                            if (chaveMsg == chaveDesejada && !pinPart.isNullOrBlank()) {
+                                                pinEncontrado = pinPart
+                                                if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
+                                                if (!modePart.isNullOrBlank()) modoEncontrado = modePart.uppercase(Locale.ROOT)
+                                                if (chatPart != null && chatPart != 0L) chatIdCanalEncontrado = chatPart
+                                            }
+                                        }
+
+                                        if (msg.content is TdApi.MessageDocument ||
+                                            msg.content is TdApi.MessageAudio ||
+                                            msg.content is TdApi.MessagePhoto ||
+                                            msg.content is TdApi.MessageVideo
                                         ) {
-                                            temArquivosDoUsuarioNaNuvem = true
-                                            val extraido = texto.substringAfter("👤 [", "").substringBefore("]", "").trim()
-                                            if (extraido.isNotBlank() && nomeOriginalEncontrado.equals(nomeUsuario.trim(), ignoreCase = true)) {
-                                                nomeOriginalEncontrado = extraido
-                                            }
-                                        }
-                                    }
-                                }
-
-                                fun gravarRegistoNaNuvem(
-                                    nomeConfirmado: String,
-                                    modoFinal: String,
-                                    chatIdCanal: Long,
-                                    mensagemSucesso: String
-                                ) {
-                                    val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeConfirmado.trim()} | PIN:$pinLimpo | MODE:$modoFinal | CHAT:$chatIdCanal"
-                                    val msgContent = TdApi.InputMessageText().apply {
-                                        text = TdApi.FormattedText(regTexto, emptyArray())
-                                    }
-                                    val sendReq = TdApi.SendMessage().apply {
-                                        this.chatId = chatObj.id
-                                        this.inputMessageContent = msgContent
-                                    }
-                                    client.send(sendReq) {
-                                        if (modoFinal == "CP" && chatIdCanal != 0L) {
-                                            val sendCanal = TdApi.SendMessage().apply {
-                                                this.chatId = chatIdCanal
-                                                this.inputMessageContent = TdApi.InputMessageText().apply {
-                                                    text = TdApi.FormattedText(regTexto, emptyArray())
-                                                }
-                                            }
-                                            client.send(sendCanal) {}
-                                        }
-                                        onResult(true, nomeConfirmado.trim(), modoFinal, chatIdCanal, mensagemSucesso)
-                                    }
-                                }
-
-                                if (modoCriarNovo) {
-                                    when {
-                                        pinEncontrado != null && pinEncontrado == pinLimpo -> {
-                                            onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre existente ($modoEncontrado) reconhecido e restaurado!")
-                                        }
-                                        pinEncontrado != null && pinEncontrado != pinLimpo -> {
-                                            onResult(false, "", modoEncontrado, 0L, "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
-                                        }
-                                        temArquivosDoUsuarioNaNuvem -> {
-                                            gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Perfil existente (MS) vinculado e restaurado!")
-                                        }
-                                        modoDesejado == "CP" -> {
-                                            criarCanalPrivadoTDLib(client, nomeUsuario.trim()) { novoCanalId, erroCanal ->
-                                                if (novoCanalId != 0L) {
-                                                    gravarRegistoNaNuvem(
-                                                        nomeConfirmado = nomeUsuario.trim(),
-                                                        modoFinal = "CP",
-                                                        chatIdCanal = novoCanalId,
-                                                        mensagemSucesso = "Cofre SSD em Canal Privado (CP) criado com sucesso!"
-                                                    )
-                                                } else {
-                                                    onResult(false, "", "CP", 0L, erroCanal ?: "Falha ao criar Canal Privado (CP). Tente o modo MS.")
+                                            if (texto.contains("👤 [$chaveDesejada]", ignoreCase = true) ||
+                                                texto.contains("👤 [${nomeUsuario.trim()}]", ignoreCase = true)
+                                            ) {
+                                                temArquivosDoUsuarioNaNuvem = true
+                                                val extraido = texto.substringAfter("👤 [", "").substringBefore("]", "").trim()
+                                                if (extraido.isNotBlank() && nomeOriginalEncontrado.equals(nomeUsuario.trim(), ignoreCase = true)) {
+                                                    nomeOriginalEncontrado = extraido
                                                 }
                                             }
                                         }
-                                        else -> {
-                                            gravarRegistoNaNuvem(nomeUsuario.trim(), "MS", 0L, "Cofre SSD em Mensagens Salvas (MS) criado com sucesso!")
+                                    }
+
+                                    fun gravarRegistoNaNuvem(
+                                        nomeConfirmado: String,
+                                        modoFinal: String,
+                                        chatIdCanal: Long,
+                                        mensagemSucesso: String
+                                    ) {
+                                        val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeConfirmado.trim()} | PIN:$pinLimpo | MODE:$modoFinal | CHAT:$chatIdCanal"
+                                        val msgContent = TdApi.InputMessageText().apply {
+                                            text = TdApi.FormattedText(regTexto, emptyArray())
+                                        }
+                                        val sendReq = TdApi.SendMessage().apply {
+                                            this.chatId = chatObj.id
+                                            this.inputMessageContent = msgContent
+                                        }
+                                        client.send(sendReq) {
+                                            if (modoFinal == "CP" && chatIdCanal != 0L) {
+                                                val sendCanal = TdApi.SendMessage().apply {
+                                                    this.chatId = chatIdCanal
+                                                    this.inputMessageContent = TdApi.InputMessageText().apply {
+                                                        text = TdApi.FormattedText(regTexto, emptyArray())
+                                                    }
+                                                }
+                                                client.send(sendCanal) {}
+                                            }
+                                            onResult(true, nomeConfirmado.trim(), modoFinal, chatIdCanal, mensagemSucesso)
                                         }
                                     }
-                                } else {
-                                    when {
-                                        pinEncontrado != null && pinEncontrado == pinLimpo -> {
-                                            onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre SSD ($modoEncontrado) desbloqueado!")
+
+                                    if (modoCriarNovo) {
+                                        when {
+                                            pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                                onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre existente ($modoEncontrado) reconhecido e restaurado!")
+                                            }
+                                            pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                                onResult(false, "", modoEncontrado, 0L, "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
+                                            }
+                                            temArquivosDoUsuarioNaNuvem -> {
+                                                gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Perfil existente (MS) vinculado e restaurado!")
+                                            }
+                                            modoDesejado == "CP" -> {
+                                                criarCanalPrivadoTDLib(client, nomeUsuario.trim()) { novoCanalId, erroCanal ->
+                                                    if (novoCanalId != 0L) {
+                                                        gravarRegistoNaNuvem(
+                                                            nomeConfirmado = nomeUsuario.trim(),
+                                                            modoFinal = "CP",
+                                                            chatIdCanal = novoCanalId,
+                                                            mensagemSucesso = "Cofre SSD em Canal Privado (CP) criado com sucesso!"
+                                                        )
+                                                    } else {
+                                                        onResult(false, "", "CP", 0L, erroCanal ?: "Falha ao criar Canal Privado (CP). Tente o modo MS.")
+                                                    }
+                                                }
+                                            }
+                                            else -> {
+                                                gravarRegistoNaNuvem(nomeUsuario.trim(), "MS", 0L, "Cofre SSD em Mensagens Salvas (MS) criado com sucesso!")
+                                            }
                                         }
-                                        pinEncontrado != null && pinEncontrado != pinLimpo -> {
-                                            onResult(false, "", modoEncontrado, 0L, "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
-                                        }
-                                        temArquivosDoUsuarioNaNuvem -> {
-                                            gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Cofre '$nomeOriginalEncontrado' (MS) reconhecido na nuvem SSD!")
-                                        }
-                                        else -> {
-                                            onResult(false, "", "MS", 0L, "Cofre '${nomeUsuario.trim()}' não encontrado na nuvem SSD. Verifique o nome ou use 'CRIAR COFRE'.")
+                                    } else {
+                                        when {
+                                            pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                                onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre SSD ($modoEncontrado) desbloqueado!")
+                                            }
+                                            pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                                onResult(false, "", modoEncontrado, 0L, "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
+                                            }
+                                            temArquivosDoUsuarioNaNuvem -> {
+                                                gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Cofre '$nomeOriginalEncontrado' (MS) reconhecido na nuvem SSD!")
+                                            }
+                                            else -> {
+                                                onResult(false, "", "MS", 0L, "Cofre '${nomeUsuario.trim()}' não encontrado na nuvem SSD. Verifique o nome ou use 'CRIAR COFRE'.")
+                                            }
                                         }
                                     }
                                 }
@@ -2236,8 +2257,10 @@ fun extrairCapaVideoParaArquivo(
 ): Boolean {
     if (destinoFrame.exists() && destinoFrame.length() > 256L) {
         val existenteBmp = try { BitmapFactory.decodeFile(destinoFrame.absolutePath) } catch (_: Exception) { null }
-        if (existenteBmp != null && calcularBrilhoMedioBitmap(existenteBmp) >= 35) {
-            return true
+        if (existenteBmp != null) {
+            val brilhoOk = calcularBrilhoMedioBitmap(existenteBmp) >= 35
+            existenteBmp.recycle()
+            if (brilhoOk) return true
         }
     }
 
@@ -2273,8 +2296,11 @@ fun extrairCapaVideoParaArquivo(
             if (candidato != null) {
                 val b = calcularBrilhoMedioBitmap(candidato)
                 if (b > melhorBrilho) {
+                    melhorBitmap?.recycle()
                     melhorBrilho = b
                     melhorBitmap = candidato
+                } else {
+                    candidato.recycle()
                 }
                 if (b >= 48) break
             }
@@ -2294,7 +2320,10 @@ fun extrairCapaVideoParaArquivo(
             if (thumbFallback != null) {
                 val b = calcularBrilhoMedioBitmap(thumbFallback)
                 if (melhorBitmap == null || b > melhorBrilho) {
+                    melhorBitmap?.recycle()
                     melhorBitmap = thumbFallback
+                } else {
+                    thumbFallback.recycle()
                 }
             }
         } catch (_: Exception) {}
@@ -2302,12 +2331,14 @@ fun extrairCapaVideoParaArquivo(
 
     val bmpBruto = melhorBitmap ?: return false
     val bmpFinal = clarearBitmapVideoSeNecessario(bmpBruto)
+    if (bmpFinal !== bmpBruto) bmpBruto.recycle()
 
     return try {
         val tempFile = File("${destinoFrame.absolutePath}.tmp")
         FileOutputStream(tempFile).use { out ->
             bmpFinal.compress(Bitmap.CompressFormat.JPEG, 88, out)
         }
+        bmpFinal.recycle()
         if (tempFile.exists() && tempFile.length() > 256L) {
             if (destinoFrame.exists()) destinoFrame.delete()
             tempFile.renameTo(destinoFrame)
@@ -2317,6 +2348,7 @@ fun extrairCapaVideoParaArquivo(
             false
         }
     } catch (_: Exception) {
+        try { bmpFinal.recycle() } catch (_: Throwable) {}
         false
     }
 }
@@ -2341,6 +2373,7 @@ fun gerarMiniaturaImagemLeve(arquivoImagem: File, destinoFrame: File): Boolean {
         FileOutputStream(tempFile).use { out ->
             bmp.compress(Bitmap.CompressFormat.JPEG, 86, out)
         }
+        bmp.recycle()
         if (tempFile.exists() && tempFile.length() > 256L) {
             if (destinoFrame.exists()) destinoFrame.delete()
             tempFile.renameTo(destinoFrame)
@@ -2363,17 +2396,23 @@ fun salvarMiniaturaRapidaTDLib(context: Context, arquivoThumb: File, fileId: Int
         val fFrame = File(dir, "fast_${fileId}_${nomeSeguro}_frame.jpg")
 
         val bmp = BitmapFactory.decodeFile(arquivoThumb.absolutePath) ?: return ""
-        if (bmp.width <= 0 || bmp.height <= 0) return ""
+        if (bmp.width <= 0 || bmp.height <= 0) {
+            bmp.recycle()
+            return ""
+        }
 
         val brilho = calcularBrilhoMedioBitmap(bmp)
         if (ehVid && brilho < 22) {
+            bmp.recycle()
             return ""
         }
 
         val bmpAjustado = if (ehVid) clarearBitmapVideoSeNecessario(bmp) else bmp
+        if (bmpAjustado !== bmp) bmp.recycle()
         FileOutputStream(fFrame).use { out ->
             bmpAjustado.compress(Bitmap.CompressFormat.JPEG, 88, out)
         }
+        bmpAjustado.recycle()
         if (fFrame.exists() && fFrame.length() > 256L) {
             Uri.fromFile(fFrame).toString()
         } else ""
@@ -2424,405 +2463,498 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO HÍBRIDA DA NUVEM COM RESTAURAÇÃO COMPLETA DE PASTAS E MOVIMENTAÇÕES ===
+// === SINCRONIZAÇÃO HÍBRIDA LEVE (CP DIRETO NO HISTÓRICO | MS COM ETIQUETAS | GRAVAÇÃO EM LOTE NO IO) ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
     usuarioAtivo: String,
     arquivosAtuaisReais: List<ArquivoNuvem>,
+    dao: NexusDao,
     vm: UIViewModel,
     onComplete: (Int) -> Unit
 ) {
+    if (NexusSyncState.emAndamento.value) {
+        onComplete(0)
+        return
+    }
+    NexusSyncState.emAndamento.value = true
+
     val chaveAtiva = normalizarUsuario(usuarioAtivo)
     val tagPerfil = "👤 [$chaveAtiva]"
     val tagPerfilExibicao = "👤 [$usuarioAtivo]"
     val modoCofre = obterModoCofreLocal(context, usuarioAtivo)
 
+    fun encerrarSync(qtdImportados: Int, fecharBarra: Boolean = false) {
+        if (fecharBarra) NexusLeituraNuvem.encerrar()
+        NexusSyncState.emAndamento.value = false
+        onComplete(qtdImportados)
+    }
+
     NexusLeituraNuvem.iniciar(1, "Conectando ao cofre $modoCofre de $usuarioAtivo...")
+
+    fun processarMensagensEmLoteIO(todasMensagens: List<TdApi.Message>, modoReal: String) {
+        NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+            try {
+                // 1. Reconstrói todas as ações de pastas e movimentações em ordem cronológica
+                val pastasAtivasNuvem = mutableMapOf<String, String>()
+                val pastasApagadasNuvem = mutableSetOf<String>()
+                val mapaRenomeacoesNuvem = mutableMapOf<String, String>()
+                val mapaMovidosPorChave = mutableMapOf<String, String>()
+                val mapaMovidosPorNome = mutableMapOf<String, String>()
+
+                val msgsMetadados = todasMensagens
+                    .filter { it.content is TdApi.MessageText }
+                    .sortedWith(compareBy<TdApi.Message> { it.date }.thenBy { it.id })
+
+                for (msg in msgsMetadados) {
+                    val txt = (msg.content as? TdApi.MessageText)?.text?.text ?: continue
+                    if (!txt.contains("[SYNC_PASTA]") && !txt.contains("[SYNC_MOVER]")) continue
+
+                    val partes = txt.split("|").map { it.trim() }
+                    val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }
+                        ?.substringAfter(":")?.trim() ?: ""
+                    val pertenceAoUsuario = modoReal == "CP" ||
+                        normalizarUsuario(userPart) == chaveAtiva
+                    if (!pertenceAoUsuario) continue
+
+                    if (txt.contains("[SYNC_PASTA]")) {
+                        val acao = partes.firstOrNull { it.startsWith("ACAO:", ignoreCase = true) }
+                            ?.substringAfter(":")?.trim()?.uppercase(Locale.ROOT) ?: ""
+                        when (acao) {
+                            "CRIAR" -> {
+                                val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                                    ?.substringAfter(":")?.trim() ?: ""
+                                if (p.isNotBlank()) {
+                                    val pLower = p.lowercase(Locale.ROOT)
+                                    pastasApagadasNuvem.remove(pLower)
+                                    pastasAtivasNuvem[pLower] = p
+                                }
+                            }
+                            "RENOMEAR" -> {
+                                val de = partes.firstOrNull { it.startsWith("DE:", ignoreCase = true) }
+                                    ?.substringAfter(":")?.trim() ?: ""
+                                val para = partes.firstOrNull { it.startsWith("PARA:", ignoreCase = true) }
+                                    ?.substringAfter(":")?.trim() ?: ""
+                                if (de.isNotBlank() && para.isNotBlank()) {
+                                    val deLower = de.lowercase(Locale.ROOT)
+                                    val paraLower = para.lowercase(Locale.ROOT)
+                                    pastasAtivasNuvem.remove(deLower)
+                                    pastasApagadasNuvem.add(deLower)
+                                    pastasApagadasNuvem.remove(paraLower)
+                                    pastasAtivasNuvem[paraLower] = para
+                                    mapaRenomeacoesNuvem.entries.forEach { entry ->
+                                        if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                    }
+                                    mapaRenomeacoesNuvem[deLower] = para
+                                    mapaMovidosPorChave.entries.forEach { entry ->
+                                        if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                    }
+                                    mapaMovidosPorNome.entries.forEach { entry ->
+                                        if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                    }
+                                }
+                            }
+                            "APAGAR" -> {
+                                val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                                    ?.substringAfter(":")?.trim() ?: ""
+                                if (p.isNotBlank()) {
+                                    val pLower = p.lowercase(Locale.ROOT)
+                                    pastasAtivasNuvem.remove(pLower)
+                                    pastasApagadasNuvem.add(pLower)
+                                    mapaMovidosPorChave.entries.forEach { entry ->
+                                        if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
+                                    }
+                                    mapaMovidosPorNome.entries.forEach { entry ->
+                                        if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
+                                    }
+                                }
+                            }
+                        }
+                    } else if (txt.contains("[SYNC_MOVER]")) {
+                        val pastaDest = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                            ?.substringAfter(":")?.trim() ?: ""
+                        val itensStr = partes.firstOrNull { it.startsWith("ITENS:", ignoreCase = true) }
+                            ?.substringAfter(":")?.trim() ?: ""
+                        if (pastaDest.isNotBlank()) {
+                            val pLower = pastaDest.lowercase(Locale.ROOT)
+                            pastasApagadasNuvem.remove(pLower)
+                            pastasAtivasNuvem[pLower] = pastaDest
+                        }
+                        itensStr.split(";;").forEach { itemToken ->
+                            val limpoToken = itemToken.trim()
+                            if (limpoToken.isNotBlank()) {
+                                val temHash = limpoToken.contains('#')
+                                val nLower = (if (temHash) limpoToken.substringBeforeLast('#') else limpoToken)
+                                    .trim().lowercase(Locale.ROOT)
+                                val tStr = if (temHash) limpoToken.substringAfterLast('#').trim() else ""
+                                if (nLower.isNotBlank()) {
+                                    if (tStr.isNotBlank()) {
+                                        mapaMovidosPorChave["$nLower|$tStr"] = pastaDest
+                                    }
+                                    mapaMovidosPorNome[nLower] = pastaDest
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Filtra as mídias do perfil
+                val mensagensDoUsuario = todasMensagens.filter { msg ->
+                    val temMidia = msg.content is TdApi.MessageDocument ||
+                        msg.content is TdApi.MessageAudio ||
+                        msg.content is TdApi.MessagePhoto ||
+                        msg.content is TdApi.MessageVideo
+                    if (!temMidia) return@filter false
+
+                    if (modoReal == "CP") {
+                        true
+                    } else {
+                        val legenda = when (val c = msg.content) {
+                            is TdApi.MessageDocument -> c.caption?.text ?: ""
+                            is TdApi.MessageAudio -> c.caption?.text ?: ""
+                            is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                            is TdApi.MessageVideo -> c.caption?.text ?: ""
+                            else -> ""
+                        }
+                        legenda.contains(tagPerfil, ignoreCase = true) ||
+                            legenda.contains(tagPerfilExibicao, ignoreCase = true)
+                    }
+                }
+
+                val totalNaNuvem = mensagensDoUsuario.size
+                if (totalNaNuvem == 0 && pastasAtivasNuvem.isEmpty()) {
+                    encerrarSync(0, fecharBarra = true)
+                    return@launch
+                }
+
+                if (totalNaNuvem > 0) {
+                    NexusLeituraNuvem.iniciar(totalNaNuvem, "Restaurando cofre SSD ($modoReal)...")
+                }
+
+                val donosAtuais = carregarDonosFicheiros(context)
+                val pastasAtuais = carregarVinculosPastas(context)
+
+                val prefsMsgs = context.getSharedPreferences("nexus_synced_msgs_$chaveAtiva", Context.MODE_PRIVATE)
+                var editorMsgs: android.content.SharedPreferences.Editor? = null
+                val prefsSynced = context.getSharedPreferences("nexus_auto_synced_files_$chaveAtiva", Context.MODE_PRIVATE)
+                var editorSynced: android.content.SharedPreferences.Editor? = null
+                val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+                var editorOwners: android.content.SharedPreferences.Editor? = null
+                val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+                var editorLinks: android.content.SharedPreferences.Editor? = null
+                val prefsThumbs = context.getSharedPreferences("nexus_fast_thumbs", Context.MODE_PRIVATE)
+                var editorThumbs: android.content.SharedPreferences.Editor? = null
+
+                val loteThumbIds = mutableMapOf<Int, Int>()
+                val loteMiniaturas = mutableMapOf<Long, String>()
+                val loteCompletos = mutableMapOf<Long, String>()
+                val novosParaInserirRoom = mutableListOf<ArquivoNuvem>()
+                val existentesParaAtualizar = mutableListOf<ArquivoNuvem>()
+
+                val pastasEncontradas = mutableSetOf<String>()
+                pastasEncontradas.addAll(pastasAtivasNuvem.values)
+
+                val mapaExistentesPorChave = arquivosAtuaisReais
+                    .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                    .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                    .toMutableMap()
+
+                val timestampsUsados = arquivosAtuaisReais.map { it.dataUpload }.toMutableSet()
+
+                mensagensDoUsuario.forEachIndexed { index, msg ->
+                    var legenda = ""
+                    var rId = 0
+                    var thumbId = 0
+                    var thumbPathLocal = ""
+                    var nomeBruto = ""
+                    var tam = 0L
+                    var caminhoLocalExistente = ""
+
+                    when (val c = msg.content) {
+                        is TdApi.MessageDocument -> {
+                            legenda = c.caption?.text ?: ""
+                            rId = c.document?.document?.id ?: 0
+                            thumbId = c.document?.thumbnail?.file?.id ?: 0
+                            thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
+                            nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                            tam = c.document?.document?.size ?: 0L
+                            caminhoLocalExistente = c.document?.document?.local?.path ?: ""
+                        }
+                        is TdApi.MessageAudio -> {
+                            legenda = c.caption?.text ?: ""
+                            rId = c.audio?.audio?.id ?: 0
+                            thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
+                            thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
+                            nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
+                            tam = c.audio?.audio?.size ?: 0L
+                            caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
+                        }
+                        is TdApi.MessagePhoto -> {
+                            legenda = c.caption?.text ?: ""
+                            val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                            rId = maior?.photo?.id ?: 0
+                            nomeBruto = "Foto_$rId.jpg"
+                            tam = maior?.photo?.size ?: 0L
+                            caminhoLocalExistente = maior?.photo?.local?.path ?: ""
+                        }
+                        is TdApi.MessageVideo -> {
+                            legenda = c.caption?.text ?: ""
+                            rId = c.video?.video?.id ?: 0
+                            thumbId = c.video?.thumbnail?.file?.id ?: 0
+                            thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
+                            nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
+                            tam = c.video?.video?.size ?: 0L
+                            caminhoLocalExistente = c.video?.video?.local?.path ?: ""
+                        }
+                        else -> return@forEachIndexed
+                    }
+
+                    if (rId != 0 && thumbId != 0) {
+                        loteThumbIds[rId] = thumbId
+                        if (prefsThumbs.getString("thid_$rId", null) != thumbId.toString()) {
+                            if (editorThumbs == null) editorThumbs = prefsThumbs.edit()
+                            editorThumbs?.putString("thid_$rId", thumbId.toString())
+                        }
+                    }
+
+                    val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                    val nomeLower = nomeDoc.lowercase(Locale.ROOT)
+                    val chaveUnica = "$nomeLower|$tam"
+
+                    if (index % 5 == 0 || index == totalNaNuvem - 1) {
+                        NexusLeituraNuvem.avancar(
+                            novoLido = index + 1,
+                            novoTotal = totalNaNuvem.coerceAtLeast(1),
+                            texto = "Restaurando SSD ($modoReal): $nomeDoc"
+                        )
+                    }
+
+                    val msgIdKey = msg.id.toString()
+                    if (msg.id != 0L && !prefsMsgs.getBoolean(msgIdKey, false)) {
+                        if (editorMsgs == null) editorMsgs = prefsMsgs.edit()
+                        editorMsgs?.putBoolean(msgIdKey, true)
+                    }
+
+                    if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
+                        return@forEachIndexed
+                    }
+
+                    val pastaBrutaLegenda = if (legenda.contains("📁 [")) {
+                        legenda.substringAfter("📁 [").substringBefore("]").trim()
+                    } else ""
+
+                    val veioDeMovimentoNuvem = mapaMovidosPorChave.containsKey(chaveUnica) ||
+                        mapaMovidosPorNome.containsKey(nomeLower)
+
+                    val pastaEscolhida = when {
+                        mapaMovidosPorChave.containsKey(chaveUnica) -> mapaMovidosPorChave[chaveUnica] ?: ""
+                        mapaMovidosPorNome.containsKey(nomeLower) -> mapaMovidosPorNome[nomeLower] ?: ""
+                        else -> pastaBrutaLegenda
+                    }
+
+                    val pastaAposRenomeNuvem = if (pastaEscolhida.isNotBlank()) {
+                        mapaRenomeacoesNuvem[pastaEscolhida.lowercase(Locale.ROOT)] ?: pastaEscolhida
+                    } else ""
+
+                    val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaAposRenomeNuvem)
+                    val pastaResolvidaLower = pastaResolvida.lowercase(Locale.ROOT)
+                    val pastaFinal = if (
+                        pastaResolvida.isNotBlank() &&
+                        !pastasApagadasNuvem.contains(pastaResolvidaLower) &&
+                        !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)
+                    ) {
+                        pastaResolvida
+                    } else ""
+
+                    if (pastaFinal.isNotBlank()) {
+                        pastasEncontradas.add(pastaFinal)
+                    }
+
+                    val kName = "name_$nomeLower"
+                    val kKey = "key_${nomeLower}|$tam"
+                    if (!prefsSynced.getBoolean(kName, false) || !prefsSynced.getBoolean(kKey, false)) {
+                        if (editorSynced == null) editorSynced = prefsSynced.edit()
+                        editorSynced?.putBoolean(kName, true)
+                        editorSynced?.putBoolean(kKey, true)
+                    }
+
+                    val uriMiniaturaInicial = when {
+                        caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
+                            prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
+                        thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
+                            salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
+                        else -> ""
+                    }
+                    val capaResolvida = resolverCaminhoCapaJpg(uriMiniaturaInicial)
+
+                    val arqExistente = mapaExistentesPorChave[chaveUnica]
+                    if (arqExistente != null) {
+                        if (veioDeMovimentoNuvem) {
+                            if (pastaFinal.isBlank()) {
+                                if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                editorLinks?.remove(arqExistente.dataUpload.toString())
+                            } else if (pastasAtuais[arqExistente.dataUpload] != pastaFinal) {
+                                if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
+                            }
+                        } else if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
+                            if (editorLinks == null) editorLinks = prefsLinks.edit()
+                            editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
+                        }
+                        if (capaResolvida.isNotBlank()) {
+                            loteMiniaturas[arqExistente.dataUpload] = capaResolvida
+                            if (editorThumbs == null) editorThumbs = prefsThumbs.edit()
+                            editorThumbs?.putString("ts_${arqExistente.dataUpload}", capaResolvida)
+                        }
+                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                            val uriComp = Uri.fromFile(File(caminhoLocalExistente)).toString()
+                            loteCompletos[arqExistente.dataUpload] = uriComp
+                            if (editorThumbs == null) editorThumbs = prefsThumbs.edit()
+                            editorThumbs?.putString("full_${arqExistente.dataUpload}", uriComp)
+                        }
+                        if ((rId != 0 && arqExistente.fileId != rId) ||
+                            (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && capaResolvida.isNotBlank())
+                        ) {
+                            existentesParaAtualizar.add(
+                                arqExistente.copy(
+                                    fileId = if (rId != 0) rId else arqExistente.fileId,
+                                    caminhoMiniatura = if (capaResolvida.isNotBlank()) capaResolvida else arqExistente.caminhoMiniatura
+                                )
+                            )
+                        }
+                    } else {
+                        var ts = (msg.date.toLong() * 1000L) + kotlin.math.abs((msg.id ushr 20) % 997L)
+                        while (!timestampsUsados.add(ts)) {
+                            ts++
+                        }
+
+                        if (editorOwners == null) editorOwners = prefsOwners.edit()
+                        editorOwners?.putString(ts.toString(), chaveAtiva)
+                        if (pastaFinal.isNotBlank()) {
+                            if (editorLinks == null) editorLinks = prefsLinks.edit()
+                            editorLinks?.putString(ts.toString(), pastaFinal)
+                        }
+                        if (capaResolvida.isNotBlank()) {
+                            loteMiniaturas[ts] = capaResolvida
+                            if (editorThumbs == null) editorThumbs = prefsThumbs.edit()
+                            editorThumbs?.putString("ts_$ts", capaResolvida)
+                        }
+                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                            val uriComp = Uri.fromFile(File(caminhoLocalExistente)).toString()
+                            loteCompletos[ts] = uriComp
+                            if (editorThumbs == null) editorThumbs = prefsThumbs.edit()
+                            editorThumbs?.putString("full_$ts", uriComp)
+                        }
+
+                        val novoArq = ArquivoNuvem(
+                            id = 0,
+                            fileId = rId,
+                            nomeArquivo = nomeDoc,
+                            tamanhoBytes = tam,
+                            dataUpload = ts,
+                            caminhoMiniatura = capaResolvida.ifBlank { uriMiniaturaInicial }
+                        )
+                        mapaExistentesPorChave[chaveUnica] = novoArq
+                        novosParaInserirRoom.add(novoArq)
+                    }
+                }
+
+                // 3. Grava todas as preferências em lote ANTES de inserir no Room (garante donos e pastas prontos)
+                val prefsFolders = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+                val conjuntoPastas = (prefsFolders.getStringSet("folders_$chaveAtiva", emptySet()) ?: emptySet())
+                    .filterNot { pastasApagadasNuvem.contains(it.trim().lowercase(Locale.ROOT)) }
+                    .toMutableSet()
+                pastasEncontradas.forEach { p ->
+                    val limpo = p.trim()
+                    if (limpo.isNotBlank() && conjuntoPastas.none { it.equals(limpo, ignoreCase = true) }) {
+                        conjuntoPastas.add(limpo)
+                    }
+                }
+                prefsFolders.edit().putStringSet("folders_$chaveAtiva", conjuntoPastas).commit()
+
+                if (pastasApagadasNuvem.isNotEmpty()) {
+                    val prefsDelPastas = context.getSharedPreferences("nexus_deleted_folders_$chaveAtiva", Context.MODE_PRIVATE)
+                    val edDel = prefsDelPastas.edit()
+                    pastasApagadasNuvem.forEach { edDel.putBoolean(it, true) }
+                    edDel.commit()
+                }
+
+                editorMsgs?.commit()
+                editorSynced?.commit()
+                editorOwners?.commit()
+                editorLinks?.commit()
+                editorThumbs?.commit()
+
+                // 4. Atualiza cache em memória no Main thread sem contenção de Snapshot
+                withContext(Dispatchers.Main) {
+                    if (loteThumbIds.isNotEmpty()) NexusThumbCache.mapaThumbIdsNuvem.putAll(loteThumbIds)
+                    if (loteMiniaturas.isNotEmpty()) NexusThumbCache.mapaMiniaturas.putAll(loteMiniaturas)
+                    if (loteCompletos.isNotEmpty()) NexusThumbCache.mapaArquivosCompletos.putAll(loteCompletos)
+                }
+
+                // 5. Insere pastas e arquivos direto no Room (sem reler a tabela inteira a cada item)
+                val pastasExistentesRoom = dao.buscarPastas().first()
+                    .map { it.nomePasta.trim().lowercase(Locale.ROOT) }
+                    .toMutableSet()
+                for (p in conjuntoPastas) {
+                    val limpo = p.trim()
+                    if (limpo.isNotBlank() && pastasExistentesRoom.add(limpo.lowercase(Locale.ROOT))) {
+                        dao.criarPasta(PastaNuvem(nomePasta = limpo))
+                    }
+                }
+
+                for (novo in novosParaInserirRoom) {
+                    dao.salvarArquivo(novo)
+                }
+                for (upd in existentesParaAtualizar) {
+                    vm.salvarArquivoSincrono(upd)
+                }
+
+                encerrarSync(novosParaInserirRoom.size)
+            } catch (_: Throwable) {
+                encerrarSync(0, fecharBarra = true)
+            }
+        }
+    }
 
     obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, modoReal, _ ->
         if (chatObj != null) {
             try { client.send(TdApi.OpenChat(chatObj.id)) {} } catch (_: Exception) {}
 
             client.send(TdApi.GetChat(chatObj.id)) {
-                buscarMensagensPorTermoNaNuvem(client, chatObj.id, tagPerfil) { msgsTag ->
-                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_PASTA") { msgsSyncPasta ->
-                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_MOVER") { msgsSyncMover ->
-                            buscarMensagensPorTermoNaNuvem(client, chatObj.id, "Nexus Cloud") { msgsNexus ->
-                                buscarHistoricoPaginado(client, chatObj.id, 0L, 40, mutableListOf()) { msgsHistorico ->
-                                    val todasMensagens = (msgsTag + msgsSyncPasta + msgsSyncMover + msgsNexus + msgsHistorico)
-                                        .distinctBy { it.id }
-
-                                    // 1. Reconstrói todas as ações de pastas e movimentações em ordem cronológica
-                                    val pastasAtivasNuvem = mutableMapOf<String, String>()
-                                    val pastasApagadasNuvem = mutableSetOf<String>()
-                                    val mapaRenomeacoesNuvem = mutableMapOf<String, String>()
-                                    val mapaMovidosPorChave = mutableMapOf<String, String>()
-                                    val mapaMovidosPorNome = mutableMapOf<String, String>()
-
-                                    val msgsMetadados = todasMensagens
-                                        .filter { it.content is TdApi.MessageText }
-                                        .sortedWith(compareBy<TdApi.Message> { it.date }.thenBy { it.id })
-
-                                    for (msg in msgsMetadados) {
-                                        val txt = (msg.content as? TdApi.MessageText)?.text?.text ?: continue
-                                        if (!txt.contains("[SYNC_PASTA]") && !txt.contains("[SYNC_MOVER]")) continue
-
-                                        val partes = txt.split("|").map { it.trim() }
-                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }
-                                            ?.substringAfter(":")?.trim() ?: ""
-                                        val pertenceAoUsuario = modoReal == "CP" ||
-                                            normalizarUsuario(userPart) == chaveAtiva
-                                        if (!pertenceAoUsuario) continue
-
-                                        if (txt.contains("[SYNC_PASTA]")) {
-                                            val acao = partes.firstOrNull { it.startsWith("ACAO:", ignoreCase = true) }
-                                                ?.substringAfter(":")?.trim()?.uppercase(Locale.ROOT) ?: ""
-                                            when (acao) {
-                                                "CRIAR" -> {
-                                                    val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
-                                                        ?.substringAfter(":")?.trim() ?: ""
-                                                    if (p.isNotBlank()) {
-                                                        val pLower = p.lowercase(Locale.ROOT)
-                                                        pastasApagadasNuvem.remove(pLower)
-                                                        pastasAtivasNuvem[pLower] = p
-                                                    }
-                                                }
-                                                "RENOMEAR" -> {
-                                                    val de = partes.firstOrNull { it.startsWith("DE:", ignoreCase = true) }
-                                                        ?.substringAfter(":")?.trim() ?: ""
-                                                    val para = partes.firstOrNull { it.startsWith("PARA:", ignoreCase = true) }
-                                                        ?.substringAfter(":")?.trim() ?: ""
-                                                    if (de.isNotBlank() && para.isNotBlank()) {
-                                                        val deLower = de.lowercase(Locale.ROOT)
-                                                        val paraLower = para.lowercase(Locale.ROOT)
-                                                        pastasAtivasNuvem.remove(deLower)
-                                                        pastasApagadasNuvem.add(deLower)
-                                                        pastasApagadasNuvem.remove(paraLower)
-                                                        pastasAtivasNuvem[paraLower] = para
-                                                        mapaRenomeacoesNuvem.entries.forEach { entry ->
-                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
-                                                        }
-                                                        mapaRenomeacoesNuvem[deLower] = para
-                                                        mapaMovidosPorChave.entries.forEach { entry ->
-                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
-                                                        }
-                                                        mapaMovidosPorNome.entries.forEach { entry ->
-                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
-                                                        }
-                                                    }
-                                                }
-                                                "APAGAR" -> {
-                                                    val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
-                                                        ?.substringAfter(":")?.trim() ?: ""
-                                                    if (p.isNotBlank()) {
-                                                        val pLower = p.lowercase(Locale.ROOT)
-                                                        pastasAtivasNuvem.remove(pLower)
-                                                        pastasApagadasNuvem.add(pLower)
-                                                        mapaMovidosPorChave.entries.forEach { entry ->
-                                                            if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
-                                                        }
-                                                        mapaMovidosPorNome.entries.forEach { entry ->
-                                                            if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else if (txt.contains("[SYNC_MOVER]")) {
-                                            val pastaDest = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
-                                                ?.substringAfter(":")?.trim() ?: ""
-                                            val itensStr = partes.firstOrNull { it.startsWith("ITENS:", ignoreCase = true) }
-                                                ?.substringAfter(":")?.trim() ?: ""
-                                            if (pastaDest.isNotBlank()) {
-                                                val pLower = pastaDest.lowercase(Locale.ROOT)
-                                                pastasApagadasNuvem.remove(pLower)
-                                                pastasAtivasNuvem[pLower] = pastaDest
-                                            }
-                                            itensStr.split(";;").forEach { itemToken ->
-                                                val limpoToken = itemToken.trim()
-                                                if (limpoToken.isNotBlank()) {
-                                                    val temHash = limpoToken.contains('#')
-                                                    val nLower = (if (temHash) limpoToken.substringBeforeLast('#') else limpoToken)
-                                                        .trim().lowercase(Locale.ROOT)
-                                                    val tStr = if (temHash) limpoToken.substringAfterLast('#').trim() else ""
-                                                    if (nLower.isNotBlank()) {
-                                                        if (tStr.isNotBlank()) {
-                                                            mapaMovidosPorChave["$nLower|$tStr"] = pastaDest
-                                                        }
-                                                        mapaMovidosPorNome[nLower] = pastaDest
-                                                    }
-                                                }
-                                            }
-                                        }
+                if (modoReal == "CP") {
+                    // Modo CP: vai direto para o histórico do Canal Privado (muito mais rápido e sem sobrecarga)
+                    NexusLeituraNuvem.iniciar(1, "Lendo cofre CP de $usuarioAtivo...")
+                    buscarHistoricoPaginado(
+                        client = client,
+                        chatId = chatObj.id,
+                        fromMsgId = 0L,
+                        lotesRestantes = 40,
+                        acumulado = mutableListOf(),
+                        onProgress = { totalLidas ->
+                            NexusLeituraNuvem.titulo.value = "Lendo cofre CP ($totalLidas itens encontrados)..."
+                        }
+                    ) { msgsHistorico ->
+                        processarMensagensEmLoteIO(msgsHistorico, "CP")
+                    }
+                } else {
+                    // Modo MS: busca pelas etiquetas do perfil + metadados de pastas + histórico paginado
+                    NexusLeituraNuvem.iniciar(1, "Lendo cofre MS de $usuarioAtivo...")
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, tagPerfil) { msgsTag ->
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_PASTA") { msgsSyncPasta ->
+                            buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_MOVER") { msgsSyncMover ->
+                                buscarHistoricoPaginado(
+                                    client = client,
+                                    chatId = chatObj.id,
+                                    fromMsgId = 0L,
+                                    lotesRestantes = 30,
+                                    acumulado = mutableListOf(),
+                                    onProgress = { totalLidas ->
+                                        NexusLeituraNuvem.titulo.value = "Lendo cofre MS ($totalLidas itens verificados)..."
                                     }
-
-                                    // 2. Filtra as mídias do perfil
-                                    val mensagensDoUsuario = todasMensagens.filter { msg ->
-                                        val temMidia = msg.content is TdApi.MessageDocument ||
-                                            msg.content is TdApi.MessageAudio ||
-                                            msg.content is TdApi.MessagePhoto ||
-                                            msg.content is TdApi.MessageVideo
-                                        if (!temMidia) return@filter false
-
-                                        if (modoReal == "CP") {
-                                            true
-                                        } else {
-                                            val legenda = when (val c = msg.content) {
-                                                is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                                is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                                is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                                                is TdApi.MessageVideo -> c.caption?.text ?: ""
-                                                else -> ""
-                                            }
-                                            legenda.contains(tagPerfil, ignoreCase = true) ||
-                                                legenda.contains(tagPerfilExibicao, ignoreCase = true)
-                                        }
-                                    }
-
-                                    val totalNaNuvem = mensagensDoUsuario.size
-                                    if (totalNaNuvem == 0 && pastasAtivasNuvem.isEmpty()) {
-                                        NexusLeituraNuvem.encerrar()
-                                        onComplete(0)
-                                        return@buscarHistoricoPaginado
-                                    }
-
-                                    if (totalNaNuvem > 0) {
-                                        NexusLeituraNuvem.iniciar(totalNaNuvem, "Restaurando cofre SSD ($modoReal)...")
-                                    }
-
-                                    // 3. Processa e grava tudo em sequência na thread IO antes de chamar onComplete
-                                    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                                        var importados = 0
-                                        val donosAtuais = carregarDonosFicheiros(context)
-                                        val pastasAtuais = carregarVinculosPastas(context)
-
-                                        val prefsMsgs = context.getSharedPreferences("nexus_synced_msgs_$chaveAtiva", Context.MODE_PRIVATE)
-                                        var editorMsgs: android.content.SharedPreferences.Editor? = null
-                                        val prefsSynced = context.getSharedPreferences("nexus_auto_synced_files_$chaveAtiva", Context.MODE_PRIVATE)
-                                        var editorSynced: android.content.SharedPreferences.Editor? = null
-                                        val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
-                                        var editorOwners: android.content.SharedPreferences.Editor? = null
-                                        val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
-                                        var editorLinks: android.content.SharedPreferences.Editor? = null
-                                        val pastasEncontradas = mutableSetOf<String>()
-                                        pastasEncontradas.addAll(pastasAtivasNuvem.values)
-
-                                        val mapaExistentesPorChave = arquivosAtuaisReais
-                                            .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
-                                            .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
-                                            .toMutableMap()
-
-                                        val timestampsUsados = arquivosAtuaisReais.map { it.dataUpload }.toMutableSet()
-
-                                        mensagensDoUsuario.forEachIndexed { index, msg ->
-                                            var legenda = ""
-                                            var rId = 0
-                                            var thumbId = 0
-                                            var thumbPathLocal = ""
-                                            var nomeBruto = ""
-                                            var tam = 0L
-                                            var caminhoLocalExistente = ""
-
-                                            when (val c = msg.content) {
-                                                is TdApi.MessageDocument -> {
-                                                    legenda = c.caption?.text ?: ""
-                                                    rId = c.document?.document?.id ?: 0
-                                                    thumbId = c.document?.thumbnail?.file?.id ?: 0
-                                                    thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
-                                                    nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                                    tam = c.document?.document?.size ?: 0L
-                                                    caminhoLocalExistente = c.document?.document?.local?.path ?: ""
-                                                }
-                                                is TdApi.MessageAudio -> {
-                                                    legenda = c.caption?.text ?: ""
-                                                    rId = c.audio?.audio?.id ?: 0
-                                                    thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
-                                                    thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
-                                                    nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                                    tam = c.audio?.audio?.size ?: 0L
-                                                    caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
-                                                }
-                                                is TdApi.MessagePhoto -> {
-                                                    legenda = c.caption?.text ?: ""
-                                                    val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
-                                                    rId = maior?.photo?.id ?: 0
-                                                    nomeBruto = "Foto_$rId.jpg"
-                                                    tam = maior?.photo?.size ?: 0L
-                                                    caminhoLocalExistente = maior?.photo?.local?.path ?: ""
-                                                }
-                                                is TdApi.MessageVideo -> {
-                                                    legenda = c.caption?.text ?: ""
-                                                    rId = c.video?.video?.id ?: 0
-                                                    thumbId = c.video?.thumbnail?.file?.id ?: 0
-                                                    thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
-                                                    nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
-                                                    tam = c.video?.video?.size ?: 0L
-                                                    caminhoLocalExistente = c.video?.video?.local?.path ?: ""
-                                                }
-                                                else -> return@forEachIndexed
-                                            }
-
-                                            if (rId != 0 && thumbId != 0) {
-                                                NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
-                                            }
-
-                                            val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
-                                            val nomeLower = nomeDoc.lowercase(Locale.ROOT)
-                                            val chaveUnica = "$nomeLower|$tam"
-
-                                            NexusLeituraNuvem.avancar(
-                                                novoLido = index + 1,
-                                                novoTotal = totalNaNuvem.coerceAtLeast(1),
-                                                texto = "Restaurando SSD ($modoReal): $nomeDoc"
-                                            )
-
-                                            val msgIdKey = msg.id.toString()
-                                            if (msg.id != 0L && !prefsMsgs.getBoolean(msgIdKey, false)) {
-                                                if (editorMsgs == null) editorMsgs = prefsMsgs.edit()
-                                                editorMsgs?.putBoolean(msgIdKey, true)
-                                            }
-
-                                            if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
-                                                return@forEachIndexed
-                                            }
-
-                                            val pastaBrutaLegenda = if (legenda.contains("📁 [")) {
-                                                legenda.substringAfter("📁 [").substringBefore("]").trim()
-                                            } else ""
-
-                                            val veioDeMovimentoNuvem = mapaMovidosPorChave.containsKey(chaveUnica) ||
-                                                mapaMovidosPorNome.containsKey(nomeLower)
-
-                                            val pastaEscolhida = when {
-                                                mapaMovidosPorChave.containsKey(chaveUnica) -> mapaMovidosPorChave[chaveUnica] ?: ""
-                                                mapaMovidosPorNome.containsKey(nomeLower) -> mapaMovidosPorNome[nomeLower] ?: ""
-                                                else -> pastaBrutaLegenda
-                                            }
-
-                                            val pastaAposRenomeNuvem = if (pastaEscolhida.isNotBlank()) {
-                                                mapaRenomeacoesNuvem[pastaEscolhida.lowercase(Locale.ROOT)] ?: pastaEscolhida
-                                            } else ""
-
-                                            val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaAposRenomeNuvem)
-                                            val pastaResolvidaLower = pastaResolvida.lowercase(Locale.ROOT)
-                                            val pastaFinal = if (
-                                                pastaResolvida.isNotBlank() &&
-                                                !pastasApagadasNuvem.contains(pastaResolvidaLower) &&
-                                                !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)
-                                            ) {
-                                                pastaResolvida
-                                            } else ""
-
-                                            if (pastaFinal.isNotBlank()) {
-                                                pastasEncontradas.add(pastaFinal)
-                                            }
-
-                                            val kName = "name_$nomeLower"
-                                            val kKey = "key_${nomeLower}|$tam"
-                                            if (!prefsSynced.getBoolean(kName, false) || !prefsSynced.getBoolean(kKey, false)) {
-                                                if (editorSynced == null) editorSynced = prefsSynced.edit()
-                                                editorSynced?.putBoolean(kName, true)
-                                                editorSynced?.putBoolean(kKey, true)
-                                            }
-
-                                            val uriMiniaturaInicial = when {
-                                                caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
-                                                    prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
-                                                thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
-                                                    salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
-                                                else -> ""
-                                            }
-
-                                            val arqExistente = mapaExistentesPorChave[chaveUnica]
-                                            if (arqExistente != null) {
-                                                if (veioDeMovimentoNuvem) {
-                                                    if (pastaFinal.isBlank()) {
-                                                        if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                                        editorLinks?.remove(arqExistente.dataUpload.toString())
-                                                    } else if (pastasAtuais[arqExistente.dataUpload] != pastaFinal) {
-                                                        if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                                        editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
-                                                    }
-                                                } else if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
-                                                    if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                                    editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
-                                                }
-                                                if (uriMiniaturaInicial.isNotBlank()) {
-                                                    NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
-                                                }
-                                                if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                                    NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
-                                                }
-                                                if ((rId != 0 && arqExistente.fileId != rId) ||
-                                                    (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
-                                                ) {
-                                                    vm.salvarArquivoSincrono(
-                                                        arqExistente.copy(
-                                                            fileId = if (rId != 0) rId else arqExistente.fileId,
-                                                            caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
-                                                        )
-                                                    )
-                                                }
-                                            } else {
-                                                var ts = (msg.date.toLong() * 1000L) + kotlin.math.abs((msg.id ushr 20) % 997L)
-                                                while (!timestampsUsados.add(ts)) {
-                                                    ts++
-                                                }
-
-                                                if (editorOwners == null) editorOwners = prefsOwners.edit()
-                                                editorOwners?.putString(ts.toString(), chaveAtiva)
-                                                if (pastaFinal.isNotBlank()) {
-                                                    if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                                    editorLinks?.putString(ts.toString(), pastaFinal)
-                                                }
-                                                if (uriMiniaturaInicial.isNotBlank()) {
-                                                    NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
-                                                }
-                                                if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                                    NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
-                                                }
-
-                                                val novoArq = ArquivoNuvem(
-                                                    fileId = rId,
-                                                    nomeArquivo = nomeDoc,
-                                                    tamanhoBytes = tam,
-                                                    dataUpload = ts,
-                                                    caminhoMiniatura = uriMiniaturaInicial
-                                                )
-                                                mapaExistentesPorChave[chaveUnica] = novoArq
-                                                vm.salvarArquivoSincrono(novoArq, forcarNovoRegistro = true)
-                                                importados++
-                                            }
-                                        }
-
-                                        // Grava todas as pastas ativas e apagadas em lote único na thread IO
-                                        val prefsFolders = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
-                                        val conjuntoPastas = (prefsFolders.getStringSet("folders_$chaveAtiva", emptySet()) ?: emptySet())
-                                            .filterNot { pastasApagadasNuvem.contains(it.trim().lowercase(Locale.ROOT)) }
-                                            .toMutableSet()
-                                        pastasEncontradas.forEach { p ->
-                                            val limpo = p.trim()
-                                            if (limpo.isNotBlank() && conjuntoPastas.none { it.equals(limpo, ignoreCase = true) }) {
-                                                conjuntoPastas.add(limpo)
-                                            }
-                                        }
-                                        prefsFolders.edit().putStringSet("folders_$chaveAtiva", conjuntoPastas).commit()
-
-                                        if (pastasApagadasNuvem.isNotEmpty()) {
-                                            val prefsDelPastas = context.getSharedPreferences("nexus_deleted_folders_$chaveAtiva", Context.MODE_PRIVATE)
-                                            val edDel = prefsDelPastas.edit()
-                                            pastasApagadasNuvem.forEach { edDel.putBoolean(it, true) }
-                                            edDel.commit()
-                                        }
-
-                                        editorMsgs?.commit()
-                                        editorSynced?.commit()
-                                        editorOwners?.commit()
-                                        editorLinks?.commit()
-
-                                        conjuntoPastas.forEach { p -> vm.criarPasta(p) }
-                                        onComplete(importados)
-                                    }
+                                ) { msgsHistorico ->
+                                    val unificadas = (msgsTag + msgsSyncPasta + msgsSyncMover + msgsHistorico).distinctBy { it.id }
+                                    processarMensagensEmLoteIO(unificadas, "MS")
                                 }
                             }
                         }
@@ -2830,8 +2962,7 @@ fun sincronizarCofreDaNuvem(
                 }
             }
         } else {
-            NexusLeituraNuvem.encerrar()
-            onComplete(0)
+            encerrarSync(0, fecharBarra = true)
         }
     }
 }
@@ -2893,12 +3024,12 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     }
 
     val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
-    val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) ||
-        ehArquivoVideo(arq.nomeArquivo) ||
-        ext == "PDF"
+    val ehVideo = ehArquivoVideo(arq.nomeArquivo)
+    val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) || ehVideo || ext == "PDF"
+    val limiteBytesCapa = if (ehVideo) 25L * 1024L * 1024L else 60L * 1024L * 1024L
 
-    if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && arq.tamanhoBytes <= 250L * 1024L * 1024L) {
-        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 20, maxTentativas = 450, controlarPausaTransfer = false) { pct, _, _ ->
+    if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && arq.tamanhoBytes <= limiteBytesCapa) {
+        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 20, maxTentativas = 350, controlarPausaTransfer = false) { pct, _, _ ->
             if (atualizarSubBarra) {
                 NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
             }
@@ -3266,6 +3397,7 @@ fun gerarCapaPdf(arquivoPdf: File): File? {
                         FileOutputStream(frameFile).use { out ->
                             bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
                         }
+                        bmp.recycle()
                         return frameFile
                     }
                 }
@@ -3380,6 +3512,7 @@ suspend fun copiarUriParaCacheTDLib(
             FileOutputStream(f).use { out ->
                 val buffer = ByteArray(64 * 1024)
                 var lidosTotal = 0L
+                var ultimoPct = -1
                 while (true) {
                     if (NexusTransfer.cancelado.value) {
                         out.close()
@@ -3400,7 +3533,10 @@ suspend fun copiarUriParaCacheTDLib(
                     lidosTotal += read
                     if (tamanhoEsperado > 0L && !NexusTransfer.cancelado.value) {
                         val pctCopia = ((lidosTotal * 35L) / tamanhoEsperado).toInt().coerceIn(5, 35)
-                        NexusTransfer.atualizarProgresso(pctCopia, "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)...")
+                        if (pctCopia != ultimoPct) {
+                            ultimoPct = pctCopia
+                            NexusTransfer.atualizarProgresso(pctCopia, "Preparando envio $loteTag'$nomeLimpo' ($pctCopia%)...")
+                        }
                     }
                 }
             }
@@ -4220,6 +4356,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val transferIsUpload by NexusTransfer.ehUpload.collectAsState()
     val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
     val bannerStatusGlobal by NexusTransfer.bannerStatusGlobal.collectAsState()
+    val sincronizandoNuvem by NexusSyncState.emAndamento.collectAsState()
 
     val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
     val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
@@ -4323,12 +4460,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showCacheDialog by remember { mutableStateOf(false) }
     var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
 
-    // Atualiza donos/pastas sempre que um upload em segundo plano grava novos itens no Room
-    LaunchedEffect(todosArquivos.size) {
-        mapaDonos = carregarDonosFicheiros(context)
-        mapaPastas = carregarVinculosPastas(context)
-        if (activeVaultUser.isNotBlank()) {
-            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+    // Só recarrega mapas quando não estiver no meio de uma sincronização em lote da nuvem
+    LaunchedEffect(todosArquivos.size, sincronizandoNuvem) {
+        if (!sincronizandoNuvem) {
+            mapaDonos = carregarDonosFicheiros(context)
+            mapaPastas = carregarVinculosPastas(context)
+            if (activeVaultUser.isNotBlank()) {
+                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+            }
         }
     }
 
@@ -4386,7 +4525,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Fila contínua em segundo plano com suporte a Pausa/Retomada
+    // Fila manual leve de miniaturas (usada apenas quando o utilizador manda recarregar capas no menu Cache)
     fun processarFilaMiniaturasNuvem(listaArquivosCofre: List<ArquivoNuvem>) {
         jobFilaMiniaturas?.cancel()
         jobFilaMiniaturas = scope.launch(Dispatchers.IO) {
@@ -4406,7 +4545,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
             NexusLeituraNuvem.iniciar(pendentes.size, "Carregando miniaturas da nuvem SSD ($vaultStorageMode)...")
 
             for ((idx, arq) in pendentes.withIndex()) {
-                while (NexusLeituraNuvem.pausado.value) {
+                while (NexusLeituraNuvem.pausado.value || NexusSyncState.emAndamento.value) {
                     delay(200)
                 }
                 if (!NexusLeituraNuvem.ativo.value) break
@@ -4435,6 +4574,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                 }
                 NexusLeituraNuvem.concluirItem()
+                delay(80)
             }
             NexusLeituraNuvem.encerrar()
         }
@@ -4462,9 +4602,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Não executa limpeza de duplicados enquanto um lote de uploads estiver em andamento; roda em IO
-    LaunchedEffect(todosArquivos.size, vaultUnlocked, isUploading) {
-        if (todosArquivos.isNotEmpty() && !isUploading) {
+    // Bloqueia limpeza de duplicados enquanto houver upload OU sincronização da nuvem em andamento
+    LaunchedEffect(todosArquivos.size, vaultUnlocked, isUploading, sincronizandoNuvem) {
+        if (todosArquivos.isNotEmpty() && !isUploading && !sincronizandoNuvem) {
             val alterou = withContext(Dispatchers.IO) {
                 var mudou = false
                 limparDuplicadosExistentes(appContext, todosArquivos, vm) { mudou = true }
@@ -4506,9 +4646,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
             pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
 
             val aposLimpeza = vm.obterArquivosReais()
-            sincronizarCofreDaNuvem(context, client, activeVaultUser, aposLimpeza, vm) { qtd ->
+            sincronizarCofreDaNuvem(context, client, activeVaultUser, aposLimpeza, dao, vm) { qtd ->
                 scope.launch(Dispatchers.Main) {
-                    delay(250)
+                    NexusLeituraNuvem.encerrar()
+                    delay(150)
                     vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
                     val atualizados = vm.obterArquivosReais()
                     withContext(Dispatchers.IO) {
@@ -4517,11 +4658,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     mapaDonos = carregarDonosFicheiros(context)
                     mapaPastas = carregarVinculosPastas(context)
                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                    val chaveAtiva = normalizarUsuario(activeVaultUser)
-                    val doUsuario = atualizados.filter { mapaDonos[it.dataUpload] == chaveAtiva }
 
-                    processarFilaMiniaturasNuvem(doUsuario)
-
+                    // Capas carregam sob demanda na grade visível (muito mais leve e sem picos de RAM)
                     if (qtd > 0) {
                         Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados na nuvem SSD ($vaultStorageMode)!", Toast.LENGTH_SHORT).show()
                     }
@@ -5712,8 +5850,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             NexusThumbCache.limparTodoCacheLocal(context)
                             statsCache = calcularUsoCacheLocal(context)
                             showCacheDialog = false
-                            Toast.makeText(context, "Cache SSD Nexus limpo! Recarregando capas da nuvem...", Toast.LENGTH_SHORT).show()
-                            processarFilaMiniaturasNuvem(arquivos)
+                            Toast.makeText(context, "Cache SSD Nexus limpo! As capas recarregarão ao navegar.", Toast.LENGTH_SHORT).show()
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
                         modifier = Modifier.fillMaxWidth().height(46.dp)
@@ -6918,9 +7055,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             drawerState.close()
                             cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD ($vaultStorageMode)..."
                             val atuaisReais = vm.obterArquivosReais()
-                            sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, vm) { qtd ->
+                            sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, dao, vm) { qtd ->
                                 scope.launch(Dispatchers.Main) {
-                                    delay(250)
+                                    NexusLeituraNuvem.encerrar()
+                                    delay(150)
                                     val aposSync = vm.obterArquivosReais()
                                     withContext(Dispatchers.IO) {
                                         limparDuplicadosExistentes(appContext, aposSync, vm) {}
@@ -6928,9 +7066,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     mapaDonos = carregarDonosFicheiros(context)
                                     mapaPastas = carregarVinculosPastas(context)
                                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                    val chaveAtiva = normalizarUsuario(activeVaultUser)
-                                    val doUsuario = aposSync.filter { mapaDonos[it.dataUpload] == chaveAtiva }
-                                    processarFilaMiniaturasNuvem(doUsuario)
                                     cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD ($vaultStorageMode)!" else "Cofre SSD [$vaultStorageMode] de $activeVaultUser atualizado!"
                                     Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                                 }
