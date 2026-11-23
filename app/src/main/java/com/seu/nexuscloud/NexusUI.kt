@@ -1354,6 +1354,147 @@ fun eliminarPastaCompleta(
     }
 }
 
+// === SINCRONIZAÇÃO DE PASTAS E MOVIMENTAÇÕES NA NUVEM SSD (MS & CP) ===
+fun registrarAcaoPastaNaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    acao: String,
+    pastaPrincipal: String,
+    pastaNova: String = ""
+) {
+    val chave = normalizarUsuario(usuarioAtivo)
+    val p1 = pastaPrincipal.trim().replace("|", "-")
+    val p2 = pastaNova.trim().replace("|", "-")
+    if (chave.isBlank() || p1.isBlank()) return
+
+    val texto = when (acao.uppercase(Locale.ROOT)) {
+        "CRIAR" -> "📂 [SYNC_PASTA] | USER:$chave | ACAO:CRIAR | PASTA:$p1"
+        "RENOMEAR" -> "📂 [SYNC_PASTA] | USER:$chave | ACAO:RENOMEAR | DE:$p1 | PARA:$p2"
+        "APAGAR" -> "📂 [SYNC_PASTA] | USER:$chave | ACAO:APAGAR | PASTA:$p1"
+        else -> return
+    }
+
+    obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, _, _ ->
+        if (chatObj != null) {
+            val req = TdApi.SendMessage().apply {
+                this.chatId = chatObj.id
+                this.inputMessageContent = TdApi.InputMessageText().apply {
+                    this.text = TdApi.FormattedText(texto, emptyArray())
+                }
+            }
+            client.send(req) {}
+        }
+    }
+}
+
+fun registrarMovimentacaoNaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    pastaDestino: String,
+    listaArquivos: List<ArquivoNuvem>
+) {
+    val chave = normalizarUsuario(usuarioAtivo)
+    if (chave.isBlank() || listaArquivos.isEmpty()) return
+    val destinoLimpo = pastaDestino.trim().replace("|", "-")
+
+    val chavesItens = listaArquivos.map { arq ->
+        val nomeLower = limparPrefixoTimestamp(arq.nomeArquivo)
+            .lowercase(Locale.ROOT)
+            .replace(";;", "_")
+            .replace("|", "_")
+        "$nomeLower#${arq.tamanhoBytes}"
+    }.distinct()
+
+    obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, _, _ ->
+        if (chatObj != null) {
+            chavesItens.chunked(18).forEach { bloco ->
+                val texto = "📂 [SYNC_MOVER] | USER:$chave | PASTA:$destinoLimpo | ITENS:${bloco.joinToString(";;")}"
+                val req = TdApi.SendMessage().apply {
+                    this.chatId = chatObj.id
+                    this.inputMessageContent = TdApi.InputMessageText().apply {
+                        this.text = TdApi.FormattedText(texto, emptyArray())
+                    }
+                }
+                client.send(req) {}
+            }
+        }
+    }
+}
+
+fun backupCompletoPastasNaNuvem(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    pastas: List<PastaNuvem>,
+    arquivos: List<ArquivoNuvem>,
+    mapaPastas: Map<Long, String>,
+    onComplete: (String) -> Unit
+) {
+    val chave = normalizarUsuario(usuarioAtivo)
+    if (chave.isBlank()) {
+        onComplete("Nenhum perfil ativo.")
+        return
+    }
+    obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, modoCofre, erro ->
+        if (chatObj == null) {
+            onComplete(erro ?: "Não foi possível conectar ao cofre SSD.")
+            return@obterChatCofreUsuario
+        }
+        val mensagensTexto = mutableListOf<String>()
+
+        val nomesPastas = pastas.map { it.nomePasta.trim().replace("|", "-") }
+            .filter { it.isNotBlank() }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+
+        nomesPastas.forEach { nomeP ->
+            mensagensTexto.add("📂 [SYNC_PASTA] | USER:$chave | ACAO:CRIAR | PASTA:$nomeP")
+        }
+
+        val porPasta = arquivos.groupBy { arq ->
+            (mapaPastas[arq.dataUpload] ?: "").trim().replace("|", "-")
+        }
+        porPasta.forEach { (pastaDest, lista) ->
+            if (pastaDest.isNotBlank() && lista.isNotEmpty()) {
+                val chavesItens = lista.map { arq ->
+                    val nomeLower = limparPrefixoTimestamp(arq.nomeArquivo)
+                        .lowercase(Locale.ROOT)
+                        .replace(";;", "_")
+                        .replace("|", "_")
+                    "$nomeLower#${arq.tamanhoBytes}"
+                }.distinct()
+                chavesItens.chunked(18).forEach { bloco ->
+                    mensagensTexto.add("📂 [SYNC_MOVER] | USER:$chave | PASTA:$pastaDest | ITENS:${bloco.joinToString(";;")}")
+                }
+            }
+        }
+
+        if (mensagensTexto.isEmpty()) {
+            onComplete("Nenhuma pasta ou vínculo para salvar na nuvem.")
+            return@obterChatCofreUsuario
+        }
+
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            mensagensTexto.forEach { txt ->
+                val def = CompletableDeferred<Unit>()
+                val req = TdApi.SendMessage().apply {
+                    this.chatId = chatObj.id
+                    this.inputMessageContent = TdApi.InputMessageText().apply {
+                        this.text = TdApi.FormattedText(txt, emptyArray())
+                    }
+                }
+                client.send(req) { def.complete(Unit) }
+                def.await()
+                delay(180)
+            }
+            withContext(Dispatchers.Main) {
+                onComplete("${nomesPastas.size} pasta(s) e vínculos salvos na nuvem SSD ($modoCofre)!")
+            }
+        }
+    }
+}
+
 fun registarMensagemSincronizada(context: Context, usuario: String, msgId: Long) {
     if (msgId == 0L) return
     val chave = normalizarUsuario(usuario)
@@ -1763,6 +1904,7 @@ fun buscarMensagensPorTermoNaNuvem(
     }
 }
 
+// Paginação otimizada para avançar direto no servidor já na primeira abertura após reinstalar
 fun buscarHistoricoPaginado(
     client: Client,
     chatId: Long,
@@ -1790,15 +1932,6 @@ fun buscarHistoricoPaginado(
     client.send(req) { obj ->
         val msgs = extrairArrayMensagensTDLib(obj)?.filterNotNull() ?: emptyList()
 
-        if (fromMsgId == 0L && msgs.size <= 3 && tentativasVazio < 5) {
-            acumulado.addAll(msgs)
-            kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                delay(650)
-                buscarHistoricoPaginado(client, chatId, 0L, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
-            }
-            return@send
-        }
-
         if (msgs.isNotEmpty()) {
             acumulado.addAll(msgs)
             val ultimoId = msgs.minOf { it.id }
@@ -1807,9 +1940,9 @@ fun buscarHistoricoPaginado(
             } else {
                 onComplete(acumulado.distinctBy { it.id })
             }
-        } else if (acumulado.size <= 1 && tentativasVazio < 5) {
+        } else if (tentativasVazio < 3 && (fromMsgId == 0L || acumulado.size <= 3)) {
             kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-                delay(650)
+                delay(550)
                 buscarHistoricoPaginado(client, chatId, fromMsgId, lotesRestantes, acumulado, tentativasVazio + 1, onComplete)
             }
         } else {
@@ -2291,7 +2424,7 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO HÍBRIDA DA NUVEM COM GRAVAÇÃO EM LOTE (SEM ESTOURO DE MEMÓRIA) ===
+// === SINCRONIZAÇÃO HÍBRIDA DA NUVEM COM RESTAURAÇÃO COMPLETA DE PASTAS E MOVIMENTAÇÕES ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -2313,220 +2446,384 @@ fun sincronizarCofreDaNuvem(
 
             client.send(TdApi.GetChat(chatObj.id)) {
                 buscarMensagensPorTermoNaNuvem(client, chatObj.id, tagPerfil) { msgsTag ->
-                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "Nexus Cloud") { msgsNexus ->
-                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, usuarioAtivo.trim()) { msgsBusca ->
-                            buscarHistoricoPaginado(client, chatObj.id, 0L, 20, mutableListOf()) { msgsHistorico ->
-                                val todasMensagens = (msgsTag + msgsNexus + msgsBusca + msgsHistorico).distinctBy { it.id }
-                                val mensagensDoUsuario = todasMensagens.filter { msg ->
-                                    val temMidia = msg.content is TdApi.MessageDocument ||
-                                        msg.content is TdApi.MessageAudio ||
-                                        msg.content is TdApi.MessagePhoto ||
-                                        msg.content is TdApi.MessageVideo
-                                    if (!temMidia) return@filter false
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_PASTA") { msgsSyncPasta ->
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_MOVER") { msgsSyncMover ->
+                            buscarMensagensPorTermoNaNuvem(client, chatObj.id, "Nexus Cloud") { msgsNexus ->
+                                buscarHistoricoPaginado(client, chatObj.id, 0L, 40, mutableListOf()) { msgsHistorico ->
+                                    val todasMensagens = (msgsTag + msgsSyncPasta + msgsSyncMover + msgsNexus + msgsHistorico)
+                                        .distinctBy { it.id }
 
-                                    if (modoReal == "CP") {
-                                        true
-                                    } else {
-                                        val legenda = when (val c = msg.content) {
-                                            is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                            is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                            is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                                            is TdApi.MessageVideo -> c.caption?.text ?: ""
-                                            else -> ""
+                                    // 1. Reconstrói todas as ações de pastas e movimentações em ordem cronológica
+                                    val pastasAtivasNuvem = mutableMapOf<String, String>()
+                                    val pastasApagadasNuvem = mutableSetOf<String>()
+                                    val mapaRenomeacoesNuvem = mutableMapOf<String, String>()
+                                    val mapaMovidosPorChave = mutableMapOf<String, String>()
+                                    val mapaMovidosPorNome = mutableMapOf<String, String>()
+
+                                    val msgsMetadados = todasMensagens
+                                        .filter { it.content is TdApi.MessageText }
+                                        .sortedWith(compareBy<TdApi.Message> { it.date }.thenBy { it.id })
+
+                                    for (msg in msgsMetadados) {
+                                        val txt = (msg.content as? TdApi.MessageText)?.text?.text ?: continue
+                                        if (!txt.contains("[SYNC_PASTA]") && !txt.contains("[SYNC_MOVER]")) continue
+
+                                        val partes = txt.split("|").map { it.trim() }
+                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }
+                                            ?.substringAfter(":")?.trim() ?: ""
+                                        val pertenceAoUsuario = modoReal == "CP" ||
+                                            normalizarUsuario(userPart) == chaveAtiva
+                                        if (!pertenceAoUsuario) continue
+
+                                        if (txt.contains("[SYNC_PASTA]")) {
+                                            val acao = partes.firstOrNull { it.startsWith("ACAO:", ignoreCase = true) }
+                                                ?.substringAfter(":")?.trim()?.uppercase(Locale.ROOT) ?: ""
+                                            when (acao) {
+                                                "CRIAR" -> {
+                                                    val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                                                        ?.substringAfter(":")?.trim() ?: ""
+                                                    if (p.isNotBlank()) {
+                                                        val pLower = p.lowercase(Locale.ROOT)
+                                                        pastasApagadasNuvem.remove(pLower)
+                                                        pastasAtivasNuvem[pLower] = p
+                                                    }
+                                                }
+                                                "RENOMEAR" -> {
+                                                    val de = partes.firstOrNull { it.startsWith("DE:", ignoreCase = true) }
+                                                        ?.substringAfter(":")?.trim() ?: ""
+                                                    val para = partes.firstOrNull { it.startsWith("PARA:", ignoreCase = true) }
+                                                        ?.substringAfter(":")?.trim() ?: ""
+                                                    if (de.isNotBlank() && para.isNotBlank()) {
+                                                        val deLower = de.lowercase(Locale.ROOT)
+                                                        val paraLower = para.lowercase(Locale.ROOT)
+                                                        pastasAtivasNuvem.remove(deLower)
+                                                        pastasApagadasNuvem.add(deLower)
+                                                        pastasApagadasNuvem.remove(paraLower)
+                                                        pastasAtivasNuvem[paraLower] = para
+                                                        mapaRenomeacoesNuvem.entries.forEach { entry ->
+                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                                        }
+                                                        mapaRenomeacoesNuvem[deLower] = para
+                                                        mapaMovidosPorChave.entries.forEach { entry ->
+                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                                        }
+                                                        mapaMovidosPorNome.entries.forEach { entry ->
+                                                            if (entry.value.equals(de, ignoreCase = true)) entry.setValue(para)
+                                                        }
+                                                    }
+                                                }
+                                                "APAGAR" -> {
+                                                    val p = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                                                        ?.substringAfter(":")?.trim() ?: ""
+                                                    if (p.isNotBlank()) {
+                                                        val pLower = p.lowercase(Locale.ROOT)
+                                                        pastasAtivasNuvem.remove(pLower)
+                                                        pastasApagadasNuvem.add(pLower)
+                                                        mapaMovidosPorChave.entries.forEach { entry ->
+                                                            if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
+                                                        }
+                                                        mapaMovidosPorNome.entries.forEach { entry ->
+                                                            if (entry.value.equals(p, ignoreCase = true)) entry.setValue("")
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } else if (txt.contains("[SYNC_MOVER]")) {
+                                            val pastaDest = partes.firstOrNull { it.startsWith("PASTA:", ignoreCase = true) }
+                                                ?.substringAfter(":")?.trim() ?: ""
+                                            val itensStr = partes.firstOrNull { it.startsWith("ITENS:", ignoreCase = true) }
+                                                ?.substringAfter(":")?.trim() ?: ""
+                                            if (pastaDest.isNotBlank()) {
+                                                val pLower = pastaDest.lowercase(Locale.ROOT)
+                                                pastasApagadasNuvem.remove(pLower)
+                                                pastasAtivasNuvem[pLower] = pastaDest
+                                            }
+                                            itensStr.split(";;").forEach { itemToken ->
+                                                val limpoToken = itemToken.trim()
+                                                if (limpoToken.isNotBlank()) {
+                                                    val temHash = limpoToken.contains('#')
+                                                    val nLower = (if (temHash) limpoToken.substringBeforeLast('#') else limpoToken)
+                                                        .trim().lowercase(Locale.ROOT)
+                                                    val tStr = if (temHash) limpoToken.substringAfterLast('#').trim() else ""
+                                                    if (nLower.isNotBlank()) {
+                                                        if (tStr.isNotBlank()) {
+                                                            mapaMovidosPorChave["$nLower|$tStr"] = pastaDest
+                                                        }
+                                                        mapaMovidosPorNome[nLower] = pastaDest
+                                                    }
+                                                }
+                                            }
                                         }
-                                        legenda.contains(tagPerfil, ignoreCase = true) || legenda.contains(tagPerfilExibicao, ignoreCase = true)
-                                    }
-                                }
-
-                                val totalNaNuvem = mensagensDoUsuario.size
-                                if (totalNaNuvem > 0) {
-                                    NexusLeituraNuvem.iniciar(totalNaNuvem, "Lendo arquivos da nuvem SSD ($modoReal)...")
-                                } else {
-                                    NexusLeituraNuvem.encerrar()
-                                    onComplete(0)
-                                    return@buscarHistoricoPaginado
-                                }
-
-                                var importados = 0
-                                val donosAtuais = carregarDonosFicheiros(context)
-                                val pastasAtuais = carregarVinculosPastas(context)
-
-                                val prefsMsgs = context.getSharedPreferences("nexus_synced_msgs_$chaveAtiva", Context.MODE_PRIVATE)
-                                var editorMsgs: android.content.SharedPreferences.Editor? = null
-                                val prefsSynced = context.getSharedPreferences("nexus_auto_synced_files_$chaveAtiva", Context.MODE_PRIVATE)
-                                var editorSynced: android.content.SharedPreferences.Editor? = null
-                                val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
-                                var editorOwners: android.content.SharedPreferences.Editor? = null
-                                val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
-                                var editorLinks: android.content.SharedPreferences.Editor? = null
-                                val pastasEncontradas = mutableSetOf<String>()
-
-                                val mapaExistentesPorChave = arquivosAtuaisReais
-                                    .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
-                                    .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
-                                    .toMutableMap()
-
-                                mensagensDoUsuario.forEachIndexed { index, msg ->
-                                    var legenda = ""
-                                    var rId = 0
-                                    var thumbId = 0
-                                    var thumbPathLocal = ""
-                                    var nomeBruto = ""
-                                    var tam = 0L
-                                    var caminhoLocalExistente = ""
-
-                                    when (val c = msg.content) {
-                                        is TdApi.MessageDocument -> {
-                                            legenda = c.caption?.text ?: ""
-                                            rId = c.document?.document?.id ?: 0
-                                            thumbId = c.document?.thumbnail?.file?.id ?: 0
-                                            thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
-                                            nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                            tam = c.document?.document?.size ?: 0L
-                                            caminhoLocalExistente = c.document?.document?.local?.path ?: ""
-                                        }
-                                        is TdApi.MessageAudio -> {
-                                            legenda = c.caption?.text ?: ""
-                                            rId = c.audio?.audio?.id ?: 0
-                                            thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
-                                            thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
-                                            nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
-                                            tam = c.audio?.audio?.size ?: 0L
-                                            caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
-                                        }
-                                        is TdApi.MessagePhoto -> {
-                                            legenda = c.caption?.text ?: ""
-                                            val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
-                                            rId = maior?.photo?.id ?: 0
-                                            nomeBruto = "Foto_$rId.jpg"
-                                            tam = maior?.photo?.size ?: 0L
-                                            caminhoLocalExistente = maior?.photo?.local?.path ?: ""
-                                        }
-                                        is TdApi.MessageVideo -> {
-                                            legenda = c.caption?.text ?: ""
-                                            rId = c.video?.video?.id ?: 0
-                                            thumbId = c.video?.thumbnail?.file?.id ?: 0
-                                            thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
-                                            nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
-                                            tam = c.video?.video?.size ?: 0L
-                                            caminhoLocalExistente = c.video?.video?.local?.path ?: ""
-                                        }
-                                        else -> return@forEachIndexed
-                                    }
-
-                                    if (rId != 0 && thumbId != 0) {
-                                        NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
-                                    }
-
-                                    val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
-                                    val nomeLower = nomeDoc.lowercase(Locale.ROOT)
-                                    val chaveUnica = "$nomeLower|$tam"
-
-                                    NexusLeituraNuvem.avancar(
-                                        novoLido = index + 1,
-                                        novoTotal = totalNaNuvem,
-                                        texto = "Lendo nuvem SSD ($modoReal): $nomeDoc"
-                                    )
-
-                                    val msgIdKey = msg.id.toString()
-                                    if (msg.id != 0L && !prefsMsgs.getBoolean(msgIdKey, false)) {
-                                        if (editorMsgs == null) editorMsgs = prefsMsgs.edit()
-                                        editorMsgs?.putBoolean(msgIdKey, true)
                                     }
 
-                                    if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
-                                        return@forEachIndexed
-                                    }
+                                    // 2. Filtra as mídias do perfil
+                                    val mensagensDoUsuario = todasMensagens.filter { msg ->
+                                        val temMidia = msg.content is TdApi.MessageDocument ||
+                                            msg.content is TdApi.MessageAudio ||
+                                            msg.content is TdApi.MessagePhoto ||
+                                            msg.content is TdApi.MessageVideo
+                                        if (!temMidia) return@filter false
 
-                                    val pastaBruta = if (legenda.contains("📁 [")) {
-                                        legenda.substringAfter("📁 [").substringBefore("]").trim()
-                                    } else ""
-                                    val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaBruta)
-                                    val pastaFinal = if (pastaResolvida.isNotBlank() && !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)) {
-                                        pastaResolvida
-                                    } else ""
-
-                                    if (pastaFinal.isNotBlank()) {
-                                        pastasEncontradas.add(pastaFinal)
-                                    }
-
-                                    val kName = "name_$nomeLower"
-                                    val kKey = "key_${nomeLower}|$tam"
-                                    if (!prefsSynced.getBoolean(kName, false) || !prefsSynced.getBoolean(kKey, false)) {
-                                        if (editorSynced == null) editorSynced = prefsSynced.edit()
-                                        editorSynced?.putBoolean(kName, true)
-                                        editorSynced?.putBoolean(kKey, true)
-                                    }
-
-                                    val uriMiniaturaInicial = when {
-                                        caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
-                                            prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
-                                        thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
-                                            salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
-                                        else -> ""
-                                    }
-
-                                    val arqExistente = mapaExistentesPorChave[chaveUnica]
-                                    if (arqExistente != null) {
-                                        if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
-                                            if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                            editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal.trim())
+                                        if (modoReal == "CP") {
+                                            true
+                                        } else {
+                                            val legenda = when (val c = msg.content) {
+                                                is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                                is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                                is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                                                is TdApi.MessageVideo -> c.caption?.text ?: ""
+                                                else -> ""
+                                            }
+                                            legenda.contains(tagPerfil, ignoreCase = true) ||
+                                                legenda.contains(tagPerfilExibicao, ignoreCase = true)
                                         }
-                                        if (uriMiniaturaInicial.isNotBlank()) {
-                                            NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
-                                        }
-                                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                            NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
-                                        }
-                                        if ((rId != 0 && arqExistente.fileId != rId) ||
-                                            (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
-                                        ) {
-                                            vm.salvarArquivo(
-                                                arqExistente.copy(
-                                                    fileId = if (rId != 0) rId else arqExistente.fileId,
-                                                    caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
-                                                )
+                                    }
+
+                                    val totalNaNuvem = mensagensDoUsuario.size
+                                    if (totalNaNuvem == 0 && pastasAtivasNuvem.isEmpty()) {
+                                        NexusLeituraNuvem.encerrar()
+                                        onComplete(0)
+                                        return@buscarHistoricoPaginado
+                                    }
+
+                                    if (totalNaNuvem > 0) {
+                                        NexusLeituraNuvem.iniciar(totalNaNuvem, "Restaurando cofre SSD ($modoReal)...")
+                                    }
+
+                                    // 3. Processa e grava tudo em sequência na thread IO antes de chamar onComplete
+                                    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+                                        var importados = 0
+                                        val donosAtuais = carregarDonosFicheiros(context)
+                                        val pastasAtuais = carregarVinculosPastas(context)
+
+                                        val prefsMsgs = context.getSharedPreferences("nexus_synced_msgs_$chaveAtiva", Context.MODE_PRIVATE)
+                                        var editorMsgs: android.content.SharedPreferences.Editor? = null
+                                        val prefsSynced = context.getSharedPreferences("nexus_auto_synced_files_$chaveAtiva", Context.MODE_PRIVATE)
+                                        var editorSynced: android.content.SharedPreferences.Editor? = null
+                                        val prefsOwners = context.getSharedPreferences("nexus_file_owners", Context.MODE_PRIVATE)
+                                        var editorOwners: android.content.SharedPreferences.Editor? = null
+                                        val prefsLinks = context.getSharedPreferences("nexus_folder_links", Context.MODE_PRIVATE)
+                                        var editorLinks: android.content.SharedPreferences.Editor? = null
+                                        val pastasEncontradas = mutableSetOf<String>()
+                                        pastasEncontradas.addAll(pastasAtivasNuvem.values)
+
+                                        val mapaExistentesPorChave = arquivosAtuaisReais
+                                            .filter { donosAtuais[it.dataUpload] == chaveAtiva || donosAtuais.isEmpty() }
+                                            .associateBy { "${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}|${it.tamanhoBytes}" }
+                                            .toMutableMap()
+
+                                        val timestampsUsados = arquivosAtuaisReais.map { it.dataUpload }.toMutableSet()
+
+                                        mensagensDoUsuario.forEachIndexed { index, msg ->
+                                            var legenda = ""
+                                            var rId = 0
+                                            var thumbId = 0
+                                            var thumbPathLocal = ""
+                                            var nomeBruto = ""
+                                            var tam = 0L
+                                            var caminhoLocalExistente = ""
+
+                                            when (val c = msg.content) {
+                                                is TdApi.MessageDocument -> {
+                                                    legenda = c.caption?.text ?: ""
+                                                    rId = c.document?.document?.id ?: 0
+                                                    thumbId = c.document?.thumbnail?.file?.id ?: 0
+                                                    thumbPathLocal = c.document?.thumbnail?.file?.local?.path ?: ""
+                                                    nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                                    tam = c.document?.document?.size ?: 0L
+                                                    caminhoLocalExistente = c.document?.document?.local?.path ?: ""
+                                                }
+                                                is TdApi.MessageAudio -> {
+                                                    legenda = c.caption?.text ?: ""
+                                                    rId = c.audio?.audio?.id ?: 0
+                                                    thumbId = c.audio?.albumCoverThumbnail?.file?.id ?: 0
+                                                    thumbPathLocal = c.audio?.albumCoverThumbnail?.file?.local?.path ?: ""
+                                                    nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
+                                                    tam = c.audio?.audio?.size ?: 0L
+                                                    caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
+                                                }
+                                                is TdApi.MessagePhoto -> {
+                                                    legenda = c.caption?.text ?: ""
+                                                    val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                                                    rId = maior?.photo?.id ?: 0
+                                                    nomeBruto = "Foto_$rId.jpg"
+                                                    tam = maior?.photo?.size ?: 0L
+                                                    caminhoLocalExistente = maior?.photo?.local?.path ?: ""
+                                                }
+                                                is TdApi.MessageVideo -> {
+                                                    legenda = c.caption?.text ?: ""
+                                                    rId = c.video?.video?.id ?: 0
+                                                    thumbId = c.video?.thumbnail?.file?.id ?: 0
+                                                    thumbPathLocal = c.video?.thumbnail?.file?.local?.path ?: ""
+                                                    nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
+                                                    tam = c.video?.video?.size ?: 0L
+                                                    caminhoLocalExistente = c.video?.video?.local?.path ?: ""
+                                                }
+                                                else -> return@forEachIndexed
+                                            }
+
+                                            if (rId != 0 && thumbId != 0) {
+                                                NexusThumbCache.salvarThumbIdNuvem(context, rId, thumbId)
+                                            }
+
+                                            val nomeDoc = extrairNomeLimpoDaMensagem(nomeBruto, legenda)
+                                            val nomeLower = nomeDoc.lowercase(Locale.ROOT)
+                                            val chaveUnica = "$nomeLower|$tam"
+
+                                            NexusLeituraNuvem.avancar(
+                                                novoLido = index + 1,
+                                                novoTotal = totalNaNuvem.coerceAtLeast(1),
+                                                texto = "Restaurando SSD ($modoReal): $nomeDoc"
                                             )
-                                        }
-                                    } else {
-                                        val ts = (msg.date.toLong() * 1000L) + (msg.id % 997L).let { if (it < 0) -it else it } + (index * 11L)
-                                        if (editorOwners == null) editorOwners = prefsOwners.edit()
-                                        editorOwners?.putString(ts.toString(), chaveAtiva)
-                                        if (pastaFinal.isNotBlank()) {
-                                            if (editorLinks == null) editorLinks = prefsLinks.edit()
-                                            editorLinks?.putString(ts.toString(), pastaFinal.trim())
-                                        }
-                                        if (uriMiniaturaInicial.isNotBlank()) {
-                                            NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
-                                        }
-                                        if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
-                                            NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
+
+                                            val msgIdKey = msg.id.toString()
+                                            if (msg.id != 0L && !prefsMsgs.getBoolean(msgIdKey, false)) {
+                                                if (editorMsgs == null) editorMsgs = prefsMsgs.edit()
+                                                editorMsgs?.putBoolean(msgIdKey, true)
+                                            }
+
+                                            if (ficheiroFoiDeletadoPeloUsuario(context, usuarioAtivo, nomeDoc, tam)) {
+                                                return@forEachIndexed
+                                            }
+
+                                            val pastaBrutaLegenda = if (legenda.contains("📁 [")) {
+                                                legenda.substringAfter("📁 [").substringBefore("]").trim()
+                                            } else ""
+
+                                            val veioDeMovimentoNuvem = mapaMovidosPorChave.containsKey(chaveUnica) ||
+                                                mapaMovidosPorNome.containsKey(nomeLower)
+
+                                            val pastaEscolhida = when {
+                                                mapaMovidosPorChave.containsKey(chaveUnica) -> mapaMovidosPorChave[chaveUnica] ?: ""
+                                                mapaMovidosPorNome.containsKey(nomeLower) -> mapaMovidosPorNome[nomeLower] ?: ""
+                                                else -> pastaBrutaLegenda
+                                            }
+
+                                            val pastaAposRenomeNuvem = if (pastaEscolhida.isNotBlank()) {
+                                                mapaRenomeacoesNuvem[pastaEscolhida.lowercase(Locale.ROOT)] ?: pastaEscolhida
+                                            } else ""
+
+                                            val pastaResolvida = resolverNomePastaAtualizado(context, usuarioAtivo, pastaAposRenomeNuvem)
+                                            val pastaResolvidaLower = pastaResolvida.lowercase(Locale.ROOT)
+                                            val pastaFinal = if (
+                                                pastaResolvida.isNotBlank() &&
+                                                !pastasApagadasNuvem.contains(pastaResolvidaLower) &&
+                                                !pastaFoiEliminadaPeloUsuario(context, usuarioAtivo, pastaResolvida)
+                                            ) {
+                                                pastaResolvida
+                                            } else ""
+
+                                            if (pastaFinal.isNotBlank()) {
+                                                pastasEncontradas.add(pastaFinal)
+                                            }
+
+                                            val kName = "name_$nomeLower"
+                                            val kKey = "key_${nomeLower}|$tam"
+                                            if (!prefsSynced.getBoolean(kName, false) || !prefsSynced.getBoolean(kKey, false)) {
+                                                if (editorSynced == null) editorSynced = prefsSynced.edit()
+                                                editorSynced?.putBoolean(kName, true)
+                                                editorSynced?.putBoolean(kKey, true)
+                                            }
+
+                                            val uriMiniaturaInicial = when {
+                                                caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L ->
+                                                    prepararMiniaturaDeFicheiroBaixado(context, File(caminhoLocalExistente), nomeDoc)
+                                                thumbPathLocal.isNotBlank() && File(thumbPathLocal).exists() && File(thumbPathLocal).length() > 100L ->
+                                                    salvarMiniaturaRapidaTDLib(context, File(thumbPathLocal), rId, nomeDoc)
+                                                else -> ""
+                                            }
+
+                                            val arqExistente = mapaExistentesPorChave[chaveUnica]
+                                            if (arqExistente != null) {
+                                                if (veioDeMovimentoNuvem) {
+                                                    if (pastaFinal.isBlank()) {
+                                                        if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                                        editorLinks?.remove(arqExistente.dataUpload.toString())
+                                                    } else if (pastasAtuais[arqExistente.dataUpload] != pastaFinal) {
+                                                        if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                                        editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
+                                                    }
+                                                } else if (pastaFinal.isNotBlank() && pastasAtuais[arqExistente.dataUpload].isNullOrBlank()) {
+                                                    if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                                    editorLinks?.putString(arqExistente.dataUpload.toString(), pastaFinal)
+                                                }
+                                                if (uriMiniaturaInicial.isNotBlank()) {
+                                                    NexusThumbCache.salvarMiniatura(context, arqExistente.dataUpload, uriMiniaturaInicial)
+                                                }
+                                                if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                                    NexusThumbCache.salvarArquivoCompleto(context, arqExistente.dataUpload, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                                }
+                                                if ((rId != 0 && arqExistente.fileId != rId) ||
+                                                    (!miniaturaExisteLocalmente(arqExistente.caminhoMiniatura, nomeDoc) && uriMiniaturaInicial.isNotBlank())
+                                                ) {
+                                                    vm.salvarArquivoSincrono(
+                                                        arqExistente.copy(
+                                                            fileId = if (rId != 0) rId else arqExistente.fileId,
+                                                            caminhoMiniatura = if (uriMiniaturaInicial.isNotBlank()) uriMiniaturaInicial else arqExistente.caminhoMiniatura
+                                                        )
+                                                    )
+                                                }
+                                            } else {
+                                                var ts = (msg.date.toLong() * 1000L) + kotlin.math.abs((msg.id ushr 20) % 997L)
+                                                while (!timestampsUsados.add(ts)) {
+                                                    ts++
+                                                }
+
+                                                if (editorOwners == null) editorOwners = prefsOwners.edit()
+                                                editorOwners?.putString(ts.toString(), chaveAtiva)
+                                                if (pastaFinal.isNotBlank()) {
+                                                    if (editorLinks == null) editorLinks = prefsLinks.edit()
+                                                    editorLinks?.putString(ts.toString(), pastaFinal)
+                                                }
+                                                if (uriMiniaturaInicial.isNotBlank()) {
+                                                    NexusThumbCache.salvarMiniatura(context, ts, uriMiniaturaInicial)
+                                                }
+                                                if (caminhoLocalExistente.isNotBlank() && File(caminhoLocalExistente).exists() && File(caminhoLocalExistente).length() > 100L) {
+                                                    NexusThumbCache.salvarArquivoCompleto(context, ts, Uri.fromFile(File(caminhoLocalExistente)).toString())
+                                                }
+
+                                                val novoArq = ArquivoNuvem(
+                                                    fileId = rId,
+                                                    nomeArquivo = nomeDoc,
+                                                    tamanhoBytes = tam,
+                                                    dataUpload = ts,
+                                                    caminhoMiniatura = uriMiniaturaInicial
+                                                )
+                                                mapaExistentesPorChave[chaveUnica] = novoArq
+                                                vm.salvarArquivoSincrono(novoArq, forcarNovoRegistro = true)
+                                                importados++
+                                            }
                                         }
 
-                                        val novoArq = ArquivoNuvem(
-                                            fileId = rId,
-                                            nomeArquivo = nomeDoc,
-                                            tamanhoBytes = tam,
-                                            dataUpload = ts,
-                                            caminhoMiniatura = uriMiniaturaInicial
-                                        )
-                                        mapaExistentesPorChave[chaveUnica] = novoArq
-                                        vm.salvarArquivo(novoArq, forcarNovoRegistro = true)
-                                        importados++
+                                        // Grava todas as pastas ativas e apagadas em lote único na thread IO
+                                        val prefsFolders = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
+                                        val conjuntoPastas = (prefsFolders.getStringSet("folders_$chaveAtiva", emptySet()) ?: emptySet())
+                                            .filterNot { pastasApagadasNuvem.contains(it.trim().lowercase(Locale.ROOT)) }
+                                            .toMutableSet()
+                                        pastasEncontradas.forEach { p ->
+                                            val limpo = p.trim()
+                                            if (limpo.isNotBlank() && conjuntoPastas.none { it.equals(limpo, ignoreCase = true) }) {
+                                                conjuntoPastas.add(limpo)
+                                            }
+                                        }
+                                        prefsFolders.edit().putStringSet("folders_$chaveAtiva", conjuntoPastas).commit()
+
+                                        if (pastasApagadasNuvem.isNotEmpty()) {
+                                            val prefsDelPastas = context.getSharedPreferences("nexus_deleted_folders_$chaveAtiva", Context.MODE_PRIVATE)
+                                            val edDel = prefsDelPastas.edit()
+                                            pastasApagadasNuvem.forEach { edDel.putBoolean(it, true) }
+                                            edDel.commit()
+                                        }
+
+                                        editorMsgs?.commit()
+                                        editorSynced?.commit()
+                                        editorOwners?.commit()
+                                        editorLinks?.commit()
+
+                                        conjuntoPastas.forEach { p -> vm.criarPasta(p) }
+                                        onComplete(importados)
                                     }
                                 }
-
-                                // Aplica todas as preferências de uma só vez no fim da varredura
-                                editorMsgs?.apply()
-                                editorSynced?.apply()
-                                editorOwners?.apply()
-                                editorLinks?.apply()
-                                pastasEncontradas.forEach { p ->
-                                    vm.criarPasta(p)
-                                    associarPastaAoUsuario(context, usuarioAtivo, p)
-                                }
-
-                                onComplete(importados)
                             }
                         }
                     }
@@ -5505,7 +5802,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // === JANELA PARA RENOMEAR PASTA ===
+    // === JANELA PARA RENOMEAR PASTA (COM SINCRONIZAÇÃO NA NUVEM SSD) ===
     if (pastaParaRenomear != null) {
         val nomeAntigo = pastaParaRenomear!!
         Dialog(onDismissRequest = { pastaParaRenomear = null }) {
@@ -5547,6 +5844,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 val limpo = novoNomePastaInput.trim()
                                 if (limpo.isNotBlank() && !limpo.equals(nomeAntigo, ignoreCase = true)) {
                                     renomearPastaCompleta(context, activeVaultUser, nomeAntigo, limpo, vm)
+                                    registrarAcaoPastaNaNuvem(context, client, activeVaultUser, "RENOMEAR", nomeAntigo, limpo)
                                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                                     mapaPastas = carregarVinculosPastas(context)
                                     if (pastaAberta?.equals(nomeAntigo, ignoreCase = true) == true) {
@@ -5567,7 +5865,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // === JANELA DE CONFIRMAÇÃO PARA APAGAR PASTA ===
+    // === JANELA DE CONFIRMAÇÃO PARA APAGAR PASTA (COM SINCRONIZAÇÃO NA NUVEM SSD) ===
     if (pastaParaApagar != null) {
         val nomePastaDel = pastaParaApagar!!
         val arquivosDaPastaDel = remember(arquivos, mapaPastas, nomePastaDel) {
@@ -5599,6 +5897,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     OutlinedButton(
                         onClick = {
                             isDeletingFolder = true
+                            registrarAcaoPastaNaNuvem(context, client, activeVaultUser, "APAGAR", nomePastaDel)
                             eliminarPastaCompleta(context, client, activeVaultUser, nomePastaDel, false, arquivosDaPastaDel, vm) { msg ->
                                 scope.launch(Dispatchers.Main) {
                                     isDeletingFolder = false
@@ -5628,6 +5927,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         Button(
                             onClick = {
                                 isDeletingFolder = true
+                                registrarAcaoPastaNaNuvem(context, client, activeVaultUser, "APAGAR", nomePastaDel)
                                 eliminarPastaCompleta(context, client, activeVaultUser, nomePastaDel, true, arquivosDaPastaDel, vm) { msg ->
                                     scope.launch(Dispatchers.Main) {
                                         isDeletingFolder = false
@@ -6047,7 +6347,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // MOVER PARA PASTA (SUPORTA 1 OU MÚLTIPLOS FICHEIROS)
+    // MOVER PARA PASTA (SUPORTA 1 OU MÚLTIPLOS FICHEIROS E REGISTA NA NUVEM SSD)
     if (filesToMoveBatch.isNotEmpty()) {
         val listaMover = filesToMoveBatch
         Dialog(onDismissRequest = { filesToMoveBatch = emptyList() }) {
@@ -6063,6 +6363,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     OutlinedButton(
                         onClick = {
                             listaMover.forEach { salvarVinculoPasta(context, it.dataUpload, "") }
+                            registrarMovimentacaoNaNuvem(context, client, activeVaultUser, "", listaMover)
                             mapaPastas = carregarVinculosPastas(context)
                             filesToMoveBatch = emptyList()
                             selectedFileIds = emptySet()
@@ -6084,6 +6385,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     associarPastaAoUsuario(context, activeVaultUser, p.nomePasta)
                                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                                     listaMover.forEach { salvarVinculoPasta(context, it.dataUpload, p.nomePasta) }
+                                    registrarMovimentacaoNaNuvem(context, client, activeVaultUser, p.nomePasta, listaMover)
                                     mapaPastas = carregarVinculosPastas(context)
                                     filesToMoveBatch = emptyList()
                                     selectedFileIds = emptySet()
@@ -6590,6 +6892,22 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     selected = false,
                     onClick = { showSync = true; scope.launch { drawerState.close() } },
                     colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                )
+                NavigationDrawerItem(
+                    icon = { Icon(Icons.Default.CloudUpload, null) },
+                    label = { Text("Salvar Pastas na Nuvem ($vaultStorageMode)") },
+                    selected = false,
+                    onClick = {
+                        scope.launch {
+                            drawerState.close()
+                            Toast.makeText(context, "Salvando estrutura de pastas na nuvem SSD...", Toast.LENGTH_SHORT).show()
+                            backupCompletoPastasNaNuvem(context, client, activeVaultUser, pastas, arquivos, mapaPastas) { msg ->
+                                cloudBannerText = msg
+                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    },
+                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
                 )
                 NavigationDrawerItem(
                     icon = { Icon(Icons.Default.CloudDownload, null) },
@@ -7353,6 +7671,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 if (n.isNotBlank()) {
                                     vm.criarPasta(n)
                                     associarPastaAoUsuario(context, activeVaultUser, n)
+                                    registrarAcaoPastaNaNuvem(context, client, activeVaultUser, "CRIAR", n)
                                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
                                 }
                                 nomeNovaPasta = ""
