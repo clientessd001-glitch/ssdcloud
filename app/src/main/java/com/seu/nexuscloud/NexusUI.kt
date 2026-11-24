@@ -1445,6 +1445,62 @@ fun obterChatCofreUsuario(
     }
 }
 
+// === MOTOR TURBO DE PREVIEWS (6 PARALELOS PARA CAPAS + CACHE RAM + MINITHUMB INSTANTÂNEA) ===
+object NexusPreviewTurbo {
+    val semaforoCapasLeves = kotlinx.coroutines.sync.Semaphore(6)
+    val semaforoFallbackCompleto = kotlinx.coroutines.sync.Semaphore(2)
+    val caminhosConfirmados: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
+    val miniThumbBytes = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
+    val jaTentouRecuperarId: MutableSet<Long> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Long, Boolean>())
+
+    fun registrarCaminhoValido(caminho: String?) {
+        val resolvido = resolverCaminhoCapaJpg(caminho)
+        if (resolvido.isNotBlank()) {
+            caminhosConfirmados.add(resolvido)
+        }
+    }
+
+    fun invalidarCaminho(caminho: String?) {
+        val resolvido = resolverCaminhoCapaJpg(caminho)
+        if (resolvido.isNotBlank()) {
+            caminhosConfirmados.remove(resolvido)
+        }
+        if (!caminho.isNullOrBlank()) {
+            caminhosConfirmados.remove(caminho)
+        }
+    }
+
+    fun salvarMiniThumbMemoria(dataUpload: Long, bytes: ByteArray?) {
+        if (bytes == null || bytes.size < 64 || bytes.size > 16384) return
+        if (miniThumbBytes.size >= 450) {
+            miniThumbBytes.keys.firstOrNull()?.let { miniThumbBytes.remove(it) }
+        }
+        miniThumbBytes[dataUpload] = bytes
+    }
+}
+
+fun extrairMiniThumbnailBytes(mediaObj: Any?): ByteArray? {
+    if (mediaObj == null) return null
+    return try {
+        val fMini = mediaObj.javaClass.getField("minithumbnail")
+        val miniObj = fMini.get(mediaObj) ?: return null
+        val fData = miniObj.javaClass.getField("data")
+        fData.get(miniObj) as? ByteArray
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+fun escolherFotoMiniaturaLeve(photo: TdApi.Photo?): TdApi.PhotoSize? {
+    val validos = photo?.sizes?.filterNotNull()?.filter { (it.photo?.id ?: 0) != 0 } ?: return null
+    if (validos.size <= 1) return null
+    val ordenados = validos.sortedBy { maxOf(it.width, it.height) }
+    return ordenados.firstOrNull { maxOf(it.width, it.height) >= 240 }
+        ?: ordenados.firstOrNull()
+}
+
 suspend fun recuperarFileIdNaNuvemPorNome(
     context: Context,
     client: Client,
@@ -1461,7 +1517,7 @@ suspend fun recuperarFileIdNaNuvemPorNome(
     obterChatCofreUsuario(context, client, usuarioAtivo) { chatObj, modoCofre, _ ->
         if (chatObj != null) {
             buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeAlvoLimpo.take(25)) { msgsBusca ->
-                buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHist ->
+                buscarHistoricoPaginado(client, chatObj.id, 0L, 10, mutableListOf()) { msgsHist ->
                     NexusBackgroundScope.scope.launch(Dispatchers.IO) {
                         val todasMensagens = (msgsBusca + msgsHist).distinctBy { it.id }
                         var achouFileId = 0
@@ -1508,6 +1564,8 @@ suspend fun recuperarFileIdNaNuvemPorNome(
                                         if (nomeMsg == nomeAlvoLimpo) {
                                             val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
                                             achouFileId = maior?.photo?.id ?: 0
+                                            val thumbPhoto = escolherFotoMiniaturaLeve(c.photo)
+                                            achouThumbId = thumbPhoto?.photo?.id?.takeIf { it != 0 && it != achouFileId } ?: 0
                                             if (achouFileId != 0) break
                                         }
                                     }
@@ -2113,10 +2171,20 @@ fun miniaturaExisteLocalmente(caminhoMiniatura: String?, nomeArquivo: String = "
     if (resolvido.startsWith("content://")) {
         return !ehArquivoVideo(nomeArquivo)
     }
+    if (NexusThumbCache.mapaMiniaturas.isEmpty() && NexusPreviewTurbo.caminhosConfirmados.isNotEmpty()) {
+        NexusPreviewTurbo.caminhosConfirmados.clear()
+    }
+    if (NexusPreviewTurbo.caminhosConfirmados.contains(resolvido)) {
+        return true
+    }
     val limpo = if (resolvido.startsWith("file://")) Uri.parse(resolvido).path ?: resolvido.removePrefix("file://") else resolvido
     if (limpo.isBlank()) return false
     val f = File(limpo)
-    return f.exists() && f.length() > 256L
+    val existe = f.exists() && f.length() > 256L
+    if (existe) {
+        NexusPreviewTurbo.caminhosConfirmados.add(resolvido)
+    }
+    return existe
 }
 
 fun arquivoCompletoExisteLocalmente(caminho: String?): Boolean {
@@ -2730,29 +2798,33 @@ fun extrairCapaVideoParaArquivo(
 }
 
 fun gerarMiniaturaImagemLeve(arquivoImagem: File, destinoFrame: File): Boolean {
-    if (destinoFrame.exists() && destinoFrame.length() > 256L) return true
+    if (destinoFrame.exists() && destinoFrame.length() > 256L) {
+        NexusPreviewTurbo.registrarCaminhoValido(Uri.fromFile(destinoFrame).toString())
+        return true
+    }
     return try {
         val optsBounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(arquivoImagem.absolutePath, optsBounds)
         if (optsBounds.outWidth <= 0 || optsBounds.outHeight <= 0) return false
 
         var sample = 1
-        while (optsBounds.outWidth / sample > 360 || optsBounds.outHeight / sample > 360) {
+        while (optsBounds.outWidth / sample > 240 || optsBounds.outHeight / sample > 240) {
             sample *= 2
         }
         val optsDecode = BitmapFactory.Options().apply {
             inSampleSize = sample.coerceAtLeast(1)
-            inPreferredConfig = Bitmap.Config.ARGB_8888
+            inPreferredConfig = Bitmap.Config.RGB_565
         }
         val bmp = BitmapFactory.decodeFile(arquivoImagem.absolutePath, optsDecode) ?: return false
         val tempFile = File("${destinoFrame.absolutePath}.tmp")
         FileOutputStream(tempFile).use { out ->
-            bmp.compress(Bitmap.CompressFormat.JPEG, 86, out)
+            bmp.compress(Bitmap.CompressFormat.JPEG, 75, out)
         }
         bmp.recycle()
         if (tempFile.exists() && tempFile.length() > 256L) {
             if (destinoFrame.exists()) destinoFrame.delete()
             tempFile.renameTo(destinoFrame)
+            NexusPreviewTurbo.registrarCaminhoValido(Uri.fromFile(destinoFrame).toString())
             true
         } else {
             tempFile.delete()
@@ -2771,27 +2843,54 @@ fun salvarMiniaturaRapidaTDLib(context: Context, arquivoThumb: File, fileId: Int
         val nomeSeguro = limparPrefixoTimestamp(nomeArquivo).replace(Regex("[^a-zA-Z0-9._-]"), "_")
         val fFrame = File(dir, "fast_${fileId}_${nomeSeguro}_frame.jpg")
 
-        val bmp = BitmapFactory.decodeFile(arquivoThumb.absolutePath) ?: return ""
+        // Para fotos e PDFs: copia o .jpg direto sem decodificar Bitmap (zero custo de CPU)
+        if (!ehVid) {
+            val tempFile = File("${fFrame.absolutePath}.tmp")
+            FileInputStream(arquivoThumb).use { inp ->
+                FileOutputStream(tempFile).use { out -> inp.copyTo(out) }
+            }
+            if (tempFile.exists() && tempFile.length() > 128L) {
+                if (fFrame.exists()) fFrame.delete()
+                tempFile.renameTo(fFrame)
+                val uriFinal = Uri.fromFile(fFrame).toString()
+                NexusPreviewTurbo.registrarCaminhoValido(uriFinal)
+                return uriFinal
+            }
+            tempFile.delete()
+            return ""
+        }
+
+        // Para vídeos: checa se a capa não veio preta e aplica clareamento leve
+        val opts = BitmapFactory.Options().apply { inPreferredConfig = Bitmap.Config.RGB_565 }
+        val bmp = BitmapFactory.decodeFile(arquivoThumb.absolutePath, opts) ?: return ""
         if (bmp.width <= 0 || bmp.height <= 0) {
             bmp.recycle()
             return ""
         }
 
         val brilho = calcularBrilhoMedioBitmap(bmp)
-        if (ehVid && brilho < 22) {
+        if (brilho < 22) {
             bmp.recycle()
             return ""
         }
 
-        val bmpAjustado = if (ehVid) clarearBitmapVideoSeNecessario(bmp) else bmp
+        val bmpAjustado = clarearBitmapVideoSeNecessario(bmp)
         if (bmpAjustado !== bmp) bmp.recycle()
-        FileOutputStream(fFrame).use { out ->
-            bmpAjustado.compress(Bitmap.CompressFormat.JPEG, 88, out)
+        val tempFile = File("${fFrame.absolutePath}.tmp")
+        FileOutputStream(tempFile).use { out ->
+            bmpAjustado.compress(Bitmap.CompressFormat.JPEG, 80, out)
         }
         bmpAjustado.recycle()
-        if (fFrame.exists() && fFrame.length() > 256L) {
-            Uri.fromFile(fFrame).toString()
-        } else ""
+        if (tempFile.exists() && tempFile.length() > 256L) {
+            if (fFrame.exists()) fFrame.delete()
+            tempFile.renameTo(fFrame)
+            val uriFinal = Uri.fromFile(fFrame).toString()
+            NexusPreviewTurbo.registrarCaminhoValido(uriFinal)
+            uriFinal
+        } else {
+            tempFile.delete()
+            ""
+        }
     } catch (_: Exception) {
         ""
     }
@@ -2808,7 +2907,9 @@ fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, no
         if (ehArquivoVideo(nomeSeguro)) {
             val ok = extrairCapaVideoParaArquivo(context, arquivoOrigem, null, frameFile)
             return if (ok && frameFile.exists() && frameFile.length() > 256L) {
-                Uri.fromFile(frameFile).toString()
+                val u = Uri.fromFile(frameFile).toString()
+                NexusPreviewTurbo.registrarCaminhoValido(u)
+                u
             } else ""
         }
 
@@ -2818,14 +2919,19 @@ fun prepararMiniaturaDeFicheiroBaixado(context: Context, arquivoOrigem: File, no
             }
         }
 
-        if (ehArquivoImagem(nomeSeguro)) {
-            val gerou = gerarMiniaturaImagemLeve(baseFile, frameFile)
-            return if (gerou && frameFile.exists()) Uri.fromFile(frameFile).toString() else Uri.fromFile(baseFile).toString()
-        } else if (descobrirMimeType(nomeSeguro) == "application/pdf") {
-            val capaPdf = gerarCapaPdf(baseFile)
-            return if (capaPdf != null && capaPdf.exists()) Uri.fromFile(capaPdf).toString() else ""
+        val resultado = when {
+            ehArquivoImagem(nomeSeguro) -> {
+                val gerou = gerarMiniaturaImagemLeve(baseFile, frameFile)
+                if (gerou && frameFile.exists()) Uri.fromFile(frameFile).toString() else Uri.fromFile(baseFile).toString()
+            }
+            descobrirMimeType(nomeSeguro) == "application/pdf" -> {
+                val capaPdf = gerarCapaPdf(baseFile)
+                if (capaPdf != null && capaPdf.exists()) Uri.fromFile(capaPdf).toString() else ""
+            }
+            else -> Uri.fromFile(baseFile).toString()
         }
-        Uri.fromFile(baseFile).toString()
+        if (resultado.isNotBlank()) NexusPreviewTurbo.registrarCaminhoValido(resultado)
+        resultado
     } catch (_: Exception) {
         ""
     }
@@ -2839,7 +2945,7 @@ fun extrairNomeLimpoDaMensagem(nomeDocumento: String, legenda: String): String {
     return limparPrefixoTimestamp(candidato).ifBlank { "Arquivo_Nuvem" }
 }
 
-// === SINCRONIZAÇÃO HÍBRIDA LEVE (CP DIRETO NO HISTÓRICO | MS COM ETIQUETAS | GRAVAÇÃO EM LOTE NO IO) ===
+// === SINCRONIZAÇÃO HÍBRIDA LEVE (CP DIRETO NO HISTÓRICO | MS COM ETIQUETAS | THUMBID EM FOTOS + MINITHUMB) ===
 fun sincronizarCofreDaNuvem(
     context: Context,
     client: Client,
@@ -2871,7 +2977,6 @@ fun sincronizarCofreDaNuvem(
     fun processarMensagensEmLoteIO(todasMensagens: List<TdApi.Message>, modoReal: String) {
         NexusBackgroundScope.scope.launch(Dispatchers.IO) {
             try {
-                // 1. Reconstrói todas as ações de pastas e movimentações em ordem cronológica
                 val pastasAtivasNuvem = mutableMapOf<String, String>()
                 val pastasApagadasNuvem = mutableSetOf<String>()
                 val mapaRenomeacoesNuvem = mutableMapOf<String, String>()
@@ -2974,7 +3079,6 @@ fun sincronizarCofreDaNuvem(
                     }
                 }
 
-                // 2. Filtra as mídias do perfil
                 val mensagensDoUsuario = todasMensagens.filter { msg ->
                     val temMidia = msg.content is TdApi.MessageDocument ||
                         msg.content is TdApi.MessageAudio ||
@@ -3045,6 +3149,7 @@ fun sincronizarCofreDaNuvem(
                     var nomeBruto = ""
                     var tam = 0L
                     var caminhoLocalExistente = ""
+                    var miniBytes: ByteArray? = null
 
                     when (val c = msg.content) {
                         is TdApi.MessageDocument -> {
@@ -3055,6 +3160,7 @@ fun sincronizarCofreDaNuvem(
                             nomeBruto = c.document?.fileName?.ifBlank { "Arquivo_$rId" } ?: "Arquivo_$rId"
                             tam = c.document?.document?.size ?: 0L
                             caminhoLocalExistente = c.document?.document?.local?.path ?: ""
+                            miniBytes = extrairMiniThumbnailBytes(c.document)
                         }
                         is TdApi.MessageAudio -> {
                             legenda = c.caption?.text ?: ""
@@ -3064,14 +3170,19 @@ fun sincronizarCofreDaNuvem(
                             nomeBruto = c.audio?.fileName?.ifBlank { c.audio?.title ?: "Arquivo_$rId" } ?: "Arquivo_$rId"
                             tam = c.audio?.audio?.size ?: 0L
                             caminhoLocalExistente = c.audio?.audio?.local?.path ?: ""
+                            miniBytes = extrairMiniThumbnailBytes(c.audio)
                         }
                         is TdApi.MessagePhoto -> {
                             legenda = c.caption?.text ?: ""
                             val maior = c.photo?.sizes?.maxByOrNull { it.photo?.size ?: 0 }
+                            val thumbPhoto = escolherFotoMiniaturaLeve(c.photo)
                             rId = maior?.photo?.id ?: 0
+                            thumbId = thumbPhoto?.photo?.id?.takeIf { it != 0 && it != rId } ?: 0
+                            thumbPathLocal = if (thumbId != 0) (thumbPhoto?.photo?.local?.path ?: "") else ""
                             nomeBruto = "Foto_$rId.jpg"
                             tam = maior?.photo?.size ?: 0L
                             caminhoLocalExistente = maior?.photo?.local?.path ?: ""
+                            miniBytes = extrairMiniThumbnailBytes(c.photo)
                         }
                         is TdApi.MessageVideo -> {
                             legenda = c.caption?.text ?: ""
@@ -3081,6 +3192,7 @@ fun sincronizarCofreDaNuvem(
                             nomeBruto = c.video?.fileName?.ifBlank { "Video_$rId.mp4" } ?: "Video_$rId.mp4"
                             tam = c.video?.video?.size ?: 0L
                             caminhoLocalExistente = c.video?.video?.local?.path ?: ""
+                            miniBytes = extrairMiniThumbnailBytes(c.video)
                         }
                         else -> return@forEachIndexed
                     }
@@ -3165,6 +3277,9 @@ fun sincronizarCofreDaNuvem(
 
                     val arqExistente = mapaExistentesPorChave[chaveUnica]
                     if (arqExistente != null) {
+                        if (miniBytes != null) {
+                            NexusPreviewTurbo.salvarMiniThumbMemoria(arqExistente.dataUpload, miniBytes)
+                        }
                         if (veioDeMovimentoNuvem) {
                             if (pastaFinal.isBlank()) {
                                 if (editorLinks == null) editorLinks = prefsLinks.edit()
@@ -3204,6 +3319,9 @@ fun sincronizarCofreDaNuvem(
                             ts++
                         }
 
+                        if (miniBytes != null) {
+                            NexusPreviewTurbo.salvarMiniThumbMemoria(ts, miniBytes)
+                        }
                         if (editorOwners == null) editorOwners = prefsOwners.edit()
                         editorOwners?.putString(ts.toString(), chaveAtiva)
                         if (pastaFinal.isNotBlank()) {
@@ -3235,7 +3353,6 @@ fun sincronizarCofreDaNuvem(
                     }
                 }
 
-                // 3. Grava todas as preferências em lote ANTES de inserir no Room (garante donos e pastas prontos)
                 val prefsFolders = context.getSharedPreferences("nexus_folder_owners", Context.MODE_PRIVATE)
                 val conjuntoPastas = (prefsFolders.getStringSet("folders_$chaveAtiva", emptySet()) ?: emptySet())
                     .filterNot { pastasApagadasNuvem.contains(it.trim().lowercase(Locale.ROOT)) }
@@ -3261,14 +3378,12 @@ fun sincronizarCofreDaNuvem(
                 editorLinks?.commit()
                 editorThumbs?.commit()
 
-                // 4. Atualiza cache em memória no Main thread sem contenção de Snapshot
                 withContext(Dispatchers.Main) {
                     if (loteThumbIds.isNotEmpty()) NexusThumbCache.mapaThumbIdsNuvem.putAll(loteThumbIds)
                     if (loteMiniaturas.isNotEmpty()) NexusThumbCache.mapaMiniaturas.putAll(loteMiniaturas)
                     if (loteCompletos.isNotEmpty()) NexusThumbCache.mapaArquivosCompletos.putAll(loteCompletos)
                 }
 
-                // 5. Insere pastas e arquivos direto no Room (sem reler a tabela inteira a cada item)
                 val pastasExistentesRoom = dao.buscarPastas().first()
                     .map { it.nomePasta.trim().lowercase(Locale.ROOT) }
                     .toMutableSet()
@@ -3341,18 +3456,30 @@ fun sincronizarCofreDaNuvem(
     }
 }
 
-// === FILA DE CARREGAMENTO DE MINIATURAS EM SEGUNDO PLANO (PRIORIZA CAPAS ULTRALEVES DA NUVEM) ===
+// === CARREGAMENTO TURBO DE MINIATURAS: 6 PARALELOS PARA CAPAS LEVES + 2 PARA FALLBACK ===
 suspend fun carregarMiniaturaIndividualDaNuvem(
     context: Context,
     client: Client,
     usuarioAtivo: String,
     arq: ArquivoNuvem,
     vm: UIViewModel,
-    atualizarSubBarra: Boolean = false
+    atualizarSubBarra: Boolean = false,
+    prioridadeRede: Int = 31,
+    apenasCapaLeve: Boolean = false
 ): String = withContext(Dispatchers.IO) {
     val jaTem = NexusThumbCache.obterMiniatura(arq)
-    if (jaTem.isNotBlank() && miniaturaExisteLocalmente(jaTem, arq.nomeArquivo)) {
-        return@withContext jaTem
+    if (jaTem.isNotBlank()) {
+        val resolvidoJaTem = resolverCaminhoCapaJpg(jaTem)
+        if (resolvidoJaTem.startsWith("content://") && !ehArquivoVideo(arq.nomeArquivo)) {
+            return@withContext resolvidoJaTem
+        }
+        val limpoJaTem = if (resolvidoJaTem.startsWith("file://")) Uri.parse(resolvidoJaTem).path ?: resolvidoJaTem.removePrefix("file://") else resolvidoJaTem
+        if (limpoJaTem.isNotBlank() && File(limpoJaTem).exists() && File(limpoJaTem).length() > 256L) {
+            NexusPreviewTurbo.registrarCaminhoValido(resolvidoJaTem)
+            return@withContext resolvidoJaTem
+        } else {
+            NexusPreviewTurbo.invalidarCaminho(jaTem)
+        }
     }
 
     val completoLocal = NexusThumbCache.obterArquivoCompleto(arq)
@@ -3373,7 +3500,12 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     var fIdAtual = arq.fileId
     var thumbIdLeve = NexusThumbCache.mapaThumbIdsNuvem[fIdAtual] ?: 0
 
-    if ((fIdAtual == 0 || (thumbIdLeve == 0 && ehArquivoVideo(arq.nomeArquivo))) && usuarioAtivo.isNotBlank()) {
+    // Evita varrer o histórico repetidamente para o mesmo arquivo
+    if ((fIdAtual == 0 || (thumbIdLeve == 0 && ehArquivoVideo(arq.nomeArquivo))) &&
+        usuarioAtivo.isNotBlank() &&
+        !apenasCapaLeve &&
+        NexusPreviewTurbo.jaTentouRecuperarId.add(arq.dataUpload)
+    ) {
         val (recFileId, recThumbId) = recuperarFileIdNaNuvemPorNome(context, client, usuarioAtivo, arq.nomeArquivo, arq.tamanhoBytes)
         if (recFileId != 0) {
             fIdAtual = recFileId
@@ -3386,10 +3518,19 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
 
     var miniaturaPronta = ""
 
+    // 1. Via expressa: 6 downloads simultâneos só para capas leves (~15-30 KB)
     if (thumbIdLeve != 0) {
-        val arqThumb = baixarArquivoTDLibAssincrono(client, thumbIdLeve, prioridade = 30, maxTentativas = 80, controlarPausaTransfer = false) { pct, _, _ ->
-            if (atualizarSubBarra) {
-                NexusLeituraNuvem.atualizarSubProgresso(pct, "Capa rápida SSD: ${arq.nomeArquivo}")
+        val arqThumb = NexusPreviewTurbo.semaforoCapasLeves.withPermit {
+            baixarArquivoTDLibAssincrono(
+                client = client,
+                fileId = thumbIdLeve,
+                prioridade = prioridadeRede,
+                maxTentativas = 70,
+                controlarPausaTransfer = false
+            ) { pct, _, _ ->
+                if (atualizarSubBarra) {
+                    NexusLeituraNuvem.atualizarSubProgresso(pct, "Capa rápida SSD: ${arq.nomeArquivo}")
+                }
             }
         }
         if (arqThumb != null && arqThumb.exists() && arqThumb.length() > 100L) {
@@ -3397,15 +3538,29 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
         }
     }
 
+    // 2. Fallback completo (semáforo separado de 2 conexões; ignorado no prefetch de arquivos pesados)
     val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
     val ehVideo = ehArquivoVideo(arq.nomeArquivo)
     val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) || ehVideo || ext == "PDF"
-    val limiteBytesCapa = if (ehVideo) 25L * 1024L * 1024L else 60L * 1024L * 1024L
+    val limiteBytesCapa = when {
+        apenasCapaLeve && ehVideo -> 0L
+        apenasCapaLeve -> 3L * 1024L * 1024L
+        ehVideo -> 25L * 1024L * 1024L
+        else -> 60L * 1024L * 1024L
+    }
 
-    if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && arq.tamanhoBytes <= limiteBytesCapa) {
-        val arqFull = baixarArquivoTDLibAssincrono(client, fIdAtual, prioridade = 20, maxTentativas = 350, controlarPausaTransfer = false) { pct, _, _ ->
-            if (atualizarSubBarra) {
-                NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
+    if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && limiteBytesCapa > 0L && arq.tamanhoBytes <= limiteBytesCapa) {
+        val arqFull = NexusPreviewTurbo.semaforoFallbackCompleto.withPermit {
+            baixarArquivoTDLibAssincrono(
+                client = client,
+                fileId = fIdAtual,
+                prioridade = (prioridadeRede - 8).coerceAtLeast(10),
+                maxTentativas = 350,
+                controlarPausaTransfer = false
+            ) { pct, _, _ ->
+                if (atualizarSubBarra) {
+                    NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
+                }
             }
         }
         if (arqFull != null && arqFull.exists() && arqFull.length() > 100L) {
@@ -3415,6 +3570,7 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     }
 
     if (miniaturaPronta.isNotBlank()) {
+        NexusPreviewTurbo.registrarCaminhoValido(miniaturaPronta)
         withContext(Dispatchers.Main) {
             vm.atualizarCaminhoMiniatura(context, arq, miniaturaPronta)
         }
@@ -4422,7 +4578,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS COM 3 COLUNAS, 4 COLUNAS, LISTA E BARRA LATERAL DE VELOCIDADE ===
+// === GRELHA DE ARQUIVOS TURBO (3 COL, 4 COL, LISTA + PREFETCH + MINITHUMB + BARRA VELOCIDADE) ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -4464,10 +4620,65 @@ fun GrelhaArquivos(
     }
     val totalItensGrid = indicesParaData.size
 
+    val indicesParaArquivo = remember(gruposPorData) {
+        val mapa = ArrayList<ArquivoNuvem?>(totalItensGrid)
+        gruposPorData.forEach { (_, arquivosDoDia) ->
+            mapa.add(null)
+            arquivosDoDia.forEach { mapa.add(it) }
+        }
+        mapa
+    }
+
     val gridState = androidx.compose.foundation.lazy.grid.rememberLazyGridState()
     val scopeGrid = rememberCoroutineScope()
     var isDraggingScrollbar by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
+
+    // Pré-carregamento (prefetch) silencioso das próximas 15 capas leves abaixo da tela quando parado
+    LaunchedEffect(gridState.isScrollInProgress, totalItensGrid, usuarioAtivo) {
+        if (!gridState.isScrollInProgress && totalItensGrid > 0 && usuarioAtivo.isNotBlank()) {
+            delay(180)
+            val ultimoVisivel = gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            val inicioPrefetch = (ultimoVisivel + 1).coerceAtMost(indicesParaArquivo.size)
+            val fimPrefetch = (ultimoVisivel + 20).coerceAtMost(indicesParaArquivo.size)
+            val candidatos = mutableListOf<ArquivoNuvem>()
+            for (i in inicioPrefetch until fimPrefetch) {
+                val arq = indicesParaArquivo.getOrNull(i) ?: continue
+                val suporta = ehArquivoImagem(arq.nomeArquivo) ||
+                    ehArquivoVideo(arq.nomeArquivo) ||
+                    arq.nomeArquivo.substringAfterLast('.', "").equals("PDF", ignoreCase = true)
+                if (!suporta) continue
+                val thumbAtual = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
+                if (!miniaturaExisteLocalmente(thumbAtual, arq.nomeArquivo) &&
+                    !NexusThumbCache.emProgresso.contains(arq.dataUpload)
+                ) {
+                    candidatos.add(arq)
+                    if (candidatos.size >= 15) break
+                }
+            }
+            candidatos.forEach { arqPrefetch ->
+                scopeGrid.launch(Dispatchers.IO) {
+                    if (!NexusThumbCache.emProgresso.contains(arqPrefetch.dataUpload)) {
+                        NexusThumbCache.emProgresso.add(arqPrefetch.dataUpload)
+                        try {
+                            carregarMiniaturaIndividualDaNuvem(
+                                context = context,
+                                client = client,
+                                usuarioAtivo = usuarioAtivo,
+                                arq = arqPrefetch,
+                                vm = vm,
+                                atualizarSubBarra = false,
+                                prioridadeRede = 24,
+                                apenasCapaLeve = true
+                            )
+                        } finally {
+                            NexusThumbCache.emProgresso.remove(arqPrefetch.dataUpload)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     val thumbFraction by remember(totalItensGrid) {
         derivedStateOf {
@@ -4549,12 +4760,17 @@ fun GrelhaArquivos(
                     val pasta = mapaPastas[arq.dataUpload]
                     val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
                     val estaSelecionado = idsSelecionados.contains(arq.id)
+                    var erroThumbTick by remember(arq.dataUpload) { mutableIntStateOf(0) }
 
                     val isImage = remember(arq.nomeArquivo) { ehArquivoImagem(arq.nomeArquivo) }
                     val isVideo = remember(arq.nomeArquivo) { ehArquivoVideo(arq.nomeArquivo) }
 
-                    val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo) {
+                    val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo, erroThumbTick) {
                         miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
+                    }
+
+                    val miniBytesInstantaneo = remember(arq.dataUpload, temArquivoMiniatura) {
+                        if (!temArquivoMiniatura) NexusPreviewTurbo.miniThumbBytes[arq.dataUpload] else null
                     }
 
                     val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura, tamanhoDecode) {
@@ -4567,27 +4783,41 @@ fun GrelhaArquivos(
                                 .allowHardware(true)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
                                 .diskCachePolicy(CachePolicy.ENABLED)
-                                .crossfade(160)
+                                .crossfade(70)
                                 .build()
                         } else null
                     }
 
-                    LaunchedEffect(arq.dataUpload, temArquivoMiniatura) {
+                    val miniModelRequest = remember(miniBytesInstantaneo) {
+                        if (miniBytesInstantaneo != null) {
+                            ImageRequest.Builder(context)
+                                .data(miniBytesInstantaneo)
+                                .size(96, 96)
+                                .bitmapConfig(Bitmap.Config.RGB_565)
+                                .memoryCachePolicy(CachePolicy.ENABLED)
+                                .build()
+                        } else null
+                    }
+
+                    LaunchedEffect(arq.dataUpload, temArquivoMiniatura, erroThumbTick) {
                         if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
-                            delay(150)
+                            // 0 ms quando parado; pausa breve apenas durante rolagem rápida
+                            if (gridState.isScrollInProgress) {
+                                delay(120)
+                            }
                             if (!NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
                                 NexusThumbCache.emProgresso.add(arq.dataUpload)
                                 try {
-                                    NexusThumbCache.downloadSemaphore.withPermit {
-                                        carregarMiniaturaIndividualDaNuvem(
-                                            context = context,
-                                            client = client,
-                                            usuarioAtivo = usuarioAtivo,
-                                            arq = arq,
-                                            vm = vm,
-                                            atualizarSubBarra = false
-                                        )
-                                    }
+                                    carregarMiniaturaIndividualDaNuvem(
+                                        context = context,
+                                        client = client,
+                                        usuarioAtivo = usuarioAtivo,
+                                        arq = arq,
+                                        vm = vm,
+                                        atualizarSubBarra = false,
+                                        prioridadeRede = 31,
+                                        apenasCapaLeve = false
+                                    )
                                 } finally {
                                     NexusThumbCache.emProgresso.remove(arq.dataUpload)
                                 }
@@ -4629,18 +4859,37 @@ fun GrelhaArquivos(
                                                 model = thumbModelRequest,
                                                 contentDescription = arq.nomeArquivo,
                                                 contentScale = ContentScale.Crop,
+                                                onError = {
+                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                    erroThumbTick++
+                                                },
                                                 modifier = Modifier.fillMaxSize()
                                             )
                                         } else {
+                                            if (miniModelRequest != null) {
+                                                AsyncImage(
+                                                    model = miniModelRequest,
+                                                    contentDescription = arq.nomeArquivo,
+                                                    contentScale = ContentScale.Crop,
+                                                    modifier = Modifier.fillMaxSize()
+                                                )
+                                            }
                                             CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
                                         }
                                     }
                                     isVideo -> {
-                                        if (thumbModelRequest != null) {
+                                        val vidModel = thumbModelRequest ?: miniModelRequest
+                                        if (vidModel != null) {
                                             AsyncImage(
-                                                model = thumbModelRequest,
+                                                model = vidModel,
                                                 contentDescription = arq.nomeArquivo,
                                                 contentScale = ContentScale.Crop,
+                                                onError = {
+                                                    if (thumbModelRequest != null) {
+                                                        NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                        erroThumbTick++
+                                                    }
+                                                },
                                                 modifier = Modifier.fillMaxSize()
                                             )
                                         }
@@ -4654,12 +4903,16 @@ fun GrelhaArquivos(
                                         }
                                     }
                                     ext == "PDF" -> {
-                                        val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                                        val possuiCapa = remember(thumbSafe, erroThumbTick) { temCapaPdfLocal(thumbSafe) }
                                         if (possuiCapa && thumbModelRequest != null) {
                                             AsyncImage(
                                                 model = thumbModelRequest,
                                                 contentDescription = arq.nomeArquivo,
                                                 contentScale = ContentScale.Crop,
+                                                onError = {
+                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                    erroThumbTick++
+                                                },
                                                 modifier = Modifier.fillMaxSize()
                                             )
                                         } else {
@@ -4761,28 +5014,46 @@ fun GrelhaArquivos(
                                             model = thumbModelRequest,
                                             contentDescription = arq.nomeArquivo,
                                             contentScale = ContentScale.Crop,
+                                            onError = {
+                                                NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                erroThumbTick++
+                                            },
                                             modifier = Modifier.fillMaxSize()
                                         )
                                     } else {
-                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                            CircularProgressIndicator(
-                                                color = Gold,
-                                                strokeWidth = 2.dp,
-                                                modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 22.dp)
+                                        if (miniModelRequest != null) {
+                                            AsyncImage(
+                                                model = miniModelRequest,
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
                                             )
                                         }
+                                        CircularProgressIndicator(
+                                            color = Gold,
+                                            strokeWidth = 2.dp,
+                                            modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 22.dp)
+                                        )
                                     }
                                 }
                                 isVideo -> {
                                     Box(Modifier.fillMaxSize()) {
-                                        if (thumbModelRequest != null) {
+                                        val vidModel = thumbModelRequest ?: miniModelRequest
+                                        if (vidModel != null) {
                                             AsyncImage(
-                                                model = thumbModelRequest,
+                                                model = vidModel,
                                                 contentDescription = "Video Preview",
                                                 contentScale = ContentScale.Crop,
+                                                onError = {
+                                                    if (thumbModelRequest != null) {
+                                                        NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                        erroThumbTick++
+                                                    }
+                                                },
                                                 modifier = Modifier.fillMaxSize()
                                             )
-                                        } else {
+                                        }
+                                        if (thumbModelRequest == null) {
                                             Column(
                                                 modifier = Modifier.align(Alignment.Center),
                                                 horizontalAlignment = Alignment.CenterHorizontally
@@ -4792,9 +5063,9 @@ fun GrelhaArquivos(
                                                     strokeWidth = 2.dp,
                                                     modifier = Modifier.size(if (ehQuatroColunas) 16.dp else 20.dp)
                                                 )
-                                                if (!ehQuatroColunas) {
+                                                if (!ehQuatroColunas && miniModelRequest == null) {
                                                     Spacer(Modifier.height(28.dp))
-                                                    Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                                                    Text("Carregando capa...", color = TextGrey, fontSize = 8.sp)
                                                 }
                                             }
                                         }
@@ -4824,13 +5095,17 @@ fun GrelhaArquivos(
                                     }
                                 }
                                 ext == "PDF" -> {
-                                    val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                                    val possuiCapa = remember(thumbSafe, erroThumbTick) { temCapaPdfLocal(thumbSafe) }
                                     if (possuiCapa && thumbModelRequest != null) {
                                         Box(Modifier.fillMaxSize()) {
                                             AsyncImage(
                                                 model = thumbModelRequest,
                                                 contentDescription = arq.nomeArquivo,
                                                 contentScale = ContentScale.Crop,
+                                                onError = {
+                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                    erroThumbTick++
+                                                },
                                                 modifier = Modifier.fillMaxSize()
                                             )
                                             Box(
