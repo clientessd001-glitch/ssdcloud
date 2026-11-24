@@ -935,9 +935,347 @@ suspend fun aguardarUploadTDLibComPausa(
 // === FIM DA PARTE 1 DE 3 ===
 // === CONTINUAÇÃO: PARTE 2 DE 3 (COLE LOGO ABAIXO DA PARTE 1) ===
 
+// === CREDENCIAIS MESTRES DO PAINEL ADMIN (ALTERE ANTES DE COMPILAR SE DESEJAR) ===
+private const val ADMIN_USER_MESTRE = "adminssd"
+private const val ADMIN_PIN_MESTRE = "202699"
+
 // Trava global para impedir limpezas repetidas no Room enquanto o cofre sincroniza com a nuvem
 object NexusSyncState {
     val emAndamento = MutableStateFlow(false)
+}
+
+data class StatusCofreLocal(
+    val bloqueado: Boolean,
+    val motivo: String,
+    val atualizadoEm: Long
+)
+
+data class PerfilAdminInfo(
+    val chaveUsuario: String,
+    val nomeExibicao: String,
+    val pinAtual: String,
+    val modo: String,
+    val chatIdCanal: Long,
+    val bloqueado: Boolean,
+    val motivoBloqueio: String,
+    val ultimaAtualizacao: Long
+)
+
+fun calcularSha256Bytes(texto: String): ByteArray {
+    return try {
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(texto.toByteArray(Charsets.UTF_8))
+    } catch (_: Throwable) {
+        texto.toByteArray(Charsets.UTF_8)
+    }
+}
+
+fun ehCredencialAdmin(nomeUsuario: String, pinDigitado: String): Boolean {
+    val userLimpo = normalizarUsuario(nomeUsuario)
+    val pinLimpo = pinDigitado.trim()
+    if (userLimpo != normalizarUsuario(ADMIN_USER_MESTRE)) return false
+    if (pinLimpo.isBlank()) return false
+    return java.security.MessageDigest.isEqual(
+        calcularSha256Bytes(pinLimpo),
+        calcularSha256Bytes(ADMIN_PIN_MESTRE.trim())
+    )
+}
+
+// === TRAVA ANTI-OFFLINE (STATUS LOCAL DO COFRE) ===
+fun salvarStatusCofreLocal(
+    context: Context,
+    usuario: String,
+    bloqueado: Boolean,
+    motivo: String,
+    atualizadoEmSeg: Long = System.currentTimeMillis() / 1000L
+) {
+    val chave = normalizarUsuario(usuario)
+    if (chave.isBlank()) return
+    val prefs = context.getSharedPreferences("nexus_vault_status", Context.MODE_PRIVATE)
+    prefs.edit()
+        .putBoolean("blocked_$chave", bloqueado)
+        .putString("reason_$chave", motivo.trim())
+        .putLong("ts_$chave", atualizadoEmSeg)
+        .commit()
+}
+
+fun obterStatusCofreLocal(context: Context, usuario: String): StatusCofreLocal {
+    val chave = normalizarUsuario(usuario)
+    if (chave.isBlank()) return StatusCofreLocal(false, "", 0L)
+    val prefs = context.getSharedPreferences("nexus_vault_status", Context.MODE_PRIVATE)
+    return StatusCofreLocal(
+        bloqueado = prefs.getBoolean("blocked_$chave", false),
+        motivo = prefs.getString("reason_$chave", "") ?: "",
+        atualizadoEm = prefs.getLong("ts_$chave", 0L)
+    )
+}
+
+fun extrairStatusCofreDasMensagens(mensagens: List<TdApi.Message>): Map<String, StatusCofreLocal> {
+    val ordenadas = mensagens.sortedWith(
+        compareByDescending<TdApi.Message> { it.date }.thenByDescending { it.id }
+    )
+    val mapaStatus = mutableMapOf<String, StatusCofreLocal>()
+    for (msg in ordenadas) {
+        val txt = (msg.content as? TdApi.MessageText)?.text?.text ?: continue
+        if (!txt.contains("[STATUS_COFRE]")) continue
+        val partes = txt.split("|").map { it.trim() }
+        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }
+            ?.substringAfter(":")?.trim() ?: ""
+        val statusPart = partes.firstOrNull { it.startsWith("STATUS:", ignoreCase = true) }
+            ?.substringAfter(":")?.trim()?.uppercase(Locale.ROOT) ?: ""
+        val motivoPart = partes.firstOrNull { it.startsWith("MOTIVO:", ignoreCase = true) }
+            ?.substringAfter(":")?.trim() ?: ""
+
+        val chave = normalizarUsuario(userPart)
+        if (chave.isNotBlank() && !mapaStatus.containsKey(chave)) {
+            val estaBloqueado = statusPart == "BLOQUEADO"
+            mapaStatus[chave] = StatusCofreLocal(
+                bloqueado = estaBloqueado,
+                motivo = if (estaBloqueado) motivoPart.ifBlank { "Acesso temporariamente suspenso." } else "",
+                atualizadoEm = msg.date.toLong()
+            )
+        }
+    }
+    return mapaStatus
+}
+
+// Consulta remota de bloqueio/desbloqueio com fallback anti-offline
+fun verificarStatusRemotoCliente(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    onResult: (Boolean, String) -> Unit
+) {
+    val chave = normalizarUsuario(usuarioAtivo)
+    if (chave.isBlank()) {
+        onResult(false, "")
+        return
+    }
+    val localAtual = obterStatusCofreLocal(context, chave)
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "STATUS_COFRE") { msgsBusca ->
+                        buscarHistoricoPaginado(client, chatObj.id, 0L, 6, mutableListOf()) { msgsHist ->
+                            NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                val todas = (msgsBusca + msgsHist).distinctBy { it.id }
+                                val mapa = extrairStatusCofreDasMensagens(todas)
+                                val remoto = mapa[chave]
+                                if (remoto != null) {
+                                    salvarStatusCofreLocal(context, chave, remoto.bloqueado, remoto.motivo, remoto.atualizadoEm)
+                                    withContext(Dispatchers.Main) {
+                                        onResult(remoto.bloqueado, remoto.motivo)
+                                    }
+                                } else {
+                                    withContext(Dispatchers.Main) {
+                                        onResult(localAtual.bloqueado, localAtual.motivo)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    onResult(localAtual.bloqueado, localAtual.motivo)
+                }
+            }
+        } else {
+            onResult(localAtual.bloqueado, localAtual.motivo)
+        }
+    }
+}
+
+// Carrega todos os clientes (MS e CP) + status atual para o Painel Admin SSD
+fun carregarTodosPerfisAdmin(
+    context: Context,
+    client: Client,
+    onComplete: (List<PerfilAdminInfo>, String?) -> Unit
+) {
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsReg ->
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "STATUS_COFRE") { msgsStatus ->
+                            buscarHistoricoPaginado(client, chatObj.id, 0L, 25, mutableListOf()) { msgsHist ->
+                                NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                    try {
+                                        val todas = (msgsReg + msgsStatus + msgsHist).distinctBy { it.id }
+                                        val ordenadas = todas.sortedWith(
+                                            compareByDescending<TdApi.Message> { it.date }.thenByDescending { it.id }
+                                        )
+                                        val mapaStatus = extrairStatusCofreDasMensagens(ordenadas)
+                                        val mapaPerfis = mutableMapOf<String, PerfilAdminInfo>()
+
+                                        for (msg in ordenadas) {
+                                            val texto = when (val c = msg.content) {
+                                                is TdApi.MessageText -> c.text?.text ?: ""
+                                                is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                                is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                                else -> ""
+                                            }
+                                            if (texto.contains("[REGISTO_COFRE]")) {
+                                                val partes = texto.split("|").map { it.trim() }
+                                                val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim() ?: ""
+                                                val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()?.uppercase(Locale.ROOT) ?: "MS"
+                                                val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull() ?: 0L
+
+                                                val chave = normalizarUsuario(userPart ?: nomePart ?: "")
+                                                val exibicao = (nomePart ?: userPart ?: "").trim()
+                                                if (chave.isNotBlank() && exibicao.isNotBlank() && !mapaPerfis.containsKey(chave)) {
+                                                    val st = mapaStatus[chave]
+                                                    if (st != null) {
+                                                        salvarStatusCofreLocal(context, chave, st.bloqueado, st.motivo, st.atualizadoEm)
+                                                    }
+                                                    mapaPerfis[chave] = PerfilAdminInfo(
+                                                        chaveUsuario = chave,
+                                                        nomeExibicao = exibicao,
+                                                        pinAtual = pinPart,
+                                                        modo = if (modePart == "CP") "CP" else "MS",
+                                                        chatIdCanal = chatPart,
+                                                        bloqueado = st?.bloqueado ?: false,
+                                                        motivoBloqueio = st?.motivo ?: "",
+                                                        ultimaAtualizacao = st?.atualizadoEm ?: msg.date.toLong()
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        val listaFinal = mapaPerfis.values.sortedBy { it.nomeExibicao.lowercase(Locale.ROOT) }
+                                        withContext(Dispatchers.Main) {
+                                            onComplete(listaFinal, null)
+                                        }
+                                    } catch (e: Throwable) {
+                                        withContext(Dispatchers.Main) {
+                                            onComplete(emptyList(), "Erro ao carregar perfis: ${e.message}")
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    onComplete(emptyList(), "Não foi possível abrir a conta central SSD.")
+                }
+            }
+        } else {
+            onComplete(emptyList(), "Sessão SSD indisponível.")
+        }
+    }
+}
+
+// Envia comando remoto de BLOQUEIO ou DESBLOQUEIO via [STATUS_COFRE]
+fun enviarComandoStatusAdmin(
+    context: Context,
+    client: Client,
+    chaveUsuario: String,
+    bloquear: Boolean,
+    motivo: String,
+    onComplete: (Boolean, String) -> Unit
+) {
+    val chave = normalizarUsuario(chaveUsuario)
+    if (chave.isBlank()) {
+        onComplete(false, "Utilizador inválido.")
+        return
+    }
+    val motivoLimpo = motivo.trim().replace("|", "-").replace("\n", " ")
+        .ifBlank { if (bloquear) "Mensalidade pendente" else "" }
+
+    val textoTag = if (bloquear) {
+        "🚫 [STATUS_COFRE] | USER:$chave | STATUS:BLOQUEADO | MOTIVO:$motivoLimpo"
+    } else {
+        "✅ [STATUS_COFRE] | USER:$chave | STATUS:ATIVO | MOTIVO:"
+    }
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    val req = TdApi.SendMessage().apply {
+                        this.chatId = chatObj.id
+                        this.inputMessageContent = TdApi.InputMessageText().apply {
+                            this.text = TdApi.FormattedText(textoTag, emptyArray())
+                        }
+                    }
+                    client.send(req) { resp ->
+                        if (resp is TdApi.Error) {
+                            onComplete(false, "Erro SSD (${resp.code}): ${resp.message}")
+                        } else {
+                            salvarStatusCofreLocal(context, chave, bloquear, if (bloquear) motivoLimpo else "")
+                            val msgOk = if (bloquear) "Cofre '$chave' bloqueado com sucesso!" else "Cofre '$chave' desbloqueado!"
+                            onComplete(true, msgOk)
+                        }
+                    }
+                } else {
+                    onComplete(false, "Falha ao conectar às Mensagens Salvas.")
+                }
+            }
+        } else {
+            onComplete(false, "Sessão SSD indisponível.")
+        }
+    }
+}
+
+// Altera o PIN do cliente remotamente a partir do Painel Admin
+fun alterarPinClienteAdmin(
+    context: Context,
+    client: Client,
+    perfil: PerfilAdminInfo,
+    novoPin: String,
+    onComplete: (Boolean, String) -> Unit
+) {
+    val pinLimpo = novoPin.trim()
+    if (pinLimpo.length < 4 || pinLimpo.length > 6) {
+        onComplete(false, "O PIN deve ter entre 4 e 6 dígitos.")
+        return
+    }
+    val regTexto = "🔒 [REGISTO_COFRE] | USER:${perfil.chaveUsuario} | NOME:${perfil.nomeExibicao.trim()} | PIN:$pinLimpo | MODE:${perfil.modo} | CHAT:${perfil.chatIdCanal}"
+
+    client.send(TdApi.GetMe()) { meObj ->
+        if (meObj is TdApi.User) {
+            client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
+                if (chatObj is TdApi.Chat) {
+                    val req = TdApi.SendMessage().apply {
+                        this.chatId = chatObj.id
+                        this.inputMessageContent = TdApi.InputMessageText().apply {
+                            this.text = TdApi.FormattedText(regTexto, emptyArray())
+                        }
+                    }
+                    client.send(req) { resp ->
+                        if (resp is TdApi.Error) {
+                            onComplete(false, "Erro SSD (${resp.code}): ${resp.message}")
+                        } else {
+                            if (perfil.modo == "CP" && perfil.chatIdCanal != 0L) {
+                                val reqCanal = TdApi.SendMessage().apply {
+                                    this.chatId = perfil.chatIdCanal
+                                    this.inputMessageContent = TdApi.InputMessageText().apply {
+                                        this.text = TdApi.FormattedText(regTexto, emptyArray())
+                                    }
+                                }
+                                client.send(reqCanal) {}
+                            }
+                            salvarCredenciaisCofreLocal(
+                                context = context,
+                                nomeOriginal = perfil.nomeExibicao,
+                                pin = pinLimpo,
+                                definirComoAtivo = false,
+                                modoArmazenamento = perfil.modo,
+                                canalChatId = perfil.chatIdCanal
+                            )
+                            onComplete(true, "PIN de '${perfil.nomeExibicao}' atualizado para $pinLimpo!")
+                        }
+                    }
+                } else {
+                    onComplete(false, "Falha ao conectar à nuvem SSD.")
+                }
+            }
+        } else {
+            onComplete(false, "Sessão SSD indisponível.")
+        }
+    }
 }
 
 // === GESTÃO DE COFRES HÍBRIDOS (MS = MENSAGENS SALVAS | CP = CANAL PRIVADO) ===
@@ -1968,7 +2306,7 @@ fun buscarHistoricoPaginado(
     }
 }
 
-// Sincroniza silenciosamente os PINs, modos (MS/CP) e IDs de canais existentes
+// Sincroniza silenciosamente os PINs, modos (MS/CP), IDs de canais e status de bloqueio [STATUS_COFRE]
 fun descobrirPerfisExistentesNaNuvem(
     context: Context,
     client: Client,
@@ -1979,47 +2317,56 @@ fun descobrirPerfisExistentesNaNuvem(
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
                     buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsBusca ->
-                        buscarHistoricoPaginado(client, chatObj.id, 0L, 10, mutableListOf()) { msgsHist ->
-                            NexusBackgroundScope.scope.launch(Dispatchers.IO) {
-                                val todas = (msgsBusca + msgsHist).distinctBy { it.id }
-                                val nomesEncontrados = mutableMapOf<String, String>()
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "STATUS_COFRE") { msgsStatus ->
+                            buscarHistoricoPaginado(client, chatObj.id, 0L, 12, mutableListOf()) { msgsHist ->
+                                NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                    val todas = (msgsBusca + msgsStatus + msgsHist).distinctBy { it.id }
+                                    val ordenadas = todas.sortedWith(
+                                        compareByDescending<TdApi.Message> { it.date }.thenByDescending { it.id }
+                                    )
 
-                                for (msg in todas) {
-                                    val texto = when (val c = msg.content) {
-                                        is TdApi.MessageText -> c.text?.text ?: ""
-                                        is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                        is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                        else -> ""
+                                    // Aplica primeiro todos os status remotos mais recentes (trava anti-offline)
+                                    val mapaStatus = extrairStatusCofreDasMensagens(ordenadas)
+                                    mapaStatus.forEach { (chaveUser, st) ->
+                                        salvarStatusCofreLocal(context, chaveUser, st.bloqueado, st.motivo, st.atualizadoEm)
                                     }
-                                    if (texto.contains("[REGISTO_COFRE]")) {
-                                        val partes = texto.split("|").map { it.trim() }
-                                        val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                        val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
 
-                                        val chave = normalizarUsuario(userPart ?: nomePart ?: "")
-                                        val exibicao = (nomePart ?: userPart ?: "").trim()
-                                        if (chave.isNotBlank() && exibicao.isNotBlank()) {
-                                            if (!nomesEncontrados.containsKey(chave)) {
+                                    val nomesEncontrados = mutableMapOf<String, String>()
+                                    for (msg in ordenadas) {
+                                        val texto = when (val c = msg.content) {
+                                            is TdApi.MessageText -> c.text?.text ?: ""
+                                            is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                            is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                            else -> ""
+                                        }
+                                        if (texto.contains("[REGISTO_COFRE]")) {
+                                            val partes = texto.split("|").map { it.trim() }
+                                            val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                            val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
+
+                                            val chave = normalizarUsuario(userPart ?: nomePart ?: "")
+                                            val exibicao = (nomePart ?: userPart ?: "").trim()
+                                            if (chave.isNotBlank() && exibicao.isNotBlank() && !nomesEncontrados.containsKey(chave)) {
                                                 nomesEncontrados[chave] = exibicao
-                                            }
-                                            if (!pinPart.isNullOrBlank()) {
-                                                salvarCredenciaisCofreLocal(
-                                                    context = context,
-                                                    nomeOriginal = exibicao,
-                                                    pin = pinPart,
-                                                    definirComoAtivo = false,
-                                                    modoArmazenamento = modePart,
-                                                    canalChatId = chatPart
-                                                )
+                                                if (!pinPart.isNullOrBlank()) {
+                                                    salvarCredenciaisCofreLocal(
+                                                        context = context,
+                                                        nomeOriginal = exibicao,
+                                                        pin = pinPart,
+                                                        definirComoAtivo = false,
+                                                        modoArmazenamento = modePart,
+                                                        canalChatId = chatPart
+                                                    )
+                                                }
                                             }
                                         }
                                     }
-                                }
 
-                                onFound(nomesEncontrados.values.toList())
+                                    onFound(nomesEncontrados.values.toList())
+                                }
                             }
                         }
                     }
@@ -2029,7 +2376,7 @@ fun descobrirPerfisExistentesNaNuvem(
     }
 }
 
-// Verifica ou regista o cofre com suporte híbrido a MS (Mensagens Salvas) e CP (Canal Privado)
+// Verifica ou regista o cofre com suporte híbrido a MS/CP e checagem de bloqueio [STATUS_COFRE]
 fun verificarOuRegistarCofreNuvem(
     context: Context,
     client: Client,
@@ -2050,131 +2397,160 @@ fun verificarOuRegistarCofreNuvem(
             client.send(TdApi.CreatePrivateChat(meObj.id, false)) { chatObj ->
                 if (chatObj is TdApi.Chat) {
                     buscarMensagensPorTermoNaNuvem(client, chatObj.id, "REGISTO_COFRE") { msgsRegisto ->
-                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeUsuario.trim()) { msgsUsuario ->
-                            buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
-                                NexusBackgroundScope.scope.launch(Dispatchers.IO) {
-                                    val todasMensagens = (msgsRegisto + msgsUsuario + msgsHistorico).distinctBy { it.id }
+                        buscarMensagensPorTermoNaNuvem(client, chatObj.id, "STATUS_COFRE") { msgsStatus ->
+                            buscarMensagensPorTermoNaNuvem(client, chatObj.id, nomeUsuario.trim()) { msgsUsuario ->
+                                buscarHistoricoPaginado(client, chatObj.id, 0L, 15, mutableListOf()) { msgsHistorico ->
+                                    NexusBackgroundScope.scope.launch(Dispatchers.IO) {
+                                        val todasMensagens = (msgsRegisto + msgsStatus + msgsUsuario + msgsHistorico)
+                                            .distinctBy { it.id }
+                                            .sortedWith(compareByDescending<TdApi.Message> { it.date }.thenByDescending { it.id })
 
-                                    var pinEncontrado: String? = null
-                                    var nomeOriginalEncontrado = nomeUsuario.trim()
-                                    var modoEncontrado = "MS"
-                                    var chatIdCanalEncontrado = 0L
-                                    var temArquivosDoUsuarioNaNuvem = false
-
-                                    for (msg in todasMensagens) {
-                                        val texto = when (val c = msg.content) {
-                                            is TdApi.MessageText -> c.text?.text ?: ""
-                                            is TdApi.MessageDocument -> c.caption?.text ?: ""
-                                            is TdApi.MessageAudio -> c.caption?.text ?: ""
-                                            is TdApi.MessagePhoto -> c.caption?.text ?: ""
-                                            is TdApi.MessageVideo -> c.caption?.text ?: ""
-                                            else -> ""
+                                        val mapaStatus = extrairStatusCofreDasMensagens(todasMensagens)
+                                        val statusRemoto = mapaStatus[chaveDesejada]
+                                        if (statusRemoto != null) {
+                                            salvarStatusCofreLocal(
+                                                context,
+                                                chaveDesejada,
+                                                statusRemoto.bloqueado,
+                                                statusRemoto.motivo,
+                                                statusRemoto.atualizadoEm
+                                            )
                                         }
 
-                                        if (texto.contains("[REGISTO_COFRE]") && pinEncontrado == null) {
-                                            val partes = texto.split("|").map { it.trim() }
-                                            val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                            val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                            val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                            val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
-                                            val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
+                                        var pinEncontrado: String? = null
+                                        var nomeOriginalEncontrado = nomeUsuario.trim()
+                                        var modoEncontrado = "MS"
+                                        var chatIdCanalEncontrado = 0L
+                                        var temArquivosDoUsuarioNaNuvem = false
 
-                                            val chaveMsg = normalizarUsuario(userPart ?: nomePart ?: "")
-                                            if (chaveMsg == chaveDesejada && !pinPart.isNullOrBlank()) {
-                                                pinEncontrado = pinPart
-                                                if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
-                                                if (!modePart.isNullOrBlank()) modoEncontrado = modePart.uppercase(Locale.ROOT)
-                                                if (chatPart != null && chatPart != 0L) chatIdCanalEncontrado = chatPart
+                                        for (msg in todasMensagens) {
+                                            val texto = when (val c = msg.content) {
+                                                is TdApi.MessageText -> c.text?.text ?: ""
+                                                is TdApi.MessageDocument -> c.caption?.text ?: ""
+                                                is TdApi.MessageAudio -> c.caption?.text ?: ""
+                                                is TdApi.MessagePhoto -> c.caption?.text ?: ""
+                                                is TdApi.MessageVideo -> c.caption?.text ?: ""
+                                                else -> ""
                                             }
-                                        }
 
-                                        if (msg.content is TdApi.MessageDocument ||
-                                            msg.content is TdApi.MessageAudio ||
-                                            msg.content is TdApi.MessagePhoto ||
-                                            msg.content is TdApi.MessageVideo
-                                        ) {
-                                            if (texto.contains("👤 [$chaveDesejada]", ignoreCase = true) ||
-                                                texto.contains("👤 [${nomeUsuario.trim()}]", ignoreCase = true)
+                                            if (texto.contains("[REGISTO_COFRE]") && pinEncontrado == null) {
+                                                val partes = texto.split("|").map { it.trim() }
+                                                val userPart = partes.firstOrNull { it.startsWith("USER:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val nomePart = partes.firstOrNull { it.startsWith("NOME:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val pinPart = partes.firstOrNull { it.startsWith("PIN:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val modePart = partes.firstOrNull { it.startsWith("MODE:", ignoreCase = true) }?.substringAfter(":")?.trim()
+                                                val chatPart = partes.firstOrNull { it.startsWith("CHAT:", ignoreCase = true) }?.substringAfter(":")?.trim()?.toLongOrNull()
+
+                                                val chaveMsg = normalizarUsuario(userPart ?: nomePart ?: "")
+                                                if (chaveMsg == chaveDesejada && !pinPart.isNullOrBlank()) {
+                                                    pinEncontrado = pinPart
+                                                    if (!nomePart.isNullOrBlank()) nomeOriginalEncontrado = nomePart
+                                                    if (!modePart.isNullOrBlank()) modoEncontrado = modePart.uppercase(Locale.ROOT)
+                                                    if (chatPart != null && chatPart != 0L) chatIdCanalEncontrado = chatPart
+                                                }
+                                            }
+
+                                            if (msg.content is TdApi.MessageDocument ||
+                                                msg.content is TdApi.MessageAudio ||
+                                                msg.content is TdApi.MessagePhoto ||
+                                                msg.content is TdApi.MessageVideo
                                             ) {
-                                                temArquivosDoUsuarioNaNuvem = true
-                                                val extraido = texto.substringAfter("👤 [", "").substringBefore("]", "").trim()
-                                                if (extraido.isNotBlank() && nomeOriginalEncontrado.equals(nomeUsuario.trim(), ignoreCase = true)) {
-                                                    nomeOriginalEncontrado = extraido
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    fun gravarRegistoNaNuvem(
-                                        nomeConfirmado: String,
-                                        modoFinal: String,
-                                        chatIdCanal: Long,
-                                        mensagemSucesso: String
-                                    ) {
-                                        val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeConfirmado.trim()} | PIN:$pinLimpo | MODE:$modoFinal | CHAT:$chatIdCanal"
-                                        val msgContent = TdApi.InputMessageText().apply {
-                                            text = TdApi.FormattedText(regTexto, emptyArray())
-                                        }
-                                        val sendReq = TdApi.SendMessage().apply {
-                                            this.chatId = chatObj.id
-                                            this.inputMessageContent = msgContent
-                                        }
-                                        client.send(sendReq) {
-                                            if (modoFinal == "CP" && chatIdCanal != 0L) {
-                                                val sendCanal = TdApi.SendMessage().apply {
-                                                    this.chatId = chatIdCanal
-                                                    this.inputMessageContent = TdApi.InputMessageText().apply {
-                                                        text = TdApi.FormattedText(regTexto, emptyArray())
-                                                    }
-                                                }
-                                                client.send(sendCanal) {}
-                                            }
-                                            onResult(true, nomeConfirmado.trim(), modoFinal, chatIdCanal, mensagemSucesso)
-                                        }
-                                    }
-
-                                    if (modoCriarNovo) {
-                                        when {
-                                            pinEncontrado != null && pinEncontrado == pinLimpo -> {
-                                                onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre existente ($modoEncontrado) reconhecido e restaurado!")
-                                            }
-                                            pinEncontrado != null && pinEncontrado != pinLimpo -> {
-                                                onResult(false, "", modoEncontrado, 0L, "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
-                                            }
-                                            temArquivosDoUsuarioNaNuvem -> {
-                                                gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Perfil existente (MS) vinculado e restaurado!")
-                                            }
-                                            modoDesejado == "CP" -> {
-                                                criarCanalPrivadoTDLib(client, nomeUsuario.trim()) { novoCanalId, erroCanal ->
-                                                    if (novoCanalId != 0L) {
-                                                        gravarRegistoNaNuvem(
-                                                            nomeConfirmado = nomeUsuario.trim(),
-                                                            modoFinal = "CP",
-                                                            chatIdCanal = novoCanalId,
-                                                            mensagemSucesso = "Cofre SSD em Canal Privado (CP) criado com sucesso!"
-                                                        )
-                                                    } else {
-                                                        onResult(false, "", "CP", 0L, erroCanal ?: "Falha ao criar Canal Privado (CP). Tente o modo MS.")
+                                                if (texto.contains("👤 [$chaveDesejada]", ignoreCase = true) ||
+                                                    texto.contains("👤 [${nomeUsuario.trim()}]", ignoreCase = true)
+                                                ) {
+                                                    temArquivosDoUsuarioNaNuvem = true
+                                                    val extraido = texto.substringAfter("👤 [", "").substringBefore("]", "").trim()
+                                                    if (extraido.isNotBlank() && nomeOriginalEncontrado.equals(nomeUsuario.trim(), ignoreCase = true)) {
+                                                        nomeOriginalEncontrado = extraido
                                                     }
                                                 }
                                             }
-                                            else -> {
-                                                gravarRegistoNaNuvem(nomeUsuario.trim(), "MS", 0L, "Cofre SSD em Mensagens Salvas (MS) criado com sucesso!")
+                                        }
+
+                                        // Se o perfil já existe e está bloqueado pelo admin, barra antes de liberar
+                                        val statusEfetivo = statusRemoto ?: obterStatusCofreLocal(context, chaveDesejada)
+                                        if (statusEfetivo.bloqueado && (pinEncontrado != null || temArquivosDoUsuarioNaNuvem || !modoCriarNovo)) {
+                                            onResult(
+                                                false,
+                                                nomeOriginalEncontrado,
+                                                modoEncontrado,
+                                                chatIdCanalEncontrado,
+                                                "BLOQUEADO::${statusEfetivo.motivo.ifBlank { "Acesso temporariamente suspenso." }}"
+                                            )
+                                            return@launch
+                                        }
+
+                                        fun gravarRegistoNaNuvem(
+                                            nomeConfirmado: String,
+                                            modoFinal: String,
+                                            chatIdCanal: Long,
+                                            mensagemSucesso: String
+                                        ) {
+                                            val regTexto = "🔒 [REGISTO_COFRE] | USER:$chaveDesejada | NOME:${nomeConfirmado.trim()} | PIN:$pinLimpo | MODE:$modoFinal | CHAT:$chatIdCanal"
+                                            val msgContent = TdApi.InputMessageText().apply {
+                                                text = TdApi.FormattedText(regTexto, emptyArray())
+                                            }
+                                            val sendReq = TdApi.SendMessage().apply {
+                                                this.chatId = chatObj.id
+                                                this.inputMessageContent = msgContent
+                                            }
+                                            client.send(sendReq) {
+                                                if (modoFinal == "CP" && chatIdCanal != 0L) {
+                                                    val sendCanal = TdApi.SendMessage().apply {
+                                                        this.chatId = chatIdCanal
+                                                        this.inputMessageContent = TdApi.InputMessageText().apply {
+                                                            text = TdApi.FormattedText(regTexto, emptyArray())
+                                                        }
+                                                    }
+                                                    client.send(sendCanal) {}
+                                                }
+                                                onResult(true, nomeConfirmado.trim(), modoFinal, chatIdCanal, mensagemSucesso)
                                             }
                                         }
-                                    } else {
-                                        when {
-                                            pinEncontrado != null && pinEncontrado == pinLimpo -> {
-                                                onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre SSD ($modoEncontrado) desbloqueado!")
+
+                                        if (modoCriarNovo) {
+                                            when {
+                                                pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                                    onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre existente ($modoEncontrado) reconhecido e restaurado!")
+                                                }
+                                                pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                                    onResult(false, "", modoEncontrado, 0L, "Este perfil já existe na nuvem SSD! Digite o PIN correto ou escolha outro nome.")
+                                                }
+                                                temArquivosDoUsuarioNaNuvem -> {
+                                                    gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Perfil existente (MS) vinculado e restaurado!")
+                                                }
+                                                modoDesejado == "CP" -> {
+                                                    criarCanalPrivadoTDLib(client, nomeUsuario.trim()) { novoCanalId, erroCanal ->
+                                                        if (novoCanalId != 0L) {
+                                                            gravarRegistoNaNuvem(
+                                                                nomeConfirmado = nomeUsuario.trim(),
+                                                                modoFinal = "CP",
+                                                                chatIdCanal = novoCanalId,
+                                                                mensagemSucesso = "Cofre SSD em Canal Privado (CP) criado com sucesso!"
+                                                            )
+                                                        } else {
+                                                            onResult(false, "", "CP", 0L, erroCanal ?: "Falha ao criar Canal Privado (CP). Tente o modo MS.")
+                                                        }
+                                                    }
+                                                }
+                                                else -> {
+                                                    gravarRegistoNaNuvem(nomeUsuario.trim(), "MS", 0L, "Cofre SSD em Mensagens Salvas (MS) criado com sucesso!")
+                                                }
                                             }
-                                            pinEncontrado != null && pinEncontrado != pinLimpo -> {
-                                                onResult(false, "", modoEncontrado, 0L, "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
-                                            }
-                                            temArquivosDoUsuarioNaNuvem -> {
-                                                gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Cofre '$nomeOriginalEncontrado' (MS) reconhecido na nuvem SSD!")
-                                            }
-                                            else -> {
-                                                onResult(false, "", "MS", 0L, "Cofre '${nomeUsuario.trim()}' não encontrado na nuvem SSD. Verifique o nome ou use 'CRIAR COFRE'.")
+                                        } else {
+                                            when {
+                                                pinEncontrado != null && pinEncontrado == pinLimpo -> {
+                                                    onResult(true, nomeOriginalEncontrado, modoEncontrado, chatIdCanalEncontrado, "Cofre SSD ($modoEncontrado) desbloqueado!")
+                                                }
+                                                pinEncontrado != null && pinEncontrado != pinLimpo -> {
+                                                    onResult(false, "", modoEncontrado, 0L, "PIN incorreto para o utilizador '$nomeOriginalEncontrado'.")
+                                                }
+                                                temArquivosDoUsuarioNaNuvem -> {
+                                                    gravarRegistoNaNuvem(nomeOriginalEncontrado, "MS", 0L, "Cofre '$nomeOriginalEncontrado' (MS) reconhecido na nuvem SSD!")
+                                                }
+                                                else -> {
+                                                    onResult(false, "", "MS", 0L, "Cofre '${nomeUsuario.trim()}' não encontrado na nuvem SSD. Verifique o nome ou use 'CRIAR COFRE'.")
+                                                }
                                             }
                                         }
                                     }
@@ -2923,7 +3299,6 @@ fun sincronizarCofreDaNuvem(
 
             client.send(TdApi.GetChat(chatObj.id)) {
                 if (modoReal == "CP") {
-                    // Modo CP: vai direto para o histórico do Canal Privado (muito mais rápido e sem sobrecarga)
                     NexusLeituraNuvem.iniciar(1, "Lendo cofre CP de $usuarioAtivo...")
                     buscarHistoricoPaginado(
                         client = client,
@@ -2938,7 +3313,6 @@ fun sincronizarCofreDaNuvem(
                         processarMensagensEmLoteIO(msgsHistorico, "CP")
                     }
                 } else {
-                    // Modo MS: busca pelas etiquetas do perfil + metadados de pastas + histórico paginado
                     NexusLeituraNuvem.iniciar(1, "Lendo cofre MS de $usuarioAtivo...")
                     buscarMensagensPorTermoNaNuvem(client, chatObj.id, tagPerfil) { msgsTag ->
                         buscarMensagensPorTermoNaNuvem(client, chatObj.id, "SYNC_PASTA") { msgsSyncPasta ->
@@ -4070,7 +4444,6 @@ fun GrelhaArquivos(
             .groupBy { formatarDataCabecalhoGaleria(it.dataUpload) }
     }
 
-    // Mapeia cada índice da grade para sua data (alimenta o balão flutuante da barra lateral)
     val indicesParaData = remember(gruposPorData) {
         val mapa = ArrayList<String>()
         gruposPorData.forEach { (dataCabecalho, arquivosDoDia) ->
@@ -4172,7 +4545,6 @@ fun GrelhaArquivos(
                         miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
                     }
 
-                    // Preview leve (220x220 + RGB_565 = quase 4x menos RAM) com transição suave de 160ms
                     val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura) {
                         if (temArquivoMiniatura && thumbSafe.isNotBlank()) {
                             val targetUri = obterUriCapaMidia(thumbSafe)
@@ -4188,7 +4560,6 @@ fun GrelhaArquivos(
                         } else null
                     }
 
-                    // Pausa de 150ms impede disparos inúteis de download ao arrastar rápido na barra lateral
                     LaunchedEffect(arq.dataUpload, temArquivoMiniatura) {
                         if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
                             delay(150)
@@ -4362,7 +4733,6 @@ fun GrelhaArquivos(
         if (totalItensGrid > 15) {
             val thumbOffsetY = (thumbFraction * usableTrackPx).toInt()
 
-            // Balão flutuante com a data enquanto você arrasta a barra lateral
             if (isDraggingScrollbar && dataAtualArrasto.isNotBlank()) {
                 Box(
                     modifier = Modifier
@@ -4382,20 +4752,12 @@ fun GrelhaArquivos(
                 }
             }
 
-            // Trilha interativa na borda direita (toque para pular ou arraste para voar entre topo e fim)
             Box(
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
                     .width(34.dp)
                     .fillMaxHeight()
                     .pointerInput(totalItensGrid, usableTrackPx) {
-                        detectTapGestures { offset ->
-                            val frac = ((offset.y - thumbHeightPx / 2f) / usableTrackPx).coerceIn(0f, 1f)
-                            val target = (frac * (totalItensGrid - 1)).toInt().coerceIn(0, totalItensGrid - 1)
-                            scopeGrid.launch { gridState.scrollToItem(target) }
-                        }
-                    }
-            .pointerInput(totalItensGrid, usableTrackPx) {
                         try {
                             awaitPointerEventScope {
                                 var lastTarget = -1
@@ -4436,7 +4798,6 @@ fun GrelhaArquivos(
                     )
                 }
 
-                // Alça dourada arrastável
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
@@ -4472,7 +4833,7 @@ fun GrelhaArquivos(
     }
 }
 // === FIM DA PARTE 2 DE 3 ===
-// === CONTINUAÇÃO: PARTE 3 DE 3 (COLE LOGO ABAIXO DA PARTE 2) ===
+// === CONTINUAÇÃO: PARTE 3 DE 4 (COLE LOGO ABAIXO DA PARTE 2) ===
 
 private data class ResultadoEnvioSSD(
     val ok: Boolean,
@@ -4501,6 +4862,588 @@ private fun gerarNomeUnicoNoLote(
             return candidato
         }
         contador++
+    }
+}
+
+// === PAINEL ADMIN EMBUTIDO SSD (BLOQUEIO, DESBLOQUEIO E TROCA DE PIN REMOTO) ===
+@Composable
+fun PainelAdminSSD(
+    context: Context,
+    client: Client,
+    onSair: () -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var listaPerfis by remember { mutableStateOf<List<PerfilAdminInfo>>(emptyList()) }
+    var carregando by remember { mutableStateOf(true) }
+    var erroMsg by remember { mutableStateOf<String?>(null) }
+    var buscaAdmin by remember { mutableStateOf("") }
+    var processandoAcao by remember { mutableStateOf(false) }
+
+    var perfilParaBloquear by remember { mutableStateOf<PerfilAdminInfo?>(null) }
+    var motivoBloqueioInput by remember { mutableStateOf("Mensalidade pendente") }
+
+    var perfilParaTrocarPin by remember { mutableStateOf<PerfilAdminInfo?>(null) }
+    var novoPinInput by remember { mutableStateOf("") }
+
+    fun recarregarPerfis() {
+        carregando = true
+        erroMsg = null
+        carregarTodosPerfisAdmin(context, client) { perfis, erro ->
+            listaPerfis = perfis
+            erroMsg = erro
+            carregando = false
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        recarregarPerfis()
+    }
+
+    val perfisFiltrados = remember(listaPerfis, buscaAdmin) {
+        if (buscaAdmin.isBlank()) listaPerfis
+        else listaPerfis.filter {
+            it.nomeExibicao.contains(buscaAdmin, ignoreCase = true) ||
+                it.chaveUsuario.contains(buscaAdmin, ignoreCase = true) ||
+                it.modo.contains(buscaAdmin, ignoreCase = true)
+        }
+    }
+
+    val totalPerfis = listaPerfis.size
+    val totalBloqueados = listaPerfis.count { it.bloqueado }
+    val totalAtivos = totalPerfis - totalBloqueados
+    val verdeAtivo = Color(0xFF2ECC71)
+
+    // Diálogo para escolher motivo e confirmar bloqueio
+    if (perfilParaBloquear != null) {
+        val alvo = perfilParaBloquear!!
+        Dialog(onDismissRequest = { if (!processandoAcao) perfilParaBloquear = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.5.dp, DangerRed),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(22.dp)) {
+                    Text("BLOQUEAR COFRE", color = DangerRed, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("Cliente: ${alvo.nomeExibicao} [${alvo.modo}]", color = Gold, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Motivos rápidos:", color = TextGrey, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(6.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OutlinedButton(
+                            onClick = { motivoBloqueioInput = "Mensalidade pendente" },
+                            border = BorderStroke(1.dp, Gold),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.weight(1f).height(34.dp)
+                        ) {
+                            Text("Mensalidade", color = Color.White, fontSize = 10.sp, maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = { motivoBloqueioInput = "Manutenção programada" },
+                            border = BorderStroke(1.dp, Gold),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            modifier = Modifier.weight(1f).height(34.dp)
+                        ) {
+                            Text("Manutenção", color = Color.White, fontSize = 10.sp, maxLines = 1)
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = motivoBloqueioInput,
+                        onValueChange = { motivoBloqueioInput = it.replace("\n", "").take(90) },
+                        label = { Text("Mensagem exibida ao cliente", color = TextGrey, fontSize = 11.sp) },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { if (!processandoAcao) perfilParaBloquear = null },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CANCELAR", color = Color.White, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = {
+                                processandoAcao = true
+                                enviarComandoStatusAdmin(
+                                    context = context,
+                                    client = client,
+                                    chaveUsuario = alvo.chaveUsuario,
+                                    bloquear = true,
+                                    motivo = motivoBloqueioInput
+                                ) { ok, msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        processandoAcao = false
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                        if (ok) {
+                                            val mot = motivoBloqueioInput.trim().ifBlank { "Mensalidade pendente" }
+                                            listaPerfis = listaPerfis.map { p ->
+                                                if (p.chaveUsuario == alvo.chaveUsuario) p.copy(bloqueado = true, motivoBloqueio = mot)
+                                                else p
+                                            }
+                                            perfilParaBloquear = null
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !processandoAcao,
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            modifier = Modifier.weight(1.2f)
+                        ) {
+                            if (processandoAcao) {
+                                CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                            } else {
+                                Text("CONFIRMAR", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Diálogo para alterar o PIN de um cliente remotamente
+    if (perfilParaTrocarPin != null) {
+        val alvoPin = perfilParaTrocarPin!!
+        Dialog(onDismissRequest = { if (!processandoAcao) perfilParaTrocarPin = null }) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = SurfaceDarker,
+                border = BorderStroke(1.5.dp, Gold),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(Modifier.padding(22.dp)) {
+                    Text("ALTERAR PIN DO CLIENTE", color = Gold, fontWeight = FontWeight.Black, fontSize = 17.sp)
+                    Spacer(Modifier.height(4.dp))
+                    Text("Cliente: ${alvoPin.nomeExibicao} [${alvoPin.modo}]", color = Color.White, fontSize = 13.sp)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = novoPinInput,
+                        onValueChange = { if (it.length <= 6) novoPinInput = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Novo PIN (4 a 6 dígitos)", color = TextGrey) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = Gold,
+                            unfocusedBorderColor = Color.Gray
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(
+                            onClick = { if (!processandoAcao) perfilParaTrocarPin = null },
+                            border = BorderStroke(1.dp, TextGrey),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("CANCELAR", color = Color.White, fontSize = 11.sp)
+                        }
+                        Button(
+                            onClick = {
+                                processandoAcao = true
+                                alterarPinClienteAdmin(context, client, alvoPin, novoPinInput) { ok, msg ->
+                                    scope.launch(Dispatchers.Main) {
+                                        processandoAcao = false
+                                        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                        if (ok) {
+                                            val pLimpo = novoPinInput.trim()
+                                            listaPerfis = listaPerfis.map { p ->
+                                                if (p.chaveUsuario == alvoPin.chaveUsuario) p.copy(pinAtual = pLimpo)
+                                                else p
+                                            }
+                                            perfilParaTrocarPin = null
+                                        }
+                                    }
+                                }
+                            },
+                            enabled = !processandoAcao && novoPinInput.length >= 4,
+                            colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                            modifier = Modifier.weight(1.2f)
+                        ) {
+                            if (processandoAcao) {
+                                CircularProgressIndicator(color = BgBlack, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                            } else {
+                                Text("SALVAR PIN", color = BgBlack, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgBlack)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        // Cabeçalho do Painel Admin
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Lock, null, tint = Gold, modifier = Modifier.size(28.dp))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("PAINEL ADMIN SSD", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Text("Controle Remoto de Cofres (MS & CP)", color = TextGrey, fontSize = 11.sp)
+            }
+            IconButton(onClick = { if (!carregando) recarregarPerfis() }) {
+                Icon(Icons.Default.Refresh, contentDescription = "Atualizar", tint = Gold)
+            }
+            IconButton(onClick = onSair) {
+                Icon(Icons.Default.Close, contentDescription = "Sair do Painel", tint = DangerRed)
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        // Resumo rápido de clientes
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(SurfaceDarker, RoundedCornerShape(14.dp))
+                .border(1.dp, Gold.copy(alpha = 0.35f), RoundedCornerShape(14.dp))
+                .padding(vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("$totalPerfis", color = Gold, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Text("Total", color = TextGrey, fontSize = 10.sp)
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("$totalAtivos", color = verdeAtivo, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Text("Ativos", color = TextGrey, fontSize = 10.sp)
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("$totalBloqueados", color = DangerRed, fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Text("Bloqueados", color = TextGrey, fontSize = 10.sp)
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        OutlinedTextField(
+            value = buscaAdmin,
+            onValueChange = { buscaAdmin = it.replace("\n", "").take(40) },
+            placeholder = { Text("Filtrar cliente por nome ou modo (MS/CP)...", color = TextGrey, fontSize = 12.sp) },
+            leadingIcon = { Icon(Icons.Default.Search, null, tint = Gold) },
+            trailingIcon = {
+                if (buscaAdmin.isNotBlank()) {
+                    IconButton(onClick = { buscaAdmin = "" }) {
+                        Icon(Icons.Default.Close, null, tint = TextGrey)
+                    }
+                }
+            },
+            singleLine = true,
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedBorderColor = Gold,
+                unfocusedBorderColor = SurfaceDark,
+                focusedContainerColor = SurfaceDarker,
+                unfocusedContainerColor = SurfaceDarker
+            ),
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        Spacer(Modifier.height(12.dp))
+
+        if (carregando) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Gold)
+                    Spacer(Modifier.height(12.dp))
+                    Text("Carregando cofres da nuvem SSD...", color = TextGrey, fontSize = 12.sp)
+                }
+            }
+        } else if (erroMsg != null) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.ErrorOutline, null, tint = DangerRed, modifier = Modifier.size(44.dp))
+                    Spacer(Modifier.height(8.dp))
+                    Text(erroMsg ?: "", color = DangerRed, fontSize = 12.sp, textAlign = TextAlign.Center)
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        onClick = { recarregarPerfis() },
+                        colors = ButtonDefaults.buttonColors(containerColor = Gold)
+                    ) {
+                        Text("TENTAR NOVAMENTE", color = BgBlack, fontWeight = FontWeight.Black)
+                    }
+                }
+            }
+        } else if (perfisFiltrados.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+                Text("Nenhum cofre encontrado.", color = TextGrey, fontSize = 13.sp)
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                perfisFiltrados.forEach { perfil ->
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = SurfaceDark,
+                        border = BorderStroke(
+                            1.dp,
+                            if (perfil.bloqueado) DangerRed.copy(alpha = 0.8f) else Gold.copy(alpha = 0.35f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Person,
+                                    null,
+                                    tint = if (perfil.bloqueado) DangerRed else Gold,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            perfil.nomeExibicao,
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Black,
+                                            fontSize = 15.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Box(
+                                            modifier = Modifier
+                                                .background(Gold.copy(alpha = 0.18f), RoundedCornerShape(5.dp))
+                                                .padding(horizontal = 6.dp, vertical = 1.dp)
+                                        ) {
+                                            Text(perfil.modo, color = Gold, fontSize = 10.sp, fontWeight = FontWeight.Black)
+                                        }
+                                    }
+                                    Text(
+                                        "PIN: ${perfil.pinAtual.ifBlank { "---" }}",
+                                        color = TextGrey,
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .background(
+                                            if (perfil.bloqueado) DangerRed.copy(alpha = 0.2f) else verdeAtivo.copy(alpha = 0.2f),
+                                            RoundedCornerShape(8.dp)
+                                        )
+                                        .border(
+                                            1.dp,
+                                            if (perfil.bloqueado) DangerRed else verdeAtivo,
+                                            RoundedCornerShape(8.dp)
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) {
+                                    Text(
+                                        if (perfil.bloqueado) "BLOQUEADO" else "ATIVO",
+                                        color = if (perfil.bloqueado) DangerRed else verdeAtivo,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                            }
+
+                            if (perfil.bloqueado && perfil.motivoBloqueio.isNotBlank()) {
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    "Motivo: ${perfil.motivoBloqueio}",
+                                    color = DangerRed,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            Spacer(Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                if (perfil.bloqueado) {
+                                    Button(
+                                        onClick = {
+                                            processandoAcao = true
+                                            enviarComandoStatusAdmin(
+                                                context = context,
+                                                client = client,
+                                                chaveUsuario = perfil.chaveUsuario,
+                                                bloquear = false,
+                                                motivo = ""
+                                            ) { ok, msg ->
+                                                scope.launch(Dispatchers.Main) {
+                                                    processandoAcao = false
+                                                    Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                                    if (ok) {
+                                                        listaPerfis = listaPerfis.map { p ->
+                                                            if (p.chaveUsuario == perfil.chaveUsuario) p.copy(bloqueado = false, motivoBloqueio = "")
+                                                            else p
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        enabled = !processandoAcao,
+                                        colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                                        modifier = Modifier.weight(1.4f).height(40.dp)
+                                    ) {
+                                        Icon(Icons.Default.CheckCircle, null, tint = BgBlack, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("DESBLOQUEAR", color = BgBlack, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = {
+                                            motivoBloqueioInput = "Mensalidade pendente"
+                                            perfilParaBloquear = perfil
+                                        },
+                                        enabled = !processandoAcao,
+                                        colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                                        modifier = Modifier.weight(1.4f).height(40.dp)
+                                    ) {
+                                        Icon(Icons.Default.Lock, null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("BLOQUEAR", color = Color.White, fontWeight = FontWeight.Black, fontSize = 11.sp)
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        novoPinInput = perfil.pinAtual
+                                        perfilParaTrocarPin = perfil
+                                    },
+                                    enabled = !processandoAcao,
+                                    border = BorderStroke(1.dp, Gold),
+                                    modifier = Modifier.weight(1f).height(40.dp)
+                                ) {
+                                    Icon(Icons.Default.Edit, null, tint = Gold, modifier = Modifier.size(15.dp))
+                                    Spacer(Modifier.width(4.dp))
+                                    Text("PIN", color = Gold, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+        OutlinedButton(
+            onClick = onSair,
+            border = BorderStroke(1.dp, Gold),
+            modifier = Modifier.fillMaxWidth().height(46.dp)
+        ) {
+            Text("VOLTAR PARA TELA DE LOGIN", color = Gold, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+        }
+    }
+}
+
+// === TELA DE AVISO DE COFRE BLOQUEADO (COM TRAVA ANTI-OFFLINE) ===
+@Composable
+fun TelaCofreBloqueado(
+    nomeUsuario: String,
+    motivo: String,
+    verificando: Boolean,
+    onVerificarLiberacao: () -> Unit,
+    onTrocarUsuario: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgBlack)
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = SurfaceDarker,
+            border = BorderStroke(1.5.dp, DangerRed),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Icon(Icons.Default.Lock, null, tint = DangerRed, modifier = Modifier.size(64.dp))
+                Spacer(Modifier.height(12.dp))
+                Text("COFRE BLOQUEADO", color = DangerRed, fontSize = 21.sp, fontWeight = FontWeight.Black)
+                if (nomeUsuario.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Perfil: $nomeUsuario", color = Gold, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+
+                Spacer(Modifier.height(16.dp))
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SurfaceDark, RoundedCornerShape(12.dp))
+                        .border(1.dp, DangerRed.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                        .padding(14.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text("MOTIVO DO BLOQUEIO", color = TextGrey, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = motivo.ifBlank { "Acesso temporariamente suspenso pela administração." },
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+                Text(
+                    "Seus arquivos e pastas continuam preservados na nuvem SSD. Fale com o suporte SSD Soluções para regularizar o acesso.",
+                    color = TextGrey,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(Modifier.height(22.dp))
+                Button(
+                    onClick = onVerificarLiberacao,
+                    enabled = !verificando,
+                    colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                    modifier = Modifier.fillMaxWidth().height(50.dp)
+                ) {
+                    if (verificando) {
+                        CircularProgressIndicator(color = BgBlack, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                    } else {
+                        Icon(Icons.Default.Refresh, null, tint = BgBlack)
+                        Spacer(Modifier.width(8.dp))
+                        Text("VERIFICAR LIBERAÇÃO", color = BgBlack, fontWeight = FontWeight.Black)
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+                TextButton(onClick = onTrocarUsuario) {
+                    Text("Entrar com outro utilizador", color = TextGrey, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
     }
 }
 
@@ -4539,7 +5482,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val sheetState = rememberModalBottomSheetState()
     var jobFilaMiniaturas by remember { mutableStateOf<Job?>(null) }
 
-    // Permissão de notificação (Android 13+) para manter o progresso fixo de upload em segundo plano
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -4581,6 +5523,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var isCheckingVault by remember { mutableStateOf(false) }
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
 
+    // Estados do Painel Admin e do Bloqueio Remoto Anti-Offline
+    var showAdminPanel by remember { mutableStateOf(false) }
+    val statusInicialLocal = remember(ultimoUsuarioSalvo) { obterStatusCofreLocal(context, ultimoUsuarioSalvo) }
+    var vaultBlocked by remember { mutableStateOf(ultimoUsuarioSalvo.isNotBlank() && statusInicialLocal.bloqueado) }
+    var vaultBlockedReason by remember { mutableStateOf(statusInicialLocal.motivo) }
+    var checkingUnlockStatus by remember { mutableStateOf(false) }
+
     // Estados da Nexus IA (Leitura Offline OCR + Extrator PIX/Boletos/Valores)
     var arquivoAnaliseIA by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var analisandoIA by remember { mutableStateOf(false) }
@@ -4588,15 +5537,23 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var iaIndexTick by remember { mutableIntStateOf(0) }
     var indexandoLoteIA by remember { mutableStateOf(false) }
 
-    // Sincroniza silenciosamente os registos (MS e CP) na nuvem sem exibir nomes de perfis na tela
-    LaunchedEffect(loginStep, vaultUnlocked) {
-        if (loginStep >= 3 && !vaultUnlocked) {
+    // Sincroniza silenciosamente os registos (MS/CP) e status [STATUS_COFRE] na nuvem
+    LaunchedEffect(loginStep, vaultUnlocked, showAdminPanel) {
+        if (loginStep >= 3 && !vaultUnlocked && !showAdminPanel) {
             procurandoPerfisNuvem = true
             descobrirPerfisExistentesNaNuvem(context, client) {
                 scope.launch(Dispatchers.Main) {
                     procurandoPerfisNuvem = false
                     if (activeVaultUser.isNotBlank()) {
                         vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
+                        val stAtual = obterStatusCofreLocal(context, activeVaultUser)
+                        if (stAtual.bloqueado && !isSwitchingUser) {
+                            vaultBlocked = true
+                            vaultBlockedReason = stAtual.motivo
+                        } else if (!stAtual.bloqueado && vaultBlocked) {
+                            vaultBlocked = false
+                            vaultBlockedReason = ""
+                        }
                     }
                 }
             }
@@ -4627,7 +5584,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var showCacheDialog by remember { mutableStateOf(false) }
     var erroUploadDetalhado by remember { mutableStateOf<String?>(null) }
 
-    // Só recarrega mapas quando não estiver no meio de uma sincronização em lote da nuvem
     LaunchedEffect(todosArquivos.size, sincronizandoNuvem) {
         if (!sincronizandoNuvem) {
             mapaDonos = carregarDonosFicheiros(context)
@@ -4638,7 +5594,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Filtro com chave única por dataUpload + nome para impedir qualquer duplicidade na grade
     val arquivos = remember(todosArquivos, mapaDonos, activeVaultUser) {
         val chaveAtiva = normalizarUsuario(activeVaultUser)
         if (chaveAtiva.isBlank()) emptyList()
@@ -4668,7 +5623,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         arquivos.sumOf { it.tamanhoBytes }
     }
 
-    // Função auxiliar para disparar a análise Nexus IA (OCR + PIX/Boletos/Valores) em qualquer arquivo
     fun abrirAnaliseIA(arq: ArquivoNuvem, forcarReleitura: Boolean = false) {
         arquivoAnaliseIA = arq
         analisandoIA = true
@@ -4692,7 +5646,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Fila manual leve de miniaturas (usada apenas quando o utilizador manda recarregar capas no menu Cache)
     fun processarFilaMiniaturasNuvem(listaArquivosCofre: List<ArquivoNuvem>) {
         jobFilaMiniaturas?.cancel()
         jobFilaMiniaturas = scope.launch(Dispatchers.IO) {
@@ -4747,7 +5700,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Marcação em lote e varredura em Dispatchers.IO (evita OOM e ANR em cofres grandes)
     fun verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio: Boolean) {
         scope.launch {
             val chaveAtiva = normalizarUsuario(activeVaultUser)
@@ -4769,7 +5721,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Bloqueia limpeza de duplicados enquanto houver upload OU sincronização da nuvem em andamento
     LaunchedEffect(todosArquivos.size, vaultUnlocked, isUploading, sincronizandoNuvem) {
         if (todosArquivos.isNotEmpty() && !isUploading && !sincronizandoNuvem) {
             val alterou = withContext(Dispatchers.IO) {
@@ -4787,9 +5738,30 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
+            // Checagem remota imediata: se o admin bloqueou o cofre, tranca na hora e ativa trava anti-offline
+            val stLocalAntes = obterStatusCofreLocal(context, activeVaultUser)
+            if (stLocalAntes.bloqueado) {
+                vaultUnlocked = false
+                vaultBlocked = true
+                vaultBlockedReason = stLocalAntes.motivo
+                return@LaunchedEffect
+            }
+
+            verificarStatusRemotoCliente(context, client, activeVaultUser) { bloqueadoRemoto, motivoRemoto ->
+                if (bloqueadoRemoto) {
+                    scope.launch(Dispatchers.Main) {
+                        jobFilaMiniaturas?.cancel()
+                        NexusLeituraNuvem.encerrar()
+                        NexusTransfer.cancelar(client)
+                        vaultUnlocked = false
+                        vaultBlocked = true
+                        vaultBlockedReason = motivoRemoto
+                    }
+                }
+            }
+
             solicitarPermissaoNotificacaoSeNecessario()
 
-            // Verifica e limpa temporários automaticamente se o limite configurado foi atingido
             val (limpouIni, bytesIni) = withContext(Dispatchers.IO) {
                 verificarELimparTempAutomatico(appContext)
             }
@@ -4826,7 +5798,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     mapaPastas = carregarVinculosPastas(context)
                     pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
 
-                    // Capas carregam sob demanda na grade visível (muito mais leve e sem picos de RAM)
                     if (qtd > 0) {
                         Toast.makeText(context, "$qtd novo(s) ficheiro(s) sincronizados na nuvem SSD ($vaultStorageMode)!", Toast.LENGTH_SHORT).show()
                     }
@@ -4870,7 +5841,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // Busca inteligente: encontra tanto pelo nome do ficheiro quanto pelo texto lido dentro da imagem/PDF via Nexus IA
     val listaVisivelAtual = remember(arquivos, selectedTab, pastaAberta, mapaPastas, searchQuery, iaIndexTick) {
         val filtraPorConsulta: (ArquivoNuvem) -> Boolean = { arq ->
             searchQuery.isBlank() ||
@@ -5053,7 +6023,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             forcarNovoRegistro = true
                         )
 
-                        // Indexação automática silenciosa via Nexus IA para imagens, PDFs e textos recém-enviados
                         if (NexusAI.suportaLeituraIA(nome)) {
                             NexusBackgroundScope.scope.launch {
                                 NexusAI.extrairTextoDeArquivo(appContext, arqTemp.absolutePath, nome, ts)
@@ -5382,6 +6351,54 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 
+    // 1B. PAINEL ADMIN SECRETO (ACESSADO COM USUÁRIO + PIN MESTRE)
+    if (showAdminPanel) {
+        PainelAdminSSD(
+            context = context,
+            client = client,
+            onSair = {
+                showAdminPanel = false
+                vaultNameInput = ""
+                vaultPinInput = ""
+                vaultErrorMsg = null
+            }
+        )
+        return
+    }
+
+    // 1C. TELA DE COFRE BLOQUEADO (TRAVA ANTI-OFFLINE ATIVA)
+    if (vaultBlocked && !isSwitchingUser) {
+        TelaCofreBloqueado(
+            nomeUsuario = activeVaultUser,
+            motivo = vaultBlockedReason,
+            verificando = checkingUnlockStatus,
+            onVerificarLiberacao = {
+                checkingUnlockStatus = true
+                verificarStatusRemotoCliente(context, client, activeVaultUser) { bloqueadoAgora, motivoAgora ->
+                    scope.launch(Dispatchers.Main) {
+                        checkingUnlockStatus = false
+                        if (!bloqueadoAgora) {
+                            vaultBlocked = false
+                            vaultBlockedReason = ""
+                            Toast.makeText(context, "Cofre liberado! Digite seu PIN para entrar.", Toast.LENGTH_LONG).show()
+                        } else {
+                            vaultBlockedReason = motivoAgora
+                            Toast.makeText(context, "Cofre ainda bloqueado.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            },
+            onTrocarUsuario = {
+                vaultBlocked = false
+                vaultErrorMsg = null
+                vaultNameInput = ""
+                vaultPinInput = ""
+                isSwitchingUser = true
+            }
+        )
+        return
+    }
+
     // 2. ECRÃ DE COFRE HÍBRIDO (MS / CP): PEDE APENAS O PIN QUANDO JÁ HÁ UTILIZADOR SALVO
     if (!vaultUnlocked) {
         val pedirApenasPin = activeVaultUser.isNotBlank() && !isSwitchingUser
@@ -5463,6 +6480,31 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     return@Button
                                 }
 
+                                val stLocal = obterStatusCofreLocal(context, activeVaultUser)
+                                if (stLocal.bloqueado) {
+                                    isCheckingVault = true
+                                    verificarStatusRemotoCliente(context, client, activeVaultUser) { blq, mot ->
+                                        scope.launch(Dispatchers.Main) {
+                                            isCheckingVault = false
+                                            if (blq) {
+                                                vaultPinInput = ""
+                                                vaultBlockedReason = mot
+                                                vaultBlocked = true
+                                            } else {
+                                                val pinLocal = obterPinCofreLocal(context, activeVaultUser)
+                                                if (pinLocal != null && pinLocal == pinLimpo) {
+                                                    vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
+                                                    vaultPinInput = ""
+                                                    vaultUnlocked = true
+                                                } else {
+                                                    vaultErrorMsg = "PIN incorreto."
+                                                }
+                                            }
+                                        }
+                                    }
+                                    return@Button
+                                }
+
                                 val pinLocal = obterPinCofreLocal(context, activeVaultUser)
                                 if (pinLocal != null && pinLocal == pinLimpo) {
                                     vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
@@ -5485,7 +6527,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                         pin = pinLimpo,
                                         modoCriarNovo = false,
                                         modoArmazenamentoEscolhido = vaultStorageMode
-                                    ) { ok, nomeConfirmado, modoConfirmado, chatIdCanal, _ ->
+                                    ) { ok, nomeConfirmado, modoConfirmado, chatIdCanal, msg ->
                                         scope.launch(Dispatchers.Main) {
                                             isCheckingVault = false
                                             if (ok) {
@@ -5501,6 +6543,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                                 vaultStorageMode = modoConfirmado
                                                 vaultPinInput = ""
                                                 vaultUnlocked = true
+                                            } else if (msg.startsWith("BLOQUEADO::")) {
+                                                vaultPinInput = ""
+                                                vaultBlockedReason = msg.removePrefix("BLOQUEADO::")
+                                                vaultBlocked = true
                                             } else {
                                                 vaultErrorMsg = "PIN incorreto."
                                             }
@@ -5674,6 +6720,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 val nomeLimpo = vaultNameInput.trim()
                                 val pinLimpo = vaultPinInput.trim()
 
+                                // Acesso secreto ao Painel Admin SSD (invisível para clientes)
+                                if (!isCreatingNewVault && ehCredencialAdmin(nomeLimpo, pinLimpo)) {
+                                    vaultNameInput = ""
+                                    vaultPinInput = ""
+                                    showAdminPanel = true
+                                    return@Button
+                                }
+
                                 if (nomeLimpo.length < 3) {
                                     vaultErrorMsg = "O nome deve ter pelo menos 3 caracteres."
                                     return@Button
@@ -5683,8 +6737,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     return@Button
                                 }
 
+                                val stLocalDigitado = obterStatusCofreLocal(context, nomeLimpo)
                                 val pinLocalExistente = obterPinCofreLocal(context, nomeLimpo)
-                                if (!isCreatingNewVault && pinLocalExistente != null && pinLocalExistente == pinLimpo) {
+                                if (!isCreatingNewVault && !stLocalDigitado.bloqueado && pinLocalExistente != null && pinLocalExistente == pinLimpo) {
                                     val modoSalvo = obterModoCofreLocal(context, nomeLimpo)
                                     val chatSalvo = obterChatIdCofreLocal(context, nomeLimpo)
                                     salvarCredenciaisCofreLocal(context, nomeLimpo, pinLimpo, true, modoSalvo, chatSalvo)
@@ -5721,10 +6776,19 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                             activeVaultUser = nomeConfirmado
                                             vaultStorageMode = modoConfirmado
                                             isSwitchingUser = false
+                                            vaultBlocked = false
+                                            vaultBlockedReason = ""
                                             vaultNameInput = ""
                                             vaultPinInput = ""
                                             vaultUnlocked = true
                                             Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                                        } else if (msg.startsWith("BLOQUEADO::")) {
+                                            activeVaultUser = nomeConfirmado.ifBlank { nomeLimpo }
+                                            isSwitchingUser = false
+                                            vaultNameInput = ""
+                                            vaultPinInput = ""
+                                            vaultBlockedReason = msg.removePrefix("BLOQUEADO::")
+                                            vaultBlocked = true
                                         } else {
                                             vaultErrorMsg = msg
                                         }
@@ -5753,6 +6817,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     vaultErrorMsg = null
                                     vaultPinInput = ""
                                     isSwitchingUser = false
+                                    val stVoltar = obterStatusCofreLocal(context, activeVaultUser)
+                                    if (stVoltar.bloqueado) {
+                                        vaultBlocked = true
+                                        vaultBlockedReason = stVoltar.motivo
+                                    }
                                 }
                             ) {
                                 Text("Voltar para desbloqueio apenas com PIN", color = TextGrey, fontSize = 12.sp)
@@ -5764,6 +6833,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
         return
     }
+// === FIM DA PARTE 3 DE 4 (COLE A PARTE 4 LOGO ABAIXO DESTA LINHA) ===
+// === CONTINUAÇÃO: PARTE 4 DE 4 (COLE LOGO ABAIXO DA PARTE 3) ===
 
     // === JANELA DE RESULTADO DA NEXUS IA (OCR + EXTRAÇÃO PIX / BOLETOS / VALORES) ===
     if (arquivoAnaliseIA != null) {
@@ -7220,21 +8291,36 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     onClick = {
                         scope.launch {
                             drawerState.close()
-                            cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD ($vaultStorageMode)..."
-                            val atuaisReais = vm.obterArquivosReais()
-                            sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, dao, vm) { qtd ->
-                                scope.launch(Dispatchers.Main) {
-                                    NexusLeituraNuvem.encerrar()
-                                    delay(150)
-                                    val aposSync = vm.obterArquivosReais()
-                                    withContext(Dispatchers.IO) {
-                                        limparDuplicadosExistentes(appContext, aposSync, vm) {}
+                            verificarStatusRemotoCliente(context, client, activeVaultUser) { bloqueadoRemoto, motivoRemoto ->
+                                if (bloqueadoRemoto) {
+                                    scope.launch(Dispatchers.Main) {
+                                        jobFilaMiniaturas?.cancel()
+                                        NexusLeituraNuvem.encerrar()
+                                        NexusTransfer.cancelar(client)
+                                        vaultUnlocked = false
+                                        vaultBlocked = true
+                                        vaultBlockedReason = motivoRemoto
                                     }
-                                    mapaDonos = carregarDonosFicheiros(context)
-                                    mapaPastas = carregarVinculosPastas(context)
-                                    pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                    cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD ($vaultStorageMode)!" else "Cofre SSD [$vaultStorageMode] de $activeVaultUser atualizado!"
-                                    Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                                    return@verificarStatusRemotoCliente
+                                }
+                                scope.launch(Dispatchers.Main) {
+                                    cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD ($vaultStorageMode)..."
+                                    val atuaisReais = vm.obterArquivosReais()
+                                    sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, dao, vm) { qtd ->
+                                        scope.launch(Dispatchers.Main) {
+                                            NexusLeituraNuvem.encerrar()
+                                            delay(150)
+                                            val aposSync = vm.obterArquivosReais()
+                                            withContext(Dispatchers.IO) {
+                                                limparDuplicadosExistentes(appContext, aposSync, vm) {}
+                                            }
+                                            mapaDonos = carregarDonosFicheiros(context)
+                                            mapaPastas = carregarVinculosPastas(context)
+                                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                            cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD ($vaultStorageMode)!" else "Cofre SSD [$vaultStorageMode] de $activeVaultUser atualizado!"
+                                            Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7266,6 +8352,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         vaultNameInput = ""
                         vaultPinInput = ""
                         vaultErrorMsg = null
+                        showAdminPanel = false
                         isSwitchingUser = false
                         vaultUnlocked = false
                     },
@@ -7354,6 +8441,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     vaultNameInput = ""
                                     vaultPinInput = ""
                                     vaultErrorMsg = null
+                                    showAdminPanel = false
                                     isSwitchingUser = false
                                     vaultUnlocked = false
                                 }) {
@@ -7785,8 +8873,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                                 AsyncImage(
                                                     model = ImageRequest.Builder(context)
                                                         .data(obterUriCapaMidia(thumbCapa))
-                                                        .size(240, 240)
-                                                        .bitmapConfig(Bitmap.Config.ARGB_8888)
+                                                        .size(220, 220)
+                                                        .bitmapConfig(Bitmap.Config.RGB_565)
                                                         .build(),
                                                     contentDescription = p.nomePasta,
                                                     contentScale = ContentScale.Crop,
