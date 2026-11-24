@@ -34,7 +34,6 @@ import java.io.File
 import java.io.InputStreamReader
 import java.lang.reflect.Modifier as JavaModifier
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
@@ -47,94 +46,6 @@ object TelegramAuth {
 
     val transferProgress = MutableStateFlow<Int?>(null)
     val transferLabel = MutableStateFlow("")
-}
-
-// Alinha o COMMIT_HASH do TdApi.java com a versão exigida pelo binário nativo libtdjni.so
-fun alinharHashTdApiComNativo(): String {
-    val hashExigidoPeloSo = "89ebded9571b7bb589ec1bd05e585fffa4c580e2"
-    val hashDivergenteJava = "a17f87c4cff7b90b278d12b91ba0614383aaee82"
-    val relatorio = StringBuilder()
-
-    val nomesClasses = listOf(
-        "org.drinkless.tdlib.TdApi",
-        "org.drinkless.tdlib.TdApi\$Object",
-        "org.drinkless.tdlib.TdApi\$Function",
-        "org.drinkless.tdlib.Client"
-    )
-
-    for (nomeClasse in nomesClasses) {
-        try {
-            val clazz = Class.forName(nomeClasse, true, NexusApp::class.java.classLoader)
-            for (field in clazz.declaredFields) {
-                if (!JavaModifier.isStatic(field.modifiers) || field.type != String::class.java) continue
-                field.isAccessible = true
-                val valorAtual = try { field.get(null) as? String } catch (_: Throwable) { null } ?: continue
-
-                if (valorAtual == hashDivergenteJava ||
-                    field.name.contains("HASH", ignoreCase = true) ||
-                    field.name.contains("COMMIT", ignoreCase = true) ||
-                    valorAtual.length == 40
-                ) {
-                    try {
-                        val accessFlagsField = java.lang.reflect.Field::class.java.getDeclaredField("accessFlags")
-                        accessFlagsField.isAccessible = true
-                        accessFlagsField.setInt(field, field.modifiers and JavaModifier.FINAL.inv())
-                        field.set(null, hashExigidoPeloSo)
-                    } catch (_: Throwable) {
-                        try { field.set(null, hashExigidoPeloSo) } catch (_: Throwable) {}
-                    }
-
-                    if ((try { field.get(null) as? String } catch (_: Throwable) { null }) != hashExigidoPeloSo) {
-                        try {
-                            val unsafeClass = Class.forName("sun.misc.Unsafe")
-                            val theUnsafeField = unsafeClass.getDeclaredField("theUnsafe")
-                            theUnsafeField.isAccessible = true
-                            val unsafe = theUnsafeField.get(null)
-
-                            val offset: Long = try {
-                                val mGetOffset = java.lang.reflect.Field::class.java.getDeclaredMethod("getOffset")
-                                mGetOffset.isAccessible = true
-                                (mGetOffset.invoke(field) as Number).toLong()
-                            } catch (_: Throwable) {
-                                try {
-                                    val fOffset = java.lang.reflect.Field::class.java.getDeclaredField("offset")
-                                    fOffset.isAccessible = true
-                                    fOffset.getInt(field).toLong()
-                                } catch (_: Throwable) {
-                                    val mStaticOffset = unsafeClass.getDeclaredMethod("staticFieldOffset", java.lang.reflect.Field::class.java)
-                                    mStaticOffset.isAccessible = true
-                                    (mStaticOffset.invoke(unsafe, field) as Number).toLong()
-                                }
-                            }
-
-                            val baseObj: Any = try {
-                                val mStaticBase = unsafeClass.getDeclaredMethod("staticFieldBase", java.lang.reflect.Field::class.java)
-                                mStaticBase.isAccessible = true
-                                mStaticBase.invoke(unsafe, field) ?: clazz
-                            } catch (_: Throwable) {
-                                clazz
-                            }
-
-                            val mPutObject = unsafeClass.getDeclaredMethod(
-                                "putObject",
-                                Any::class.java,
-                                Long::class.javaPrimitiveType,
-                                Any::class.java
-                            )
-                            mPutObject.isAccessible = true
-                            mPutObject.invoke(unsafe, baseObj, offset, hashExigidoPeloSo)
-                        } catch (e: Throwable) {
-                            relatorio.append("Aviso Unsafe (${field.name}): ${e.message}\n")
-                        }
-                    }
-
-                    val valorFinal = try { field.get(null) as? String } catch (_: Throwable) { null }
-                    relatorio.append("Campo ${clazz.simpleName}.${field.name}: $valorAtual -> $valorFinal\n")
-                }
-            }
-        } catch (_: Throwable) {}
-    }
-    return relatorio.toString().trim()
 }
 
 // Verifica se o último encerramento foi ação normal do utilizador (ex: SwipeUpClean) e não um crash
@@ -274,9 +185,6 @@ class NexusApp : Application() {
     @Synchronized
     fun carregarSomenteTdjni(): String? {
         return try {
-            val logHash = alinharHashTdApiComNativo()
-            Log.i("NexusCloud", "Alinhamento Hash TDLib: $logHash")
-
             System.loadLibrary("tdjni")
             File(filesDir, "tdlib").apply { if (!exists()) mkdirs() }
             File(filesDir, "tdlib_files").apply { if (!exists()) mkdirs() }
@@ -386,7 +294,7 @@ class TelegramHandler(private val app: NexusApp) : Client.ResultHandler {
                             apiHash = BuildConfig.TELEGRAM_API_HASH
                             systemLanguageCode = "pt"
                             deviceModel = modelo
-                            applicationVersion = "2.0"
+                            applicationVersion = "2.2"
 
                             for (f in javaClass.declaredFields) {
                                 if (JavaModifier.isStatic(f.modifiers)) continue
@@ -447,8 +355,8 @@ class MainActivity : ComponentActivity() {
         val nexusApp = application as NexusApp
         val prefs = getSharedPreferences("nexus_crash_log", Context.MODE_PRIVATE)
 
-        if (prefs.getString("versao_fix_hash", "") != "v2.0_swipe_safe") {
-            prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
+        if (prefs.getString("versao_fix_hash", "") != "v2.2_hash_clean") {
+            prefs.edit().clear().putString("versao_fix_hash", "v2.2_hash_clean").commit()
         }
 
         // Ignora encerramento normal quando o utilizador fecha o app nos Apps Recentes (SwipeUpClean)
@@ -485,13 +393,12 @@ class MainActivity : ComponentActivity() {
                             val db = withContext(Dispatchers.IO) { NexusDB.get(this@MainActivity) }
                             val dao = db.dao()
 
-                            etapaTexto = "Etapa 2/3: A alinhar e carregar motor nativo SSD..."
-                            val statusHash = alinharHashTdApiComNativo()
-                            prefs.edit().putString("etapa_em_curso_v2", "Etapa 2: System.loadLibrary(tdjni) [$statusHash]").commit()
+                            etapaTexto = "Etapa 2/3: A carregar motor nativo SSD..."
+                            prefs.edit().putString("etapa_em_curso_v2", "Etapa 2: System.loadLibrary(tdjni)").commit()
                             val erroLib = nexusApp.carregarSomenteTdjni()
                             if (erroLib != null) {
                                 prefs.edit().remove("etapa_em_curso_v2").commit()
-                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib\n$statusHash\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
+                                erroVisivel = "Falha ao carregar biblioteca nativa:\n$erroLib\n\n${recolherDiagnosticoNativo(this@MainActivity)}"
                                 carregando = false
                                 return@LaunchedEffect
                             }
@@ -556,7 +463,7 @@ class MainActivity : ComponentActivity() {
                             Spacer(modifier = Modifier.height(14.dp))
                             Button(
                                 onClick = {
-                                    prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
+                                    prefs.edit().clear().putString("versao_fix_hash", "v2.2_hash_clean").commit()
                                     erroVisivel = null
                                 },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD700)),
@@ -583,7 +490,7 @@ class MainActivity : ComponentActivity() {
                                         File(filesDir, "tdlib").deleteRecursively()
                                         File(filesDir, "tdlib_files").deleteRecursively()
                                     } catch (_: Throwable) {}
-                                    prefs.edit().clear().putString("versao_fix_hash", "v2.0_swipe_safe").commit()
+                                    prefs.edit().clear().putString("versao_fix_hash", "v2.2_hash_clean").commit()
                                     erroVisivel = null
                                 },
                                 border = BorderStroke(1.dp, Color(0xFFE53935)),
