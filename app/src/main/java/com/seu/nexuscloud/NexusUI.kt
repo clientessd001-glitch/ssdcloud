@@ -91,7 +91,7 @@ import kotlinx.coroutines.withContext
 import org.drinkless.tdlib.Client
 import org.drinkless.tdlib.TdApi
 
-const val NEXUS_VERSION = "v2.1"
+const val NEXUS_VERSION = "v2.2"
 
 val BgBlack = Color(0xFF05070A)
 val SurfaceDark = Color(0xFF161A25)
@@ -4833,7 +4833,7 @@ fun GrelhaArquivos(
     }
 }
 // === FIM DA PARTE 2 DE 3 ===
-// === CONTINUAÇÃO: PARTE 3 DE 4 (COLE LOGO ABAIXO DA PARTE 2) ===
+// === CONTINUAÇÃO: PARTE 3 DE 4 (COLE LOGO ABAIXO DA PARTE 2 - v2.2) ===
 
 private data class ResultadoEnvioSSD(
     val ok: Boolean,
@@ -4862,6 +4862,251 @@ private fun gerarNomeUnicoNoLote(
             return candidato
         }
         contador++
+    }
+}
+
+// === PREFERÊNCIA: CHAVE PARA LIGAR/DESLIGAR OCR AUTOMÁTICO NO UPLOAD (ECONOMIA DE BATERIA) ===
+fun obterOcrAutoNoUpload(context: Context): Boolean {
+    return context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+        .getBoolean("ocr_auto_upload_enabled", true)
+}
+
+fun salvarOcrAutoNoUpload(context: Context, ativo: Boolean) {
+    context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+        .edit()
+        .putBoolean("ocr_auto_upload_enabled", ativo)
+        .apply()
+}
+
+// === BOTÃO ISOLADO NO TOPO (EVITA RECOMPOR A GALERIA A CADA % DE UPLOAD/DOWNLOAD) ===
+@Composable
+fun BotaoTopoProgressoOuCadeado(
+    onTrancar: () -> Unit
+) {
+    val transferProgress by NexusTransfer.progress.collectAsState()
+    val transferPaused by NexusTransfer.pausado.collectAsState()
+    val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
+
+    if (transferProgress != null || isUploading) {
+        Text(
+            "${transferProgress ?: 10}%",
+            color = Gold,
+            fontWeight = FontWeight.Black,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(end = 6.dp)
+        )
+        if (!transferPaused) {
+            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+        } else {
+            Icon(Icons.Default.Pause, contentDescription = "Pausado", tint = Gold, modifier = Modifier.size(18.dp))
+        }
+    } else {
+        IconButton(onClick = onTrancar) {
+            Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
+        }
+    }
+}
+
+// === BARRA DE PROGRESSO 100% ISOLADA (SÓ ESTA FAIXA ATUALIZA DURANTE TRANSFERÊNCIAS) ===
+@Composable
+fun BarraProgressoIsoladaSSD(
+    context: Context,
+    client: Client,
+    vaultStorageMode: String,
+    onCancelarLeitura: () -> Unit,
+    onTransferCancelada: () -> Unit
+) {
+    val transferProgress by NexusTransfer.progress.collectAsState()
+    val transferLabel by NexusTransfer.label.collectAsState()
+    val transferPaused by NexusTransfer.pausado.collectAsState()
+    val transferIsUpload by NexusTransfer.ehUpload.collectAsState()
+    val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
+
+    val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
+    val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
+    val leituraTotal by NexusLeituraNuvem.total.collectAsState()
+    val leituraSubPct by NexusLeituraNuvem.subProgressoItem.collectAsState()
+    val leituraTitulo by NexusLeituraNuvem.titulo.collectAsState()
+    val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
+
+    if (transferProgress != null || isUploading) {
+        val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
+        val fra = pctAtual / 100f
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 4.dp)
+                .background(SurfaceDarker, RoundedCornerShape(10.dp))
+                .border(1.dp, if (transferPaused) DangerRed else Gold, RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        text = when {
+                            transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO [$vaultStorageMode] ($pctAtual%)"
+                            transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO [$vaultStorageMode] ($pctAtual%)"
+                            transferIsUpload -> "⬆️ ENVIANDO EM SEGUNDO PLANO [$vaultStorageMode] ($pctAtual%)"
+                            else -> "⬇️ BAIXANDO COM PRIORIDADE [$vaultStorageMode] ($pctAtual%)"
+                        },
+                        color = if (transferPaused) DangerRed else Gold,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Black
+                    )
+                    Text(
+                        text = transferLabel.ifBlank { "Processando transferência..." },
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Button(
+                        onClick = { NexusTransfer.alternarPausa(client) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (transferPaused) Gold else SurfaceDark
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (transferPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                            contentDescription = if (transferPaused) "Continuar" else "Pausar",
+                            tint = if (transferPaused) BgBlack else Gold,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            text = if (transferPaused) "CONTINUAR" else "PAUSAR",
+                            color = if (transferPaused) BgBlack else Gold,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Black
+                        )
+                    }
+
+                    IconButton(
+                        onClick = {
+                            NexusTransfer.cancelar(client)
+                            onTransferCancelada()
+                            Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier
+                            .size(32.dp)
+                            .background(DangerRed.copy(alpha = 0.2f), CircleShape)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Cancelar transferência",
+                            tint = DangerRed,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(SurfaceDark)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(fra)
+                        .height(6.dp)
+                        .background(
+                            if (transferPaused) Brush.horizontalGradient(listOf(DangerRed, DangerRed))
+                            else Brush.horizontalGradient(listOf(Gold, DangerRed))
+                        )
+                )
+            }
+        }
+    } else if (leituraAtiva && leituraTotal > 0) {
+        val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
+        val avancoSuave = (lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()
+        val fracaoLeitura = avancoSuave.coerceIn(0.02f, 1f)
+        val pctLeitura = (fracaoLeitura * 100).toInt().coerceIn(1, 100)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 4.dp)
+                .background(SurfaceDarker, RoundedCornerShape(10.dp))
+                .border(1.dp, Gold.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (leituraPausada) "⏸ PAUSADO: ${leituraTitulo.ifBlank { "Leitura da nuvem SSD" }}"
+                    else leituraTitulo.ifBlank { "Lendo arquivos da nuvem SSD..." },
+                    color = if (leituraPausada) Gold else Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                )
+                Text(
+                    text = "${(lidosSafe + 1).coerceAtMost(leituraTotal)} / $leituraTotal ($pctLeitura%)",
+                    color = Gold,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Black,
+                    modifier = Modifier.padding(end = 6.dp)
+                )
+                IconButton(
+                    onClick = { NexusLeituraNuvem.alternarPausa() },
+                    modifier = Modifier.size(26.dp)
+                ) {
+                    Icon(
+                        imageVector = if (leituraPausada) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        contentDescription = if (leituraPausada) "Continuar leitura" else "Pausar leitura",
+                        tint = Gold,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+                IconButton(
+                    onClick = onCancelarLeitura,
+                    modifier = Modifier.size(26.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = "Fechar barra de leitura",
+                        tint = TextGrey,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp)
+                    .clip(RoundedCornerShape(3.dp))
+                    .background(SurfaceDark)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(fracaoLeitura)
+                        .height(6.dp)
+                        .background(Brush.horizontalGradient(listOf(Gold, DangerRed)))
+                )
+            }
+        }
     }
 }
 
@@ -4913,7 +5158,6 @@ fun PainelAdminSSD(
     val totalAtivos = totalPerfis - totalBloqueados
     val verdeAtivo = Color(0xFF2ECC71)
 
-    // Diálogo para escolher motivo e confirmar bloqueio
     if (perfilParaBloquear != null) {
         val alvo = perfilParaBloquear!!
         Dialog(onDismissRequest = { if (!processandoAcao) perfilParaBloquear = null }) {
@@ -5011,7 +5255,6 @@ fun PainelAdminSSD(
         }
     }
 
-    // Diálogo para alterar o PIN de um cliente remotamente
     if (perfilParaTrocarPin != null) {
         val alvoPin = perfilParaTrocarPin!!
         Dialog(onDismissRequest = { if (!processandoAcao) perfilParaTrocarPin = null }) {
@@ -5089,7 +5332,6 @@ fun PainelAdminSSD(
             .background(BgBlack)
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
-        // Cabeçalho do Painel Admin
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
@@ -5110,7 +5352,6 @@ fun PainelAdminSSD(
 
         Spacer(Modifier.height(10.dp))
 
-        // Resumo rápido de clientes
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -5460,20 +5701,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val statusText by TelegramAuth.statusText.collectAsState()
     val errorText by TelegramAuth.errorText.collectAsState()
 
-    val transferProgress by NexusTransfer.progress.collectAsState()
-    val transferLabel by NexusTransfer.label.collectAsState()
-    val transferPaused by NexusTransfer.pausado.collectAsState()
-    val transferIsUpload by NexusTransfer.ehUpload.collectAsState()
+    // Apenas estados binários ficam aqui; percentuais ficam isolados em BarraProgressoIsoladaSSD
     val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
     val bannerStatusGlobal by NexusTransfer.bannerStatusGlobal.collectAsState()
     val sincronizandoNuvem by NexusSyncState.emAndamento.collectAsState()
-
-    val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
-    val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
-    val leituraTotal by NexusLeituraNuvem.total.collectAsState()
-    val leituraSubPct by NexusLeituraNuvem.subProgressoItem.collectAsState()
-    val leituraTitulo by NexusLeituraNuvem.titulo.collectAsState()
-    val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
 
     val context = LocalContext.current
     val appContext = remember(context) { context.applicationContext }
@@ -5530,7 +5761,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var vaultBlockedReason by remember { mutableStateOf(statusInicialLocal.motivo) }
     var checkingUnlockStatus by remember { mutableStateOf(false) }
 
-    // Estados da Nexus IA (Leitura Offline OCR + Extrator PIX/Boletos/Valores)
+    // Estados da Nexus IA (Leitura Offline OCR + Chave para desligar OCR automático no upload)
+    var ocrAutoNoUpload by remember { mutableStateOf(obterOcrAutoNoUpload(context)) }
     var arquivoAnaliseIA by remember { mutableStateOf<ArquivoNuvem?>(null) }
     var analisandoIA by remember { mutableStateOf(false) }
     var resultadoIA by remember { mutableStateOf<ResultadoAnaliseIA?>(null) }
@@ -5738,7 +5970,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     LaunchedEffect(vaultUnlocked, activeVaultUser) {
         if (vaultUnlocked && activeVaultUser.isNotBlank()) {
-            // Checagem remota imediata: se o admin bloqueou o cofre, tranca na hora e ativa trava anti-offline
             val stLocalAntes = obterStatusCofreLocal(context, activeVaultUser)
             if (stLocalAntes.bloqueado) {
                 vaultUnlocked = false
@@ -5866,6 +6097,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
+    // Lista na mesma ordem cronológica da grade para o deslizar do visualizador
+    val listaOrdenadaViewer = remember(listaVisivelAtual) {
+        listaVisivelAtual
+            .distinctBy { "${it.dataUpload}_${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}" }
+            .sortedByDescending { it.dataUpload }
+    }
+
     fun alternarSelecaoFicheiro(arq: ArquivoNuvem) {
         val novos = if (selectedFileIds.contains(arq.id)) {
             selectedFileIds - arq.id
@@ -5876,10 +6114,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
         isSelectionMode = novos.isNotEmpty()
     }
 
-    LaunchedEffect(isUploading, transferPaused) {
+    LaunchedEffect(isUploading) {
         while (isUploading) {
             delay(450)
-            if (!transferPaused && !NexusTransfer.cancelado.value) {
+            if (!NexusTransfer.pausado.value && !NexusTransfer.cancelado.value) {
                 val atual = NexusTransfer.progress.value ?: 10
                 if (atual in 35..88) {
                     NexusTransfer.atualizarProgresso((atual + 3).coerceAtMost(90))
@@ -5894,7 +6132,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // === UPLOAD REAL EM SEGUNDO PLANO (FORA DA TELA VIA NexusBackgroundScope + NexusUploadService) ===
+    // === UPLOAD REAL EM SEGUNDO PLANO (RESPEITA A CHAVE DE OCR AUTOMÁTICO) ===
     fun executarUploads(uris: List<Uri>, pastaEscolhida: String) {
         if (uris.isEmpty() || activeVaultUser.isBlank()) return
         solicitarPermissaoNotificacaoSeNecessario()
@@ -6023,7 +6261,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             forcarNovoRegistro = true
                         )
 
-                        if (NexusAI.suportaLeituraIA(nome)) {
+                        // Só roda OCR automático no upload se a chave estiver ativada (poupa bateria)
+                        if (obterOcrAutoNoUpload(appContext) && NexusAI.suportaLeituraIA(nome)) {
                             NexusBackgroundScope.scope.launch {
                                 NexusAI.extrairTextoDeArquivo(appContext, arqTemp.absolutePath, nome, ts)
                             }
@@ -6080,7 +6319,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // === SINCRONIZAÇÃO AUTOMÁTICA REAL EM SEGUNDO PLANO (FORA DA TELA) ===
+    // === SINCRONIZAÇÃO AUTOMÁTICA REAL EM SEGUNDO PLANO (RESPEITA A CHAVE DE OCR) ===
     fun executarUploadsNovosSync(itensParaEnviar: List<NovoArquivoSync>, manterPastasOrigem: Boolean) {
         if (itensParaEnviar.isEmpty() || activeVaultUser.isBlank()) return
         solicitarPermissaoNotificacaoSeNecessario()
@@ -6208,7 +6447,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             forcarNovoRegistro = true
                         )
 
-                        if (NexusAI.suportaLeituraIA(nomeLimpo)) {
+                        if (obterOcrAutoNoUpload(appContext) && NexusAI.suportaLeituraIA(nomeLimpo)) {
                             NexusBackgroundScope.scope.launch {
                                 NexusAI.extrairTextoDeArquivo(appContext, arqTemp.absolutePath, nomeLimpo, ts)
                             }
@@ -6720,7 +6959,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 val nomeLimpo = vaultNameInput.trim()
                                 val pinLimpo = vaultPinInput.trim()
 
-                                // Acesso secreto ao Painel Admin SSD (invisível para clientes)
                                 if (!isCreatingNewVault && ehCredencialAdmin(nomeLimpo, pinLimpo)) {
                                     vaultNameInput = ""
                                     vaultPinInput = ""
@@ -6834,7 +7072,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         return
     }
 // === FIM DA PARTE 3 DE 4 (COLE A PARTE 4 LOGO ABAIXO DESTA LINHA) ===
-// === CONTINUAÇÃO: PARTE 4 DE 4 (COLE LOGO ABAIXO DA PARTE 3) ===
+// === CONTINUAÇÃO: PARTE 4 DE 4 (COLE LOGO ABAIXO DA PARTE 3 - v2.2) ===
 
     // === JANELA DE RESULTADO DA NEXUS IA (OCR + EXTRAÇÃO PIX / BOLETOS / VALORES) ===
     if (arquivoAnaliseIA != null) {
@@ -7781,19 +8019,67 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    // VISUALIZADOR EM ECRÃ INTEIRO COM ZOOM INTERATIVO + BOTÃO NEXUS IA
+    // === VISUALIZADOR EM ECRÃ INTEIRO v2.2: DESLIZAR ENTRE FOTOS/VÍDEOS + ZOOM + NEXUS IA ===
     if (viewerFile != null) {
         val cur = viewerFile!!
-        val curMediaPath = NexusThumbCache.obterArquivoCompleto(cur).ifBlank { NexusThumbCache.obterMiniatura(cur) }
+        val completoCacheViewer = NexusThumbCache.obterArquivoCompleto(cur)
+        val curMediaPath = completoCacheViewer
+            .ifBlank { cur.caminhoMiniatura ?: "" }
+            .ifBlank { NexusThumbCache.obterMiniatura(cur) }
         val ext = cur.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
         val isImage = ehArquivoImagem(cur.nomeArquivo)
         val isVideo = ehArquivoVideo(cur.nomeArquivo)
         val isPdf = ext == "PDF"
         val isText = ext in listOf("TXT", "CSV", "LOG", "JSON", "XML", "MD")
         val suportaIA = NexusAI.suportaLeituraIA(cur.nomeArquivo)
+        val videoProntoLocal = isVideo && arquivoCompletoExisteLocalmente(curMediaPath)
+        val thumbVideoPreview = NexusThumbCache.obterMiniatura(cur)
 
-        var zoomScale by remember(cur.id) { mutableFloatStateOf(1f) }
-        var zoomOffset by remember(cur.id) { mutableStateOf(Offset.Zero) }
+        val indiceViewer = remember(cur.id, cur.dataUpload, listaOrdenadaViewer) {
+            listaOrdenadaViewer.indexOfFirst {
+                it.id == cur.id || (it.dataUpload == cur.dataUpload && it.nomeArquivo == cur.nomeArquivo)
+            }
+        }
+        val temAnterior = indiceViewer > 0
+        val temProximo = indiceViewer != -1 && indiceViewer < listaOrdenadaViewer.lastIndex
+
+        val viewerDownloadPct by NexusTransfer.progress.collectAsState()
+
+        fun navegarViewer(delta: Int) {
+            if (listaOrdenadaViewer.size <= 1 || indiceViewer == -1) return
+            val novoIdx = indiceViewer + delta
+            if (novoIdx !in listaOrdenadaViewer.indices) return
+            val proximo = listaOrdenadaViewer[novoIdx]
+
+            val compLocal = NexusThumbCache.obterArquivoCompleto(proximo)
+            if (compLocal.isNotBlank() && arquivoCompletoExisteLocalmente(compLocal)) {
+                viewerFile = proximo.copy(caminhoMiniatura = compLocal)
+                return
+            }
+
+            val thumbLocal = NexusThumbCache.obterMiniatura(proximo)
+            if (!ehArquivoVideo(proximo.nomeArquivo) && thumbLocal.isNotBlank()) {
+                val limpo = if (thumbLocal.startsWith("file://")) Uri.parse(thumbLocal).path ?: thumbLocal.removePrefix("file://") else thumbLocal
+                val fOrig = File(limpo.removeSuffix("_frame.jpg"))
+                if (fOrig.exists() && fOrig.length() > 256L) {
+                    viewerFile = proximo.copy(caminhoMiniatura = Uri.fromFile(fOrig).toString())
+                    return
+                }
+            }
+
+            // Troca imediatamente para o próximo item e baixa o arquivo completo da nuvem com prioridade
+            viewerFile = proximo
+            garantirFicheiroLocal(context, client, activeVaultUser, proximo, vm) { arqPronto ->
+                scope.launch(Dispatchers.Main) {
+                    if (viewerFile?.id == proximo.id && viewerFile?.dataUpload == proximo.dataUpload) {
+                        viewerFile = arqPronto
+                    }
+                }
+            }
+        }
+
+        var zoomScale by remember(cur.id, cur.dataUpload) { mutableFloatStateOf(1f) }
+        var zoomOffset by remember(cur.id, cur.dataUpload) { mutableStateOf(Offset.Zero) }
         val transformableState = rememberTransformableState { zoomChange, panChange, _ ->
             val novoScale = (zoomScale * zoomChange).coerceIn(1f, 5f)
             zoomScale = novoScale
@@ -7804,21 +8090,21 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
         }
 
-        var videoViewRef by remember { mutableStateOf<android.widget.VideoView?>(null) }
-        var isPlaying by remember { mutableStateOf(true) }
-        var currentPos by remember { mutableIntStateOf(0) }
-        var duration by remember { mutableIntStateOf(0) }
+        var videoViewRef by remember(cur.id, curMediaPath) { mutableStateOf<android.widget.VideoView?>(null) }
+        var isPlaying by remember(cur.id, curMediaPath) { mutableStateOf(true) }
+        var currentPos by remember(cur.id, curMediaPath) { mutableIntStateOf(0) }
+        var duration by remember(cur.id, curMediaPath) { mutableIntStateOf(0) }
 
-        var pdfPages by remember { mutableStateOf<List<Bitmap>>(emptyList()) }
-        var isLoadingDoc by remember { mutableStateOf(false) }
-        var textContent by remember { mutableStateOf<String?>(null) }
+        var pdfPages by remember(cur.id, curMediaPath) { mutableStateOf<List<Bitmap>>(emptyList()) }
+        var isLoadingDoc by remember(cur.id, curMediaPath) { mutableStateOf(false) }
+        var textContent by remember(cur.id, curMediaPath) { mutableStateOf<String?>(null) }
 
-        LaunchedEffect(curMediaPath, ext) {
-            if (isPdf) {
+        LaunchedEffect(cur.id, curMediaPath, ext) {
+            if (isPdf && arquivoCompletoExisteLocalmente(curMediaPath)) {
                 isLoadingDoc = true
                 pdfPages = withContext(Dispatchers.IO) { renderizarPaginasPdf(curMediaPath) }
                 isLoadingDoc = false
-            } else if (isText) {
+            } else if (isText && arquivoCompletoExisteLocalmente(curMediaPath)) {
                 isLoadingDoc = true
                 textContent = withContext(Dispatchers.IO) { lerTextoDocumento(curMediaPath) }
                 isLoadingDoc = false
@@ -7842,176 +8128,305 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
         Dialog(onDismissRequest = { viewerFile = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Box(Modifier.fillMaxSize().background(Color.Black).clipToBounds()) {
-                when {
-                    isImage -> {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .pointerInput(Unit) {
-                                    detectTapGestures(
-                                        onDoubleTap = {
-                                            if (zoomScale > 1.05f) {
-                                                zoomScale = 1f
-                                                zoomOffset = Offset.Zero
-                                            } else {
-                                                zoomScale = 2.5f
-                                            }
+                // Área central de mídia com gesto de deslizar horizontal (ativo quando sem zoom)
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(cur.id, cur.dataUpload, listaOrdenadaViewer.size, zoomScale) {
+                            if (zoomScale <= 1.05f && listaOrdenadaViewer.size > 1) {
+                                awaitPointerEventScope {
+                                    var startX = 0f
+                                    var startY = 0f
+                                    var tracking = false
+                                    var disparouSwipe = false
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val pointers = event.changes
+                                        if (pointers.size > 1) {
+                                            tracking = false
+                                            disparouSwipe = false
+                                            continue
                                         }
-                                    )
-                                }
-                                .transformable(state = transformableState),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            AsyncImage(
-                                model = Uri.parse(curMediaPath),
-                                contentDescription = cur.nomeArquivo,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .graphicsLayer(
-                                        scaleX = zoomScale,
-                                        scaleY = zoomScale,
-                                        translationX = zoomOffset.x,
-                                        translationY = zoomOffset.y
-                                    ),
-                                contentScale = ContentScale.Fit
-                            )
-                        }
-                    }
-                    isVideo -> {
-                        AndroidView(
-                            factory = { ctx ->
-                                android.widget.VideoView(ctx).apply {
-                                    setVideoURI(Uri.parse(curMediaPath))
-                                    setOnPreparedListener { mp ->
-                                        duration = mp.duration.coerceAtLeast(0)
-                                        start()
-                                        isPlaying = true
+                                        val change = pointers.firstOrNull() ?: continue
+                                        if (change.pressed && !tracking) {
+                                            tracking = true
+                                            disparouSwipe = false
+                                            startX = change.position.x
+                                            startY = change.position.y
+                                        } else if (change.pressed && tracking && !disparouSwipe) {
+                                            val dx = change.position.x - startX
+                                            val dy = change.position.y - startY
+                                            if (kotlin.math.abs(dx) > 95f && kotlin.math.abs(dx) > kotlin.math.abs(dy) * 1.35f) {
+                                                disparouSwipe = true
+                                                change.consume()
+                                                if (dx < 0f) navegarViewer(1) else navegarViewer(-1)
+                                            }
+                                        } else if (!change.pressed) {
+                                            tracking = false
+                                            disparouSwipe = false
+                                        }
                                     }
-                                    setOnCompletionListener {
-                                        isPlaying = false
-                                        currentPos = duration
-                                    }
-                                    videoViewRef = this
                                 }
-                            },
-                            modifier = Modifier.fillMaxSize().align(Alignment.Center)
-                        )
-                    }
-                    isPdf -> {
-                        if (isLoadingDoc) {
-                            Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
-                                CircularProgressIndicator(color = Gold)
-                                Spacer(Modifier.height(12.dp))
-                                Text("A renderizar páginas do PDF...", color = Color.White, fontSize = 13.sp)
                             }
-                        } else if (pdfPages.isNotEmpty()) {
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    when {
+                        isImage -> {
                             Box(
                                 modifier = Modifier
                                     .fillMaxSize()
-                                    .padding(top = 72.dp, bottom = 72.dp)
-                                    .pointerInput(Unit) {
+                                    .pointerInput(cur.id, cur.dataUpload) {
                                         detectTapGestures(
                                             onDoubleTap = {
                                                 if (zoomScale > 1.05f) {
                                                     zoomScale = 1f
                                                     zoomOffset = Offset.Zero
                                                 } else {
-                                                    zoomScale = 2.2f
+                                                    zoomScale = 2.5f
                                                 }
                                             }
                                         )
                                     }
-                                    .transformable(state = transformableState)
+                                    .transformable(state = transformableState),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .verticalScroll(rememberScrollState())
-                                        .padding(horizontal = 12.dp)
-                                        .graphicsLayer(
-                                            scaleX = zoomScale,
-                                            scaleY = zoomScale,
-                                            translationX = zoomOffset.x,
-                                            translationY = zoomOffset.y
-                                        ),
-                                    horizontalAlignment = Alignment.CenterHorizontally
-                                ) {
-                                    pdfPages.forEachIndexed { idx, paginaBmp ->
+                                if (curMediaPath.isNotBlank()) {
+                                    AsyncImage(
+                                        model = Uri.parse(curMediaPath),
+                                        contentDescription = cur.nomeArquivo,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .graphicsLayer(
+                                                scaleX = zoomScale,
+                                                scaleY = zoomScale,
+                                                translationX = zoomOffset.x,
+                                                translationY = zoomOffset.y
+                                            ),
+                                        contentScale = ContentScale.Fit
+                                    )
+                                } else {
+                                    CircularProgressIndicator(color = Gold)
+                                }
+                            }
+                        }
+                        isVideo -> {
+                            if (videoProntoLocal) {
+                                androidx.compose.runtime.key(cur.id, curMediaPath) {
+                                    AndroidView(
+                                        factory = { ctx ->
+                                            android.widget.VideoView(ctx).apply {
+                                                setVideoURI(Uri.parse(curMediaPath))
+                                                setOnPreparedListener { mp ->
+                                                    duration = mp.duration.coerceAtLeast(0)
+                                                    start()
+                                                    isPlaying = true
+                                                }
+                                                setOnCompletionListener {
+                                                    isPlaying = false
+                                                    currentPos = duration
+                                                }
+                                                videoViewRef = this
+                                            }
+                                        },
+                                        modifier = Modifier.fillMaxSize().align(Alignment.Center)
+                                    )
+                                }
+                            } else {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    if (thumbVideoPreview.isNotBlank() && miniaturaExisteLocalmente(thumbVideoPreview, cur.nomeArquivo)) {
+                                        AsyncImage(
+                                            model = obterUriCapaMidia(thumbVideoPreview),
+                                            contentDescription = cur.nomeArquivo,
+                                            contentScale = ContentScale.Fit,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                                    }
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        CircularProgressIndicator(color = Gold)
+                                        Spacer(Modifier.height(10.dp))
                                         Text(
-                                            "Página ${idx + 1} de ${pdfPages.size}",
+                                            text = if (viewerDownloadPct != null) "Baixando vídeo (${viewerDownloadPct}%)..." else "Carregando vídeo da nuvem...",
                                             color = Gold,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
                                         )
-                                        Image(
-                                            bitmap = paginaBmp.asImageBitmap(),
-                                            contentDescription = "Página ${idx + 1}",
-                                            contentScale = ContentScale.FillWidth,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .background(Color.White, RoundedCornerShape(6.dp))
-                                        )
-                                        Spacer(Modifier.height(12.dp))
                                     }
                                 }
                             }
-                        } else {
+                        }
+                        isPdf -> {
+                            if (isLoadingDoc || !arquivoCompletoExisteLocalmente(curMediaPath)) {
+                                Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    CircularProgressIndicator(color = Gold)
+                                    Spacer(Modifier.height(12.dp))
+                                    Text(
+                                        text = if (viewerDownloadPct != null) "Baixando PDF (${viewerDownloadPct}%)..." else "A renderizar páginas do PDF...",
+                                        color = Color.White,
+                                        fontSize = 13.sp
+                                    )
+                                }
+                            } else if (pdfPages.isNotEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(top = 72.dp, bottom = 72.dp)
+                                        .pointerInput(cur.id) {
+                                            detectTapGestures(
+                                                onDoubleTap = {
+                                                    if (zoomScale > 1.05f) {
+                                                        zoomScale = 1f
+                                                        zoomOffset = Offset.Zero
+                                                    } else {
+                                                        zoomScale = 2.2f
+                                                    }
+                                                }
+                                            )
+                                        }
+                                        .transformable(state = transformableState)
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .verticalScroll(rememberScrollState())
+                                            .padding(horizontal = 12.dp)
+                                            .graphicsLayer(
+                                                scaleX = zoomScale,
+                                                scaleY = zoomScale,
+                                                translationX = zoomOffset.x,
+                                                translationY = zoomOffset.y
+                                            ),
+                                        horizontalAlignment = Alignment.CenterHorizontally
+                                    ) {
+                                        pdfPages.forEachIndexed { idx, paginaBmp ->
+                                            Text(
+                                                "Página ${idx + 1} de ${pdfPages.size}",
+                                                color = Gold,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(top = 8.dp, bottom = 4.dp)
+                                            )
+                                            Image(
+                                                bitmap = paginaBmp.asImageBitmap(),
+                                                contentDescription = "Página ${idx + 1}",
+                                                contentScale = ContentScale.FillWidth,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .background(Color.White, RoundedCornerShape(6.dp))
+                                            )
+                                            Spacer(Modifier.height(12.dp))
+                                        }
+                                    }
+                                }
+                            } else {
+                                Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(64.dp))
+                                    Spacer(Modifier.height(16.dp))
+                                    Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+                                    Spacer(Modifier.height(20.dp))
+                                    Button(
+                                        onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Gold)
+                                    ) {
+                                        Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("ABRIR NO LEITOR DE PDF", color = BgBlack, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                        }
+                        isText && !textContent.isNullOrBlank() -> {
+                            val tamanhoFonteTexto = (13f * zoomScale).coerceIn(11f, 32f).sp
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(top = 76.dp, bottom = 76.dp, start = 16.dp, end = 16.dp)
+                                    .background(SurfaceDark, RoundedCornerShape(12.dp))
+                                    .padding(16.dp)
+                                    .verticalScroll(rememberScrollState())
+                            ) {
+                                Text(textContent!!, color = Color.White, fontSize = tamanhoFonteTexto)
+                            }
+                        }
+                        else -> {
                             Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(64.dp))
+                                Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(72.dp))
                                 Spacer(Modifier.height(16.dp))
-                                Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                                Spacer(Modifier.height(20.dp))
+                                Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, textAlign = TextAlign.Center)
+                                Spacer(Modifier.height(8.dp))
+                                Text("Tamanho: ${formatarTamanhoNuvem(cur.tamanhoBytes)}", color = TextGrey, fontSize = 12.sp)
+                                Spacer(Modifier.height(24.dp))
                                 Button(
                                     onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Gold)
+                                    colors = ButtonDefaults.buttonColors(containerColor = Gold),
+                                    modifier = Modifier.fillMaxWidth(0.8f).height(50.dp)
                                 ) {
                                     Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
                                     Spacer(Modifier.width(8.dp))
-                                    Text("ABRIR NO LEITOR DE PDF", color = BgBlack, fontWeight = FontWeight.Bold)
+                                    Text("ABRIR DOCUMENTO", color = BgBlack, fontWeight = FontWeight.Bold)
                                 }
                             }
                         }
                     }
-                    isText && !textContent.isNullOrBlank() -> {
-                        val tamanhoFonteTexto = (13f * zoomScale).coerceIn(11f, 32f).sp
+
+                    // Aviso discreto quando estiver baixando a versão HD da foto ao deslizar
+                    if (isImage && viewerDownloadPct != null && !arquivoCompletoExisteLocalmente(completoCacheViewer)) {
                         Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .padding(top = 76.dp, bottom = 76.dp, start = 16.dp, end = 16.dp)
-                                .background(SurfaceDark, RoundedCornerShape(12.dp))
-                                .padding(16.dp)
-                                .verticalScroll(rememberScrollState())
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = 74.dp)
+                                .background(BgBlack.copy(alpha = 0.8f), RoundedCornerShape(16.dp))
+                                .border(1.dp, Gold.copy(alpha = 0.6f), RoundedCornerShape(16.dp))
+                                .padding(horizontal = 12.dp, vertical = 5.dp)
                         ) {
-                            Text(textContent!!, color = Color.White, fontSize = tamanhoFonteTexto)
+                            Text(
+                                "Carregando HD (${viewerDownloadPct}%)...",
+                                color = Gold,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
-                    else -> {
-                        Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.InsertDriveFile, null, tint = Gold, modifier = Modifier.size(72.dp))
-                            Spacer(Modifier.height(16.dp))
-                            Text(cur.nomeArquivo, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp, textAlign = TextAlign.Center)
-                            Spacer(Modifier.height(8.dp))
-                            Text("Tamanho: ${formatarTamanhoNuvem(cur.tamanhoBytes)}", color = TextGrey, fontSize = 12.sp)
-                            Spacer(Modifier.height(24.dp))
-                            Button(
-                                onClick = { abrirFicheiroExterno(context, curMediaPath, cur.nomeArquivo) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Gold),
-                                modifier = Modifier.fillMaxWidth(0.8f).height(50.dp)
-                            ) {
-                                Icon(Icons.Default.OpenInNew, null, tint = BgBlack)
-                                Spacer(Modifier.width(8.dp))
-                                Text("ABRIR DOCUMENTO", color = BgBlack, fontWeight = FontWeight.Bold)
-                            }
+
+                    // Setas laterais discretas para alternar com 1 toque além do deslizar
+                    if (zoomScale <= 1.05f && temAnterior) {
+                        IconButton(
+                            onClick = { navegarViewer(-1) },
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .padding(start = 6.dp)
+                                .size(38.dp)
+                                .background(BgBlack.copy(alpha = 0.48f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.KeyboardArrowLeft, contentDescription = "Anterior", tint = Gold)
+                        }
+                    }
+                    if (zoomScale <= 1.05f && temProximo) {
+                        IconButton(
+                            onClick = { navegarViewer(1) },
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .padding(end = 6.dp)
+                                .size(38.dp)
+                                .background(BgBlack.copy(alpha = 0.48f), CircleShape)
+                        ) {
+                            Icon(Icons.Default.KeyboardArrowRight, contentDescription = "Próximo", tint = Gold)
                         }
                     }
                 }
 
+                // Barra superior do visualizador (com contador de posição da galeria)
                 Row(Modifier.fillMaxWidth().background(BgBlack.copy(alpha = 0.85f)).padding(12.dp).align(Alignment.TopCenter), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClick = { viewerFile = null }) { Icon(Icons.Default.ArrowBack, null, tint = Color.White) }
                     Column(Modifier.weight(1f).padding(horizontal = 8.dp)) {
                         Text(cur.nomeArquivo, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(formatarDataNuvem(cur.dataUpload), color = TextGrey, fontSize = 10.sp, maxLines = 1)
+                        val infoSubtitulo = if (indiceViewer != -1 && listaOrdenadaViewer.size > 1) {
+                            "${indiceViewer + 1} / ${listaOrdenadaViewer.size} • ${formatarDataNuvem(cur.dataUpload)}"
+                        } else {
+                            formatarDataNuvem(cur.dataUpload)
+                        }
+                        Text(infoSubtitulo, color = TextGrey, fontSize = 10.sp, maxLines = 1)
                     }
                     if (suportaIA) {
                         IconButton(onClick = { abrirAnaliseIA(cur) }) {
@@ -8096,7 +8511,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                 }
 
-                if (isVideo) {
+                if (isVideo && videoProntoLocal) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -8198,166 +8613,224 @@ fun NexusUI(dao: NexusDao, client: Client) {
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
-                Column(Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
-                    Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(48.dp))
-                    Spacer(Modifier.height(12.dp))
-                    Text("Cofre [$vaultStorageMode]: $activeVaultUser", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 19.sp)
-                    Text("Nexus Cloud $NEXUS_VERSION • SSD ${mascararNumeroComAsterisco(phoneNumber)}", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                }
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Storage, null) },
-                    label = { Text("Armazenamento do Cofre ($vaultStorageMode)") },
-                    selected = false,
-                    onClick = { showStorage = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.AutoAwesome, null) },
-                    label = {
-                        val totalIdx = remember(iaIndexTick, arquivos.size) { NexusAI.totalIndexados(context) }
-                        Text(if (indexandoLoteIA) "Indexando com Nexus IA..." else "Indexar Busca IA ($totalIdx lido(s))")
-                    },
-                    selected = false,
-                    onClick = {
-                        scope.launch {
-                            drawerState.close()
-                            if (indexandoLoteIA) return@launch
-                            val candidatos = arquivos.filter { arq ->
-                                NexusAI.suportaLeituraIA(arq.nomeArquivo) &&
-                                    NexusAI.obterTextoIndexado(context, arq.dataUpload).isBlank() &&
-                                    (NexusThumbCache.obterArquivoCompleto(arq).isNotBlank() ||
-                                        NexusThumbCache.obterMiniatura(arq).isNotBlank())
-                            }
-                            if (candidatos.isEmpty()) {
-                                Toast.makeText(context, "Todos os arquivos locais já estão indexados pela Nexus IA!", Toast.LENGTH_SHORT).show()
-                                return@launch
-                            }
-                            indexandoLoteIA = true
-                            NexusLeituraNuvem.iniciar(candidatos.size, "Nexus IA indexando textos offline...")
-                            var lidosIA = 0
-                            withContext(Dispatchers.IO) {
-                                for ((idx, arq) in candidatos.withIndex()) {
-                                    if (!NexusLeituraNuvem.ativo.value) break
-                                    NexusLeituraNuvem.avancar(idx, candidatos.size, "Nexus IA lendo: ${arq.nomeArquivo}")
-                                    val caminho = NexusThumbCache.obterArquivoCompleto(arq)
-                                        .ifBlank { NexusThumbCache.obterMiniatura(arq) }
-                                    val txt = NexusAI.extrairTextoDeArquivo(appContext, caminho, arq.nomeArquivo, arq.dataUpload)
-                                    if (txt.isNotBlank()) lidosIA++
-                                    NexusLeituraNuvem.concluirItem()
+                Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+                    Column(Modifier.fillMaxWidth().background(SurfaceDarker).padding(32.dp)) {
+                        Icon(Icons.Default.Person, null, tint = Gold, modifier = Modifier.size(48.dp))
+                        Spacer(Modifier.height(12.dp))
+                        Text("Cofre [$vaultStorageMode]: $activeVaultUser", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 19.sp)
+                        Text("Nexus Cloud $NEXUS_VERSION • SSD ${mascararNumeroComAsterisco(phoneNumber)}", color = Gold, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Storage, null) },
+                        label = { Text("Armazenamento do Cofre ($vaultStorageMode)") },
+                        selected = false,
+                        onClick = { showStorage = true; scope.launch { drawerState.close() } },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.AutoAwesome, null) },
+                        label = {
+                            val totalIdx = remember(iaIndexTick, arquivos.size) { NexusAI.totalIndexados(context) }
+                            Text(if (indexandoLoteIA) "Indexando com Nexus IA..." else "Indexar Busca IA ($totalIdx lido(s))")
+                        },
+                        selected = false,
+                        onClick = {
+                            scope.launch {
+                                drawerState.close()
+                                if (indexandoLoteIA) return@launch
+                                val candidatos = arquivos.filter { arq ->
+                                    NexusAI.suportaLeituraIA(arq.nomeArquivo) &&
+                                        NexusAI.obterTextoIndexado(context, arq.dataUpload).isBlank() &&
+                                        (NexusThumbCache.obterArquivoCompleto(arq).isNotBlank() ||
+                                            NexusThumbCache.obterMiniatura(arq).isNotBlank())
                                 }
-                            }
-                            NexusLeituraNuvem.encerrar()
-                            indexandoLoteIA = false
-                            iaIndexTick++
-                            Toast.makeText(context, "Nexus IA indexou $lidosIA arquivo(s) para busca por texto!", Toast.LENGTH_LONG).show()
-                        }
-                    },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Refresh, null) },
-                    label = { Text("Cache do SSD Nexus") },
-                    selected = false,
-                    onClick = { showCacheDialog = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Sync, null) },
-                    label = { Text("Sincronização Auto") },
-                    selected = false,
-                    onClick = { showSync = true; scope.launch { drawerState.close() } },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.CloudUpload, null) },
-                    label = { Text("Salvar Pastas na Nuvem ($vaultStorageMode)") },
-                    selected = false,
-                    onClick = {
-                        scope.launch {
-                            drawerState.close()
-                            Toast.makeText(context, "Salvando estrutura de pastas na nuvem SSD...", Toast.LENGTH_SHORT).show()
-                            backupCompletoPastasNaNuvem(context, client, activeVaultUser, pastas, arquivos, mapaPastas) { msg ->
-                                cloudBannerText = msg
-                                Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
-                            }
-                        }
-                    },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.CloudDownload, null) },
-                    label = { Text("Restaurar Cofre da Nuvem ($vaultStorageMode)") },
-                    selected = false,
-                    onClick = {
-                        scope.launch {
-                            drawerState.close()
-                            verificarStatusRemotoCliente(context, client, activeVaultUser) { bloqueadoRemoto, motivoRemoto ->
-                                if (bloqueadoRemoto) {
-                                    scope.launch(Dispatchers.Main) {
-                                        jobFilaMiniaturas?.cancel()
-                                        NexusLeituraNuvem.encerrar()
-                                        NexusTransfer.cancelar(client)
-                                        vaultUnlocked = false
-                                        vaultBlocked = true
-                                        vaultBlockedReason = motivoRemoto
+                                if (candidatos.isEmpty()) {
+                                    Toast.makeText(context, "Todos os arquivos locais já estão indexados pela Nexus IA!", Toast.LENGTH_SHORT).show()
+                                    return@launch
+                                }
+                                indexandoLoteIA = true
+                                NexusLeituraNuvem.iniciar(candidatos.size, "Nexus IA indexando textos offline...")
+                                var lidosIA = 0
+                                withContext(Dispatchers.IO) {
+                                    for ((idx, arq) in candidatos.withIndex()) {
+                                        if (!NexusLeituraNuvem.ativo.value) break
+                                        NexusLeituraNuvem.avancar(idx, candidatos.size, "Nexus IA lendo: ${arq.nomeArquivo}")
+                                        val caminho = NexusThumbCache.obterArquivoCompleto(arq)
+                                            .ifBlank { NexusThumbCache.obterMiniatura(arq) }
+                                        val txt = NexusAI.extrairTextoDeArquivo(appContext, caminho, arq.nomeArquivo, arq.dataUpload)
+                                        if (txt.isNotBlank()) lidosIA++
+                                        NexusLeituraNuvem.concluirItem()
                                     }
-                                    return@verificarStatusRemotoCliente
                                 }
-                                scope.launch(Dispatchers.Main) {
-                                    cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD ($vaultStorageMode)..."
-                                    val atuaisReais = vm.obterArquivosReais()
-                                    sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, dao, vm) { qtd ->
+                                NexusLeituraNuvem.encerrar()
+                                indexandoLoteIA = false
+                                iaIndexTick++
+                                Toast.makeText(context, "Nexus IA indexou $lidosIA arquivo(s) para busca por texto!", Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                    )
+                    // Chave liga/desliga do OCR automático no upload (economia de bateria em lotes grandes)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                val novo = !ocrAutoNoUpload
+                                ocrAutoNoUpload = novo
+                                salvarOcrAutoNoUpload(context, novo)
+                                Toast.makeText(
+                                    context,
+                                    if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                            .padding(horizontal = 24.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.AutoAwesome,
+                            contentDescription = null,
+                            tint = if (ocrAutoNoUpload) Gold else TextGrey
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "OCR Auto no Upload",
+                                color = Color.White,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                if (ocrAutoNoUpload) "Ativado (lê textos ao enviar)" else "Desligado (poupa bateria)",
+                                color = if (ocrAutoNoUpload) Gold else TextGrey,
+                                fontSize = 10.sp
+                            )
+                        }
+                        Switch(
+                            checked = ocrAutoNoUpload,
+                            onCheckedChange = { novo ->
+                                ocrAutoNoUpload = novo
+                                salvarOcrAutoNoUpload(context, novo)
+                                Toast.makeText(
+                                    context,
+                                    if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = BgBlack,
+                                checkedTrackColor = Gold,
+                                uncheckedThumbColor = TextGrey,
+                                uncheckedTrackColor = SurfaceDarker
+                            )
+                        )
+                    }
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Refresh, null) },
+                        label = { Text("Cache do SSD Nexus") },
+                        selected = false,
+                        onClick = { showCacheDialog = true; scope.launch { drawerState.close() } },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Sync, null) },
+                        label = { Text("Sincronização Auto") },
+                        selected = false,
+                        onClick = { showSync = true; scope.launch { drawerState.close() } },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = TextGrey)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.CloudUpload, null) },
+                        label = { Text("Salvar Pastas na Nuvem ($vaultStorageMode)") },
+                        selected = false,
+                        onClick = {
+                            scope.launch {
+                                drawerState.close()
+                                Toast.makeText(context, "Salvando estrutura de pastas na nuvem SSD...", Toast.LENGTH_SHORT).show()
+                                backupCompletoPastasNaNuvem(context, client, activeVaultUser, pastas, arquivos, mapaPastas) { msg ->
+                                    cloudBannerText = msg
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.CloudDownload, null) },
+                        label = { Text("Restaurar Cofre da Nuvem ($vaultStorageMode)") },
+                        selected = false,
+                        onClick = {
+                            scope.launch {
+                                drawerState.close()
+                                verificarStatusRemotoCliente(context, client, activeVaultUser) { bloqueadoRemoto, motivoRemoto ->
+                                    if (bloqueadoRemoto) {
                                         scope.launch(Dispatchers.Main) {
+                                            jobFilaMiniaturas?.cancel()
                                             NexusLeituraNuvem.encerrar()
-                                            delay(150)
-                                            val aposSync = vm.obterArquivosReais()
-                                            withContext(Dispatchers.IO) {
-                                                limparDuplicadosExistentes(appContext, aposSync, vm) {}
+                                            NexusTransfer.cancelar(client)
+                                            vaultUnlocked = false
+                                            vaultBlocked = true
+                                            vaultBlockedReason = motivoRemoto
+                                        }
+                                        return@verificarStatusRemotoCliente
+                                    }
+                                    scope.launch(Dispatchers.Main) {
+                                        cloudBannerText = "A procurar ficheiros de $activeVaultUser na nuvem SSD ($vaultStorageMode)..."
+                                        val atuaisReais = vm.obterArquivosReais()
+                                        sincronizarCofreDaNuvem(context, client, activeVaultUser, atuaisReais, dao, vm) { qtd ->
+                                            scope.launch(Dispatchers.Main) {
+                                                NexusLeituraNuvem.encerrar()
+                                                delay(150)
+                                                val aposSync = vm.obterArquivosReais()
+                                                withContext(Dispatchers.IO) {
+                                                    limparDuplicadosExistentes(appContext, aposSync, vm) {}
+                                                }
+                                                mapaDonos = carregarDonosFicheiros(context)
+                                                mapaPastas = carregarVinculosPastas(context)
+                                                pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
+                                                cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD ($vaultStorageMode)!" else "Cofre SSD [$vaultStorageMode] de $activeVaultUser atualizado!"
+                                                Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                                             }
-                                            mapaDonos = carregarDonosFicheiros(context)
-                                            mapaPastas = carregarVinculosPastas(context)
-                                            pastasDoUsuarioSet = carregarPastasDoUsuario(context, activeVaultUser)
-                                            cloudBannerText = if (qtd > 0) "$qtd ficheiro(s) restaurados da nuvem SSD ($vaultStorageMode)!" else "Cofre SSD [$vaultStorageMode] de $activeVaultUser atualizado!"
-                                            Toast.makeText(context, cloudBannerText, Toast.LENGTH_SHORT).show()
                                         }
                                     }
                                 }
                             }
-                        }
-                    },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Info, null) },
-                    label = { Text("Sobre") },
-                    selected = false,
-                    onClick = {
-                        showAboutDialog = true
-                        scope.launch { drawerState.close() }
-                    },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
-                )
-                NavigationDrawerItem(
-                    icon = { Icon(Icons.Default.Lock, null) },
-                    label = { Text("Trancar / Trocar Cofre") },
-                    selected = false,
-                    onClick = {
-                        scope.launch { drawerState.close() }
-                        jobFilaMiniaturas?.cancel()
-                        NexusLeituraNuvem.encerrar()
-                        NexusTransfer.cancelar(client)
-                        pastaAberta = null
-                        selectedFileIds = emptySet()
-                        isSelectionMode = false
-                        vaultNameInput = ""
-                        vaultPinInput = ""
-                        vaultErrorMsg = null
-                        showAdminPanel = false
-                        isSwitchingUser = false
-                        vaultUnlocked = false
-                    },
-                    colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
-                )
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Info, null) },
+                        label = { Text("Sobre") },
+                        selected = false,
+                        onClick = {
+                            showAboutDialog = true
+                            scope.launch { drawerState.close() }
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
+                    )
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.Lock, null) },
+                        label = { Text("Trancar / Trocar Cofre") },
+                        selected = false,
+                        onClick = {
+                            scope.launch { drawerState.close() }
+                            jobFilaMiniaturas?.cancel()
+                            NexusLeituraNuvem.encerrar()
+                            NexusTransfer.cancelar(client)
+                            pastaAberta = null
+                            selectedFileIds = emptySet()
+                            isSelectionMode = false
+                            vaultNameInput = ""
+                            vaultPinInput = ""
+                            vaultErrorMsg = null
+                            showAdminPanel = false
+                            isSwitchingUser = false
+                            vaultUnlocked = false
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = DangerRed, unselectedIconColor = DangerRed)
+                    )
+                    Spacer(Modifier.height(16.dp))
+                }
             }
         }
     ) {
@@ -8404,7 +8877,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                         }
                     } else {
-                        // Barra superior limpa: sem o texto "NEXUS CLOUD v2.1", apenas menu e botões de ação
+                        // Barra superior limpa com botão de progresso/cadeado isolado
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -8424,15 +8897,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }) {
                                 Icon(if (showSearchBar) Icons.Default.Close else Icons.Default.Search, contentDescription = "Pesquisar", tint = Gold)
                             }
-                            if (transferProgress != null || isUploading) {
-                                Text("${transferProgress ?: 10}%", color = Gold, fontWeight = FontWeight.Black, fontSize = 13.sp, modifier = Modifier.padding(end = 6.dp))
-                                if (!transferPaused) {
-                                    CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
-                                } else {
-                                    Icon(Icons.Default.Pause, contentDescription = "Pausado", tint = Gold, modifier = Modifier.size(18.dp))
-                                }
-                            } else {
-                                IconButton(onClick = {
+                            BotaoTopoProgressoOuCadeado(
+                                onTrancar = {
                                     jobFilaMiniaturas?.cancel()
                                     NexusLeituraNuvem.encerrar()
                                     NexusTransfer.cancelar(client)
@@ -8444,196 +8910,24 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     showAdminPanel = false
                                     isSwitchingUser = false
                                     vaultUnlocked = false
-                                }) {
-                                    Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
                                 }
-                            }
+                            )
                         }
                     }
 
-                    // === BARRA ÚNICA DE DOWNLOAD / ENVIO EM SEGUNDO PLANO COM PAUSAR / CONTINUAR / CANCELAR ===
-                    if (transferProgress != null || isUploading) {
-                        val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
-                        val fra = pctAtual / 100f
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 4.dp)
-                                .background(SurfaceDarker, RoundedCornerShape(10.dp))
-                                .border(1.dp, if (transferPaused) DangerRed else Gold, RoundedCornerShape(10.dp))
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                                    Text(
-                                        text = when {
-                                            transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO [$vaultStorageMode] ($pctAtual%)"
-                                            transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO [$vaultStorageMode] ($pctAtual%)"
-                                            transferIsUpload -> "⬆️ ENVIANDO EM SEGUNDO PLANO [$vaultStorageMode] ($pctAtual%)"
-                                            else -> "⬇️ BAIXANDO COM PRIORIDADE [$vaultStorageMode] ($pctAtual%)"
-                                        },
-                                        color = if (transferPaused) DangerRed else Gold,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.Black
-                                    )
-                                    Text(
-                                        text = transferLabel.ifBlank { "Processando transferência..." },
-                                        color = Color.White,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Button(
-                                        onClick = { NexusTransfer.alternarPausa(client) },
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = if (transferPaused) Gold else SurfaceDark
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                                        modifier = Modifier.height(32.dp)
-                                    ) {
-                                        Icon(
-                                            imageVector = if (transferPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                                            contentDescription = if (transferPaused) "Continuar" else "Pausar",
-                                            tint = if (transferPaused) BgBlack else Gold,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                        Spacer(Modifier.width(4.dp))
-                                        Text(
-                                            text = if (transferPaused) "CONTINUAR" else "PAUSAR",
-                                            color = if (transferPaused) BgBlack else Gold,
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Black
-                                        )
-                                    }
-
-                                    IconButton(
-                                        onClick = {
-                                            NexusTransfer.cancelar(client)
-                                            cloudBannerText = "Transferência cancelada."
-                                            Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
-                                        },
-                                        modifier = Modifier
-                                            .size(32.dp)
-                                            .background(DangerRed.copy(alpha = 0.2f), CircleShape)
-                                    ) {
-                                        Icon(
-                                            Icons.Default.Close,
-                                            contentDescription = "Cancelar transferência",
-                                            tint = DangerRed,
-                                            modifier = Modifier.size(16.dp)
-                                        )
-                                    }
-                                }
-                            }
-
-                            Spacer(Modifier.height(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(SurfaceDark)
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth(fra)
-                                        .height(6.dp)
-                                        .background(
-                                            if (transferPaused) Brush.horizontalGradient(listOf(DangerRed, DangerRed))
-                                            else Brush.horizontalGradient(listOf(Gold, DangerRed))
-                                        )
-                                )
-                            }
+                    // Barra de progresso 100% isolada (não redesenha a galeria a cada %)
+                    BarraProgressoIsoladaSSD(
+                        context = context,
+                        client = client,
+                        vaultStorageMode = vaultStorageMode,
+                        onCancelarLeitura = {
+                            jobFilaMiniaturas?.cancel()
+                            NexusLeituraNuvem.encerrar()
+                        },
+                        onTransferCancelada = {
+                            cloudBannerText = "Transferência cancelada."
                         }
-                    } else if (leituraAtiva && leituraTotal > 0) {
-                        val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
-                        val avancoSuave = (lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()
-                        val fracaoLeitura = avancoSuave.coerceIn(0.02f, 1f)
-                        val pctLeitura = (fracaoLeitura * 100).toInt().coerceIn(1, 100)
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 14.dp, vertical = 4.dp)
-                                .background(SurfaceDarker, RoundedCornerShape(10.dp))
-                                .border(1.dp, Gold.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                                .padding(horizontal = 12.dp, vertical = 8.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (leituraPausada) "⏸ PAUSADO: ${leituraTitulo.ifBlank { "Leitura da nuvem SSD" }}"
-                                    else leituraTitulo.ifBlank { "Lendo arquivos da nuvem SSD..." },
-                                    color = if (leituraPausada) Gold else Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f).padding(end = 8.dp)
-                                )
-                                Text(
-                                    text = "${(lidosSafe + 1).coerceAtMost(leituraTotal)} / $leituraTotal ($pctLeitura%)",
-                                    color = Gold,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Black,
-                                    modifier = Modifier.padding(end = 6.dp)
-                                )
-                                IconButton(
-                                    onClick = { NexusLeituraNuvem.alternarPausa() },
-                                    modifier = Modifier.size(26.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = if (leituraPausada) Icons.Default.PlayArrow else Icons.Default.Pause,
-                                        contentDescription = if (leituraPausada) "Continuar leitura" else "Pausar leitura",
-                                        tint = Gold,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                                IconButton(
-                                    onClick = {
-                                        jobFilaMiniaturas?.cancel()
-                                        NexusLeituraNuvem.encerrar()
-                                    },
-                                    modifier = Modifier.size(26.dp)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Close,
-                                        contentDescription = "Fechar barra de leitura",
-                                        tint = TextGrey,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                }
-                            }
-                            Spacer(Modifier.height(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(6.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(SurfaceDark)
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth(fracaoLeitura)
-                                        .height(6.dp)
-                                        .background(Brush.horizontalGradient(listOf(Gold, DangerRed)))
-                                )
-                            }
-                        }
-                    }
+                    )
 
                     if (showSearchBar) {
                         OutlinedTextField(
@@ -9147,4 +9441,4 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 }
-// === FIM DO NEXUSUI.KT v2.1 ===
+// === FIM DO NEXUSUI.KT v2.2 ===
