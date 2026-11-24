@@ -4422,7 +4422,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS COM BARRA LATERAL DE VELOCIDADE E PREVIEWS ULTRALEVES ===
+// === GRELHA DE ARQUIVOS COM 3 COLUNAS, 4 COLUNAS, LISTA E BARRA LATERAL DE VELOCIDADE ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -4434,9 +4434,19 @@ fun GrelhaArquivos(
     mapaPastas: Map<Long, String>,
     modoSelecao: Boolean,
     idsSelecionados: Set<Int>,
+    modoVisualizacao: Int = 3,
     onFileClick: (ArquivoNuvem) -> Unit,
     onFileLongClick: (ArquivoNuvem) -> Unit
 ) {
+    val colunas = when (modoVisualizacao) {
+        1 -> 1
+        4 -> 4
+        else -> 3
+    }
+    val ehLista = colunas == 1
+    val ehQuatroColunas = colunas == 4
+    val tamanhoDecode = if (ehQuatroColunas) 160 else 220
+
     val gruposPorData = remember(lista) {
         lista
             .distinctBy { "${it.dataUpload}_${limparPrefixoTimestamp(it.nomeArquivo).lowercase(Locale.ROOT)}" }
@@ -4492,11 +4502,13 @@ fun GrelhaArquivos(
         val usableTrackPx = (trackHeightPx - thumbHeightPx).coerceAtLeast(1f)
 
         LazyVerticalGrid(
-            columns = GridCells.Fixed(3),
+            columns = GridCells.Fixed(colunas),
             state = gridState,
-            modifier = Modifier.fillMaxSize().padding(1.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-            verticalArrangement = Arrangement.spacedBy(2.dp)
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = if (ehLista) 8.dp else 1.dp, vertical = 1.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (ehLista) 0.dp else 2.dp),
+            verticalArrangement = Arrangement.spacedBy(if (ehLista) 6.dp else 2.dp)
         ) {
             gruposPorData.forEach { (dataCabecalho, arquivosDoDia) ->
 
@@ -4531,7 +4543,7 @@ fun GrelhaArquivos(
                 itemsIndexed(
                     items = arquivosDoDia,
                     key = { idx, arq -> "item_${arq.id}_${arq.dataUpload}_${arq.nomeArquivo}_$idx" },
-                    contentType = { _, _ -> "item_midia" }
+                    contentType = { _, _ -> if (ehLista) "item_lista" else "item_midia" }
                 ) { _, arq ->
                     val ext = remember(arq.nomeArquivo) { arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT) }
                     val pasta = mapaPastas[arq.dataUpload]
@@ -4545,12 +4557,12 @@ fun GrelhaArquivos(
                         miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
                     }
 
-                    val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura) {
+                    val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura, tamanhoDecode) {
                         if (temArquivoMiniatura && thumbSafe.isNotBlank()) {
                             val targetUri = obterUriCapaMidia(thumbSafe)
                             ImageRequest.Builder(context)
                                 .data(targetUri)
-                                .size(220, 220)
+                                .size(tamanhoDecode, tamanhoDecode)
                                 .bitmapConfig(Bitmap.Config.RGB_565)
                                 .allowHardware(true)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
@@ -4583,145 +4595,301 @@ fun GrelhaArquivos(
                         }
                     }
 
-                    Box(
-                        Modifier
-                            .aspectRatio(1f)
-                            .background(SurfaceDark)
-                            .border(
-                                width = if (estaSelecionado) 3.dp else 0.dp,
-                                color = if (estaSelecionado) Gold else Color.Transparent
-                            )
-                            .combinedClickable(
-                                onClick = { onFileClick(arq) },
-                                onLongClick = { onFileLongClick(arq) }
-                            ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        when {
-                            isImage -> {
-                                if (thumbModelRequest != null) {
-                                    AsyncImage(
-                                        model = thumbModelRequest,
-                                        contentDescription = arq.nomeArquivo,
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                } else {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(22.dp))
-                                    }
-                                }
-                            }
-                            isVideo -> {
-                                Box(Modifier.fillMaxSize()) {
-                                    if (thumbModelRequest != null) {
-                                        AsyncImage(
-                                            model = thumbModelRequest,
-                                            contentDescription = "Video Preview",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
-                                    } else {
-                                        Column(
-                                            modifier = Modifier.align(Alignment.Center),
-                                            horizontalAlignment = Alignment.CenterHorizontally
-                                        ) {
-                                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
-                                            Spacer(Modifier.height(28.dp))
-                                            Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                    if (ehLista) {
+                        // === VISUALIZAÇÃO EM MODO LISTA ===
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = if (totalItensGrid > 15) 22.dp else 0.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (estaSelecionado) Gold.copy(alpha = 0.14f) else SurfaceDark)
+                                .border(
+                                    width = if (estaSelecionado) 1.5.dp else 0.8.dp,
+                                    color = if (estaSelecionado) Gold else SurfaceDarker,
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .combinedClickable(
+                                    onClick = { onFileClick(arq) },
+                                    onLongClick = { onFileLongClick(arq) }
+                                )
+                                .padding(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(54.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(SurfaceDarker),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                when {
+                                    isImage -> {
+                                        if (thumbModelRequest != null) {
+                                            AsyncImage(
+                                                model = thumbModelRequest,
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
                                         }
                                     }
-                                    Box(
-                                        modifier = Modifier
-                                            .size(38.dp)
-                                            .align(Alignment.Center)
-                                            .background(BgBlack.copy(alpha = 0.45f), CircleShape),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            Icons.Default.PlayArrow,
-                                            null,
-                                            tint = Color.White,
-                                            modifier = Modifier.size(24.dp)
-                                        )
+                                    isVideo -> {
+                                        if (thumbModelRequest != null) {
+                                            AsyncImage(
+                                                model = thumbModelRequest,
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .size(24.dp)
+                                                .background(BgBlack.copy(alpha = 0.65f), CircleShape),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(Icons.Default.PlayArrow, null, tint = Gold, modifier = Modifier.size(16.dp))
+                                        }
                                     }
-                                    Box(
-                                        modifier = Modifier
-                                            .align(Alignment.BottomEnd)
-                                            .padding(4.dp)
-                                            .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
-                                            .padding(horizontal = 4.dp, vertical = 1.dp)
-                                    ) {
-                                        Text("VÍDEO", color = Gold, fontSize = 7.sp, fontWeight = FontWeight.Bold)
+                                    ext == "PDF" -> {
+                                        val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                                        if (possuiCapa && thumbModelRequest != null) {
+                                            AsyncImage(
+                                                model = thumbModelRequest,
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(28.dp))
+                                        }
+                                    }
+                                    ext in listOf("ZIP", "RAR", "APK") -> {
+                                        Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(28.dp))
+                                    }
+                                    else -> {
+                                        Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(26.dp))
                                     }
                                 }
                             }
-                            ext == "PDF" -> {
-                                val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
-                                if (possuiCapa && thumbModelRequest != null) {
-                                    Box(Modifier.fillMaxSize()) {
+
+                            Spacer(Modifier.width(10.dp))
+
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = arq.nomeArquivo,
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(Modifier.height(3.dp))
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        text = "${formatarTamanhoNuvem(arq.tamanhoBytes)} • ${formatarDataNuvem(arq.dataUpload)}",
+                                        color = TextGrey,
+                                        fontSize = 10.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                if (!pasta.isNullOrBlank()) {
+                                    Spacer(Modifier.height(3.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .background(Gold.copy(alpha = 0.16f), RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 5.dp, vertical = 1.dp)
+                                    ) {
+                                        Text(pasta, color = Gold, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                                    }
+                                }
+                            }
+
+                            Spacer(Modifier.width(8.dp))
+
+                            if (modoSelecao) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(24.dp)
+                                        .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
+                                        .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (estaSelecionado) {
+                                        Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(16.dp))
+                                    }
+                                }
+                            } else if (ext.isNotBlank()) {
+                                Box(
+                                    modifier = Modifier
+                                        .background(SurfaceDarker, RoundedCornerShape(6.dp))
+                                        .border(1.dp, Gold.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
+                                        .padding(horizontal = 6.dp, vertical = 3.dp)
+                                ) {
+                                    Text(
+                                        text = ext.take(4),
+                                        color = if (ext == "PDF") DangerRed else Gold,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Black
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        // === VISUALIZAÇÃO EM GRADE (3 OU 4 COLUNAS) ===
+                        Box(
+                            Modifier
+                                .aspectRatio(1f)
+                                .background(SurfaceDark)
+                                .border(
+                                    width = if (estaSelecionado) 3.dp else 0.dp,
+                                    color = if (estaSelecionado) Gold else Color.Transparent
+                                )
+                                .combinedClickable(
+                                    onClick = { onFileClick(arq) },
+                                    onLongClick = { onFileLongClick(arq) }
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            when {
+                                isImage -> {
+                                    if (thumbModelRequest != null) {
                                         AsyncImage(
                                             model = thumbModelRequest,
                                             contentDescription = arq.nomeArquivo,
                                             contentScale = ContentScale.Crop,
                                             modifier = Modifier.fillMaxSize()
                                         )
-                                        Box(
-                                            Modifier
-                                                .align(Alignment.BottomEnd)
-                                                .padding(4.dp)
-                                                .background(DangerRed, RoundedCornerShape(4.dp))
-                                                .padding(horizontal = 4.dp, vertical = 2.dp)
-                                        ) {
-                                            Text("PDF", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                    } else {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                            CircularProgressIndicator(
+                                                color = Gold,
+                                                strokeWidth = 2.dp,
+                                                modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 22.dp)
+                                            )
                                         }
                                     }
-                                } else {
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                                        Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(32.dp))
-                                        Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                isVideo -> {
+                                    Box(Modifier.fillMaxSize()) {
+                                        if (thumbModelRequest != null) {
+                                            AsyncImage(
+                                                model = thumbModelRequest,
+                                                contentDescription = "Video Preview",
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                        } else {
+                                            Column(
+                                                modifier = Modifier.align(Alignment.Center),
+                                                horizontalAlignment = Alignment.CenterHorizontally
+                                            ) {
+                                                CircularProgressIndicator(
+                                                    color = Gold,
+                                                    strokeWidth = 2.dp,
+                                                    modifier = Modifier.size(if (ehQuatroColunas) 16.dp else 20.dp)
+                                                )
+                                                if (!ehQuatroColunas) {
+                                                    Spacer(Modifier.height(28.dp))
+                                                    Text("Gerando capa...", color = TextGrey, fontSize = 8.sp)
+                                                }
+                                            }
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .size(if (ehQuatroColunas) 30.dp else 38.dp)
+                                                .align(Alignment.Center)
+                                                .background(BgBlack.copy(alpha = 0.45f), CircleShape),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                Icons.Default.PlayArrow,
+                                                null,
+                                                tint = Color.White,
+                                                modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 24.dp)
+                                            )
+                                        }
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.BottomEnd)
+                                                .padding(3.dp)
+                                                .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                                        ) {
+                                            Text("VÍDEO", color = Gold, fontSize = if (ehQuatroColunas) 6.sp else 7.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                                ext == "PDF" -> {
+                                    val possuiCapa = remember(thumbSafe) { temCapaPdfLocal(thumbSafe) }
+                                    if (possuiCapa && thumbModelRequest != null) {
+                                        Box(Modifier.fillMaxSize()) {
+                                            AsyncImage(
+                                                model = thumbModelRequest,
+                                                contentDescription = arq.nomeArquivo,
+                                                contentScale = ContentScale.Crop,
+                                                modifier = Modifier.fillMaxSize()
+                                            )
+                                            Box(
+                                                Modifier
+                                                    .align(Alignment.BottomEnd)
+                                                    .padding(4.dp)
+                                                    .background(DangerRed, RoundedCornerShape(4.dp))
+                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                                            ) {
+                                                Text("PDF", color = Color.White, fontSize = if (ehQuatroColunas) 7.sp else 8.sp, fontWeight = FontWeight.Bold)
+                                            }
+                                        }
+                                    } else {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                            Icon(Icons.Default.PictureAsPdf, null, tint = DangerRed, modifier = Modifier.size(if (ehQuatroColunas) 24.dp else 32.dp))
+                                            Text(arq.nomeArquivo, color = TextGrey, fontSize = if (ehQuatroColunas) 8.sp else 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        }
+                                    }
+                                }
+                                ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                    Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(if (ehQuatroColunas) 24.dp else 32.dp))
+                                    Text(arq.nomeArquivo, color = TextGrey, fontSize = if (ehQuatroColunas) 8.sp else 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
+                                    Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(if (ehQuatroColunas) 22.dp else 28.dp))
+                                    Text(arq.nomeArquivo, color = TextGrey, fontSize = if (ehQuatroColunas) 8.sp else 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                            }
+
+                            if (estaSelecionado) {
+                                Box(Modifier.fillMaxSize().background(Gold.copy(alpha = 0.22f)))
+                            }
+
+                            if (modoSelecao) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(if (ehQuatroColunas) 4.dp else 6.dp)
+                                        .size(if (ehQuatroColunas) 20.dp else 24.dp)
+                                        .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
+                                        .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (estaSelecionado) {
+                                        Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(if (ehQuatroColunas) 13.dp else 16.dp))
                                     }
                                 }
                             }
-                            ext in listOf("ZIP", "RAR", "APK") -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                                Icon(Icons.Default.FolderZip, null, tint = Gold, modifier = Modifier.size(32.dp))
-                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                            else -> Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
-                                Icon(Icons.Default.InsertDriveFile, null, tint = Color.White, modifier = Modifier.size(28.dp))
-                                Text(arq.nomeArquivo, color = TextGrey, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            }
-                        }
 
-                        if (estaSelecionado) {
-                            Box(Modifier.fillMaxSize().background(Gold.copy(alpha = 0.22f)))
-                        }
-
-                        if (modoSelecao) {
-                            Box(
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(6.dp)
-                                    .size(24.dp)
-                                    .background(if (estaSelecionado) Gold else BgBlack.copy(alpha = 0.7f), CircleShape)
-                                    .border(1.5.dp, if (estaSelecionado) BgBlack else Color.White, CircleShape),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                if (estaSelecionado) {
-                                    Icon(Icons.Default.Check, null, tint = BgBlack, modifier = Modifier.size(16.dp))
+                            if (!pasta.isNullOrBlank()) {
+                                Box(
+                                    Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(3.dp)
+                                        .background(BgBlack.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
+                                        .padding(horizontal = 4.dp, vertical = 1.dp)
+                                ) {
+                                    Text(pasta, color = Gold, fontSize = if (ehQuatroColunas) 7.sp else 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                                 }
-                            }
-                        }
-
-                        if (!pasta.isNullOrBlank()) {
-                            Box(
-                                Modifier
-                                    .align(Alignment.TopStart)
-                                    .padding(4.dp)
-                                    .background(BgBlack.copy(alpha = 0.78f), RoundedCornerShape(4.dp))
-                                    .padding(horizontal = 5.dp, vertical = 2.dp)
-                            ) {
-                                Text(pasta, color = Gold, fontSize = 8.sp, fontWeight = FontWeight.Bold, maxLines = 1)
                             }
                         }
                     }
@@ -4834,7 +5002,6 @@ fun GrelhaArquivos(
 }
 // === FIM DA PARTE 2 DE 3 ===
 // === CONTINUAÇÃO: PARTE 3 DE 4 (COLE LOGO ABAIXO DA PARTE 2 - v2.2) ===
-
 private data class ResultadoEnvioSSD(
     val ok: Boolean,
     val fileId: Int,
@@ -4865,7 +5032,7 @@ private fun gerarNomeUnicoNoLote(
     }
 }
 
-// === PREFERÊNCIA: CHAVE PARA LIGAR/DESLIGAR OCR AUTOMÁTICO NO UPLOAD (ECONOMIA DE BATERIA) ===
+// === PREFERÊNCIAS: OCR AUTOMÁTICO NO UPLOAD E MODO DA GALERIA (3 COL, 4 COL OU LISTA) ===
 fun obterOcrAutoNoUpload(context: Context): Boolean {
     return context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
         .getBoolean("ocr_auto_upload_enabled", true)
@@ -4878,41 +5045,172 @@ fun salvarOcrAutoNoUpload(context: Context, ativo: Boolean) {
         .apply()
 }
 
-// === BOTÃO ISOLADO NO TOPO (EVITA RECOMPOR A GALERIA A CADA % DE UPLOAD/DOWNLOAD) ===
+fun obterModoVisualizacaoGaleria(context: Context): Int {
+    val salvo = context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+        .getInt("gallery_layout_mode", 3)
+    return if (salvo in listOf(1, 3, 4)) salvo else 3
+}
+
+fun salvarModoVisualizacaoGaleria(context: Context, modo: Int) {
+    val valido = if (modo in listOf(1, 3, 4)) modo else 3
+    context.getSharedPreferences("nexus_vault_prefs", Context.MODE_PRIVATE)
+        .edit()
+        .putInt("gallery_layout_mode", valido)
+        .apply()
+}
+
+// === ANEL CIRCULAR ANIMADO DE PROGRESSO SSD (PREENCHE DE 0% A 100%) ===
+@Composable
+fun AnelProgressoCircularSSD(
+    progressoFracao: Float,
+    pausado: Boolean,
+    tamanho: androidx.compose.ui.unit.Dp,
+    espessura: androidx.compose.ui.unit.Dp,
+    textoCentro: String = "",
+    mostrarIconePausaSePausado: Boolean = true
+) {
+    val progressoAnimado by androidx.compose.animation.core.animateFloatAsState(
+        targetValue = progressoFracao.coerceIn(0.02f, 1f),
+        label = "anelProgressoAnimado"
+    )
+    val corArco = if (pausado) DangerRed else Gold
+
+    Box(
+        modifier = Modifier.size(tamanho),
+        contentAlignment = Alignment.Center
+    ) {
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            val strokePx = espessura.toPx()
+            val inset = strokePx / 2f
+            val arcSize = androidx.compose.ui.geometry.Size(
+                width = (size.width - strokePx).coerceAtLeast(1f),
+                height = (size.height - strokePx).coerceAtLeast(1f)
+            )
+            val topLeft = Offset(inset, inset)
+
+            drawArc(
+                color = SurfaceDark,
+                startAngle = 0f,
+                sweepAngle = 360f,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = androidx.compose.ui.graphics.drawscope.Stroke(width = strokePx)
+            )
+            drawArc(
+                color = corArco,
+                startAngle = -90f,
+                sweepAngle = 360f * progressoAnimado,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = androidx.compose.ui.graphics.drawscope.Stroke(
+                    width = strokePx,
+                    cap = androidx.compose.ui.graphics.StrokeCap.Round
+                )
+            )
+        }
+
+        if (pausado && mostrarIconePausaSePausado) {
+            Icon(
+                imageVector = Icons.Default.Pause,
+                contentDescription = "Pausado",
+                tint = DangerRed,
+                modifier = Modifier.size(tamanho * 0.46f)
+            )
+        } else if (textoCentro.isNotBlank()) {
+            Text(
+                text = textoCentro,
+                color = if (pausado) DangerRed else Gold,
+                fontSize = if (tamanho >= 42.dp) 10.sp else 9.sp,
+                fontWeight = FontWeight.Black,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+// === BOTÃO ISOLADO NO TOPO: ANEL CIRCULAR CLICÁVEL (EXPANDE CONTROLES) OU CADEADO ===
 @Composable
 fun BotaoTopoProgressoOuCadeado(
+    expandido: Boolean,
+    onAlternarExpandido: () -> Unit,
     onTrancar: () -> Unit
 ) {
     val transferProgress by NexusTransfer.progress.collectAsState()
     val transferPaused by NexusTransfer.pausado.collectAsState()
     val isUploading by NexusTransfer.enviandoEmSegundoPlano.collectAsState()
 
-    if (transferProgress != null || isUploading) {
-        Text(
-            "${transferProgress ?: 10}%",
-            color = Gold,
-            fontWeight = FontWeight.Black,
-            fontSize = 13.sp,
-            modifier = Modifier.padding(end = 6.dp)
-        )
-        if (!transferPaused) {
-            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
-        } else {
-            Icon(Icons.Default.Pause, contentDescription = "Pausado", tint = Gold, modifier = Modifier.size(18.dp))
+    val leituraAtiva by NexusLeituraNuvem.ativo.collectAsState()
+    val leituraLidos by NexusLeituraNuvem.lidos.collectAsState()
+    val leituraTotal by NexusLeituraNuvem.total.collectAsState()
+    val leituraSubPct by NexusLeituraNuvem.subProgressoItem.collectAsState()
+    val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
+
+    val emTransferencia = transferProgress != null || isUploading
+    val emLeitura = !emTransferencia && leituraAtiva && leituraTotal > 0
+
+    when {
+        emTransferencia -> {
+            val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 4.dp)
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(if (expandido) Gold.copy(alpha = 0.16f) else Color.Transparent)
+                    .clickable { onAlternarExpandido() },
+                contentAlignment = Alignment.Center
+            ) {
+                AnelProgressoCircularSSD(
+                    progressoFracao = pctAtual / 100f,
+                    pausado = transferPaused,
+                    tamanho = 34.dp,
+                    espessura = 3.2.dp,
+                    textoCentro = "$pctAtual%",
+                    mostrarIconePausaSePausado = true
+                )
+            }
         }
-    } else {
-        IconButton(onClick = onTrancar) {
-            Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
+        emLeitura -> {
+            val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
+            val fracao = ((lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()).coerceIn(0.02f, 1f)
+            val pctLeitura = (fracao * 100).toInt().coerceIn(1, 100)
+            Box(
+                modifier = Modifier
+                    .padding(horizontal = 4.dp)
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(if (expandido) Gold.copy(alpha = 0.16f) else Color.Transparent)
+                    .clickable { onAlternarExpandido() },
+                contentAlignment = Alignment.Center
+            ) {
+                AnelProgressoCircularSSD(
+                    progressoFracao = fracao,
+                    pausado = leituraPausada,
+                    tamanho = 34.dp,
+                    espessura = 3.2.dp,
+                    textoCentro = "$pctLeitura%",
+                    mostrarIconePausaSePausado = true
+                )
+            }
+        }
+        else -> {
+            IconButton(onClick = onTrancar) {
+                Icon(Icons.Default.Lock, contentDescription = "Trancar Cofre", tint = Gold)
+            }
         }
     }
 }
 
-// === BARRA DE PROGRESSO 100% ISOLADA (SÓ ESTA FAIXA ATUALIZA DURANTE TRANSFERÊNCIAS) ===
+// === PAINEL EXPANSÍVEL E ISOLADO DE CONTROLE (ABRE AO TOCAR NO ANEL CIRCULAR DO TOPO) ===
 @Composable
 fun BarraProgressoIsoladaSSD(
     context: Context,
     client: Client,
     vaultStorageMode: String,
+    expandido: Boolean,
+    onRecolher: () -> Unit,
     onCancelarLeitura: () -> Unit,
     onTransferCancelada: () -> Unit
 ) {
@@ -4929,181 +5227,190 @@ fun BarraProgressoIsoladaSSD(
     val leituraTitulo by NexusLeituraNuvem.titulo.collectAsState()
     val leituraPausada by NexusLeituraNuvem.pausado.collectAsState()
 
-    if (transferProgress != null || isUploading) {
-        val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
-        val fra = pctAtual / 100f
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 4.dp)
-                .background(SurfaceDarker, RoundedCornerShape(10.dp))
-                .border(1.dp, if (transferPaused) DangerRed else Gold, RoundedCornerShape(10.dp))
-                .padding(horizontal = 12.dp, vertical = 8.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f).padding(end = 8.dp)) {
-                    Text(
-                        text = when {
-                            transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO [$vaultStorageMode] ($pctAtual%)"
-                            transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO [$vaultStorageMode] ($pctAtual%)"
-                            transferIsUpload -> "⬆️ ENVIANDO EM SEGUNDO PLANO [$vaultStorageMode] ($pctAtual%)"
-                            else -> "⬇️ BAIXANDO COM PRIORIDADE [$vaultStorageMode] ($pctAtual%)"
-                        },
-                        color = if (transferPaused) DangerRed else Gold,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Black
-                    )
-                    Text(
-                        text = transferLabel.ifBlank { "Processando transferência..." },
-                        color = Color.White,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
+    val emTransferencia = transferProgress != null || isUploading
+    val emLeitura = !emTransferencia && leituraAtiva && leituraTotal > 0
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Button(
-                        onClick = { NexusTransfer.alternarPausa(client) },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (transferPaused) Gold else SurfaceDark
-                        ),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                        modifier = Modifier.height(32.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (transferPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                            contentDescription = if (transferPaused) "Continuar" else "Pausar",
-                            tint = if (transferPaused) BgBlack else Gold,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            text = if (transferPaused) "CONTINUAR" else "PAUSAR",
-                            color = if (transferPaused) BgBlack else Gold,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Black
-                        )
-                    }
-
-                    IconButton(
-                        onClick = {
-                            NexusTransfer.cancelar(client)
-                            onTransferCancelada()
-                            Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
-                        },
-                        modifier = Modifier
-                            .size(32.dp)
-                            .background(DangerRed.copy(alpha = 0.2f), CircleShape)
-                    ) {
-                        Icon(
-                            Icons.Default.Close,
-                            contentDescription = "Cancelar transferência",
-                            tint = DangerRed,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(6.dp))
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(SurfaceDark)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(fra)
-                        .height(6.dp)
-                        .background(
-                            if (transferPaused) Brush.horizontalGradient(listOf(DangerRed, DangerRed))
-                            else Brush.horizontalGradient(listOf(Gold, DangerRed))
-                        )
-                )
-            }
+    LaunchedEffect(emTransferencia, emLeitura) {
+        if (!emTransferencia && !emLeitura && expandido) {
+            onRecolher()
         }
-    } else if (leituraAtiva && leituraTotal > 0) {
-        val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
-        val avancoSuave = (lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()
-        val fracaoLeitura = avancoSuave.coerceIn(0.02f, 1f)
-        val pctLeitura = (fracaoLeitura * 100).toInt().coerceIn(1, 100)
-        Column(
+    }
+
+    if (!expandido) return
+
+    if (emTransferencia) {
+        val pctAtual = (transferProgress ?: 10).coerceIn(2, 100)
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 14.dp, vertical = 4.dp)
-                .background(SurfaceDarker, RoundedCornerShape(10.dp))
-                .border(1.dp, Gold.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .background(SurfaceDarker, RoundedCornerShape(12.dp))
+                .border(1.dp, if (transferPaused) DangerRed else Gold, RoundedCornerShape(12.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            AnelProgressoCircularSSD(
+                progressoFracao = pctAtual / 100f,
+                pausado = transferPaused,
+                tamanho = 44.dp,
+                espessura = 4.dp,
+                textoCentro = "$pctAtual%",
+                mostrarIconePausaSePausado = false
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f).padding(end = 6.dp)) {
                 Text(
-                    text = if (leituraPausada) "⏸ PAUSADO: ${leituraTitulo.ifBlank { "Leitura da nuvem SSD" }}"
-                    else leituraTitulo.ifBlank { "Lendo arquivos da nuvem SSD..." },
-                    color = if (leituraPausada) Gold else Color.White,
+                    text = when {
+                        transferPaused && transferIsUpload -> "⏸ ENVIO PAUSADO [$vaultStorageMode]"
+                        transferPaused && !transferIsUpload -> "⏸ DOWNLOAD PAUSADO [$vaultStorageMode]"
+                        transferIsUpload -> "⬆️ ENVIANDO [$vaultStorageMode]"
+                        else -> "⬇️ BAIXANDO [$vaultStorageMode]"
+                    },
+                    color = if (transferPaused) DangerRed else Gold,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Black
+                )
+                Text(
+                    text = transferLabel.ifBlank { "Processando transferência..." },
+                    color = Color.White,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f).padding(end = 8.dp)
+                    overflow = TextOverflow.Ellipsis
                 )
-                Text(
-                    text = "${(lidosSafe + 1).coerceAtMost(leituraTotal)} / $leituraTotal ($pctLeitura%)",
-                    color = Gold,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black,
-                    modifier = Modifier.padding(end = 6.dp)
-                )
-                IconButton(
-                    onClick = { NexusLeituraNuvem.alternarPausa() },
-                    modifier = Modifier.size(26.dp)
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Button(
+                    onClick = { NexusTransfer.alternarPausa(client) },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (transferPaused) Gold else SurfaceDark
+                    ),
+                    contentPadding = PaddingValues(horizontal = 9.dp, vertical = 2.dp),
+                    modifier = Modifier.height(32.dp)
                 ) {
                     Icon(
-                        imageVector = if (leituraPausada) Icons.Default.PlayArrow else Icons.Default.Pause,
-                        contentDescription = if (leituraPausada) "Continuar leitura" else "Pausar leitura",
-                        tint = Gold,
-                        modifier = Modifier.size(18.dp)
+                        imageVector = if (transferPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                        contentDescription = if (transferPaused) "Continuar" else "Pausar",
+                        tint = if (transferPaused) BgBlack else Gold,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        text = if (transferPaused) "IR" else "PAUSA",
+                        color = if (transferPaused) BgBlack else Gold,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Black
                     )
                 }
+
                 IconButton(
-                    onClick = onCancelarLeitura,
-                    modifier = Modifier.size(26.dp)
+                    onClick = {
+                        NexusTransfer.cancelar(client)
+                        onTransferCancelada()
+                        onRecolher()
+                        Toast.makeText(context, "Transferência cancelada.", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier
+                        .size(30.dp)
+                        .background(DangerRed.copy(alpha = 0.2f), CircleShape)
                 ) {
                     Icon(
                         Icons.Default.Close,
-                        contentDescription = "Fechar barra de leitura",
+                        contentDescription = "Cancelar transferência",
+                        tint = DangerRed,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+
+                IconButton(
+                    onClick = onRecolher,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        Icons.Default.KeyboardArrowUp,
+                        contentDescription = "Recolher",
                         tint = TextGrey,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                 }
             }
-            Spacer(Modifier.height(6.dp))
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp)
-                    .clip(RoundedCornerShape(3.dp))
-                    .background(SurfaceDark)
+        }
+    } else if (emLeitura) {
+        val lidosSafe = leituraLidos.coerceIn(0, leituraTotal)
+        val fracaoLeitura = ((lidosSafe.toFloat() + (leituraSubPct.toFloat() / 100f)) / leituraTotal.toFloat()).coerceIn(0.02f, 1f)
+        val pctLeitura = (fracaoLeitura * 100).toInt().coerceIn(1, 100)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 4.dp)
+                .background(SurfaceDarker, RoundedCornerShape(12.dp))
+                .border(1.dp, Gold.copy(alpha = 0.45f), RoundedCornerShape(12.dp))
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            AnelProgressoCircularSSD(
+                progressoFracao = fracaoLeitura,
+                pausado = leituraPausada,
+                tamanho = 42.dp,
+                espessura = 3.8.dp,
+                textoCentro = "$pctLeitura%",
+                mostrarIconePausaSePausado = false
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f).padding(end = 6.dp)) {
+                Text(
+                    text = if (leituraPausada) "⏸ PAUSADO • ${(lidosSafe + 1).coerceAtMost(leituraTotal)}/$leituraTotal"
+                    else "☁️ SINCRONIZANDO • ${(lidosSafe + 1).coerceAtMost(leituraTotal)}/$leituraTotal",
+                    color = Gold,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Black
+                )
+                Text(
+                    text = leituraTitulo.ifBlank { "Lendo arquivos da nuvem SSD..." },
+                    color = Color.White,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            IconButton(
+                onClick = { NexusLeituraNuvem.alternarPausa() },
+                modifier = Modifier.size(28.dp)
             ) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(fracaoLeitura)
-                        .height(6.dp)
-                        .background(Brush.horizontalGradient(listOf(Gold, DangerRed)))
+                Icon(
+                    imageVector = if (leituraPausada) Icons.Default.PlayArrow else Icons.Default.Pause,
+                    contentDescription = if (leituraPausada) "Continuar leitura" else "Pausar leitura",
+                    tint = Gold,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+            IconButton(
+                onClick = {
+                    onCancelarLeitura()
+                    onRecolher()
+                },
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    Icons.Default.Close,
+                    contentDescription = "Fechar leitura",
+                    tint = DangerRed,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+            IconButton(
+                onClick = onRecolher,
+                modifier = Modifier.size(28.dp)
+            ) {
+                Icon(
+                    Icons.Default.KeyboardArrowUp,
+                    contentDescription = "Recolher",
+                    tint = TextGrey,
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }
@@ -8834,6 +9141,9 @@ fun NexusUI(dao: NexusDao, client: Client) {
             }
         }
     ) {
+var modoVisualizacao by remember { mutableIntStateOf(obterModoVisualizacaoGaleria(context)) }
+        var progressoExpandido by remember { mutableStateOf(false) }
+
         Scaffold(
             topBar = {
                 Column(Modifier.background(BgBlack)) {
@@ -8877,7 +9187,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             }
                         }
                     } else {
-                        // Barra superior limpa com botão de progresso/cadeado isolado
+                        // Barra superior limpa com alternador (3 col / 4 col / Lista) e anel circular expansível
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
                             verticalAlignment = Alignment.CenterVertically
@@ -8892,16 +9202,44 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 }
                             }
                             IconButton(onClick = {
+                                val proximoModo = when (modoVisualizacao) {
+                                    3 -> 4
+                                    4 -> 1
+                                    else -> 3
+                                }
+                                modoVisualizacao = proximoModo
+                                salvarModoVisualizacaoGaleria(context, proximoModo)
+                                val nomeModo = when (proximoModo) {
+                                    4 -> "Grade 4 colunas"
+                                    1 -> "Modo Lista"
+                                    else -> "Grade 3 colunas"
+                                }
+                                Toast.makeText(context, "Visualização: $nomeModo", Toast.LENGTH_SHORT).show()
+                            }) {
+                                Icon(
+                                    imageVector = when (modoVisualizacao) {
+                                        4 -> Icons.Default.Apps
+                                        1 -> Icons.Default.ViewList
+                                        else -> Icons.Default.GridView
+                                    },
+                                    contentDescription = "Alterar visualização (3 col / 4 col / Lista)",
+                                    tint = Gold
+                                )
+                            }
+                            IconButton(onClick = {
                                 showSearchBar = !showSearchBar
                                 if (!showSearchBar) searchQuery = ""
                             }) {
                                 Icon(if (showSearchBar) Icons.Default.Close else Icons.Default.Search, contentDescription = "Pesquisar", tint = Gold)
                             }
                             BotaoTopoProgressoOuCadeado(
+                                expandido = progressoExpandido,
+                                onAlternarExpandido = { progressoExpandido = !progressoExpandido },
                                 onTrancar = {
                                     jobFilaMiniaturas?.cancel()
                                     NexusLeituraNuvem.encerrar()
                                     NexusTransfer.cancelar(client)
+                                    progressoExpandido = false
                                     selectedFileIds = emptySet()
                                     isSelectionMode = false
                                     vaultNameInput = ""
@@ -8915,11 +9253,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
                     }
 
-                    // Barra de progresso 100% isolada (não redesenha a galeria a cada %)
+                    // Painel isolado expansível ao tocar no anel circular do topo
                     BarraProgressoIsoladaSSD(
                         context = context,
                         client = client,
                         vaultStorageMode = vaultStorageMode,
+                        expandido = progressoExpandido,
+                        onRecolher = { progressoExpandido = false },
                         onCancelarLeitura = {
                             jobFilaMiniaturas?.cancel()
                             NexusLeituraNuvem.encerrar()
@@ -9101,6 +9441,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 mapaPastas = mapaPastas,
                                 modoSelecao = isSelectionMode,
                                 idsSelecionados = selectedFileIds,
+                                modoVisualizacao = modoVisualizacao,
                                 onFileClick = { arq ->
                                     if (isSelectionMode) alternarSelecaoFicheiro(arq)
                                     else selectedFile = arq
@@ -9233,6 +9574,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         mapaPastas = mapaPastas,
                         modoSelecao = isSelectionMode,
                         idsSelecionados = selectedFileIds,
+                        modoVisualizacao = modoVisualizacao,
                         onFileClick = { arq ->
                             if (isSelectionMode) alternarSelecaoFicheiro(arq)
                             else selectedFile = arq
