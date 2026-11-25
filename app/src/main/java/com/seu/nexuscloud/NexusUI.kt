@@ -1445,31 +1445,67 @@ fun obterChatCofreUsuario(
     }
 }
 
-// === MOTOR TURBO DE PREVIEWS (6 PARALELOS PARA CAPAS + CACHE RAM + MINITHUMB INSTANTÂNEA) ===
+// === MOTOR TURBO MODO UNLIM (MINITHUMB EM DISCO + CANCELAMENTO EM LOTE + FILA SILENCIOSA) ===
 object NexusPreviewTurbo {
-    val semaforoCapasLeves = kotlinx.coroutines.sync.Semaphore(6)
-    val semaforoFallbackCompleto = kotlinx.coroutines.sync.Semaphore(2)
+    val semaforoCapasLeves = kotlinx.coroutines.sync.Semaphore(8)
+    val semaforoFallbackFotos = kotlinx.coroutines.sync.Semaphore(5)
+    val semaforoFallbackVideos = kotlinx.coroutines.sync.Semaphore(2)
+
+    @Volatile
+    var usuarioRolando: Boolean = false
+
     val caminhosConfirmados: MutableSet<String> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<String, Boolean>())
     val miniThumbBytes = java.util.concurrent.ConcurrentHashMap<Long, ByteArray>()
     val jaTentouRecuperarId: MutableSet<Long> =
         java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Long, Boolean>())
+    val downloadsAtivosPorItem = java.util.concurrent.ConcurrentHashMap<Long, Pair<Int, Boolean>>()
+
+    fun registrarDownloadAtivo(dataUpload: Long, fileId: Int, ehCapaLeve: Boolean) {
+        if (fileId != 0) downloadsAtivosPorItem[dataUpload] = Pair(fileId, ehCapaLeve)
+    }
+
+    fun limparDownloadAtivo(dataUpload: Long) {
+        downloadsAtivosPorItem.remove(dataUpload)
+    }
+
+    fun cancelarDownloadItem(client: Client, dataUpload: Long) {
+        val ativo = downloadsAtivosPorItem.remove(dataUpload) ?: return
+        val (fileId, ehCapaLeve) = ativo
+        if (fileId == 0) return
+        val downloadManualAtivo = NexusTransfer.progress.value != null && !NexusTransfer.ehUpload.value
+        if (ehCapaLeve || !downloadManualAtivo) {
+            try {
+                client.send(TdApi.CancelDownloadFile(fileId, false)) {}
+            } catch (_: Throwable) {}
+        }
+    }
+
+    fun cancelarDownloadsPreviewAtivos(client: Client) {
+        val chaves = downloadsAtivosPorItem.keys.toList()
+        for (ts in chaves) {
+            cancelarDownloadItem(client, ts)
+        }
+    }
+
+    fun cancelarForaDosVisiveis(client: Client, idsVisiveis: Set<Long>) {
+        val chaves = downloadsAtivosPorItem.keys.toList()
+        for (ts in chaves) {
+            if (!idsVisiveis.contains(ts)) {
+                cancelarDownloadItem(client, ts)
+            }
+        }
+    }
 
     fun registrarCaminhoValido(caminho: String?) {
         val resolvido = resolverCaminhoCapaJpg(caminho)
-        if (resolvido.isNotBlank()) {
-            caminhosConfirmados.add(resolvido)
-        }
+        if (resolvido.isNotBlank()) caminhosConfirmados.add(resolvido)
     }
 
     fun invalidarCaminho(caminho: String?) {
         val resolvido = resolverCaminhoCapaJpg(caminho)
-        if (resolvido.isNotBlank()) {
-            caminhosConfirmados.remove(resolvido)
-        }
-        if (!caminho.isNullOrBlank()) {
-            caminhosConfirmados.remove(caminho)
-        }
+        if (resolvido.isNotBlank()) caminhosConfirmados.remove(resolvido)
+        if (!caminho.isNullOrBlank()) caminhosConfirmados.remove(caminho)
     }
 
     fun salvarMiniThumbMemoria(dataUpload: Long, bytes: ByteArray?) {
@@ -1479,8 +1515,75 @@ object NexusPreviewTurbo {
         }
         miniThumbBytes[dataUpload] = bytes
     }
+
+    fun salvarMiniThumbDisco(context: Context, dataUpload: Long, bytes: ByteArray?) {
+        if (bytes == null || bytes.size < 64 || bytes.size > 16384) return
+        salvarMiniThumbMemoria(dataUpload, bytes)
+        try {
+            val dir = File(context.filesDir, "nexus_thumbs").apply { if (!exists()) mkdirs() }
+            val fMini = File(dir, "mini_$dataUpload.jpg")
+            if (!fMini.exists() || fMini.length() < 64L) {
+                FileOutputStream(fMini).use { it.write(bytes) }
+            }
+        } catch (_: Throwable) {}
+    }
+
+    fun obterModeloMiniThumb(context: Context, dataUpload: Long): Any? {
+        miniThumbBytes[dataUpload]?.let { return it }
+        val fMini = File(File(context.filesDir, "nexus_thumbs"), "mini_$dataUpload.jpg")
+        return if (fMini.exists() && fMini.length() >= 64L) fMini else null
+    }
 }
 
+// Pré-aquece silenciosamente as capas leves (~15 KB) em segundo plano; pausa na hora se você rolar
+suspend fun baixarCapasLevesEmSegundoPlano(
+    context: Context,
+    client: Client,
+    usuarioAtivo: String,
+    listaArquivos: List<ArquivoNuvem>,
+    vm: UIViewModel
+) = withContext(Dispatchers.IO) {
+    val pendentes = listaArquivos
+        .sortedByDescending { it.dataUpload }
+        .filter { arq ->
+            (NexusThumbCache.mapaThumbIdsNuvem[arq.fileId] ?: 0) != 0 &&
+                !miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(arq), arq.nomeArquivo)
+        }
+        .take(200)
+
+    if (pendentes.isEmpty()) return@withContext
+
+    kotlinx.coroutines.coroutineScope {
+        val filaSilenciosa = kotlinx.coroutines.sync.Semaphore(4)
+        for (arq in pendentes) {
+            while (NexusPreviewTurbo.usuarioRolando || NexusSyncState.emAndamento.value || NexusTransfer.progress.value != null) {
+                delay(350)
+            }
+            if (miniaturaExisteLocalmente(NexusThumbCache.obterMiniatura(arq), arq.nomeArquivo)) continue
+            launch(Dispatchers.IO) {
+                filaSilenciosa.withPermit {
+                    if (!NexusPreviewTurbo.usuarioRolando && NexusThumbCache.emProgresso.add(arq.dataUpload)) {
+                        try {
+                            carregarMiniaturaIndividualDaNuvem(
+                                context = context,
+                                client = client,
+                                usuarioAtivo = usuarioAtivo,
+                                arq = arq,
+                                vm = vm,
+                                atualizarSubBarra = false,
+                                prioridadeRede = 14,
+                                apenasCapaLeve = true
+                            )
+                        } finally {
+                            NexusPreviewTurbo.limparDownloadAtivo(arq.dataUpload)
+                            NexusThumbCache.emProgresso.remove(arq.dataUpload)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 fun extrairMiniThumbnailBytes(mediaObj: Any?): ByteArray? {
     if (mediaObj == null) return null
     return try {
@@ -4578,7 +4681,7 @@ fun formatarTamanhoNuvem(bytes: Long?): String {
     return if (mb < 1024.0) String.format(Locale.US, "%.1f MB", mb) else String.format(Locale.US, "%.2f GB", mb / 1024.0)
 }
 
-// === GRELHA DE ARQUIVOS TURBO (3 COL, 4 COL, LISTA + PREFETCH + MINITHUMB + BARRA VELOCIDADE) ===
+// === GRELHA DE ARQUIVOS MODO UNLIM (CONTROLADOR ÚNICO, ZERO SPINNERS, ZERO CROSSFADE, 3/4 COL E LISTA) ===
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun GrelhaArquivos(
@@ -4601,7 +4704,7 @@ fun GrelhaArquivos(
     }
     val ehLista = colunas == 1
     val ehQuatroColunas = colunas == 4
-    val tamanhoDecode = if (ehQuatroColunas) 160 else 220
+    val tamanhoDecode = if (ehQuatroColunas) 144 else 200
 
     val gruposPorData = remember(lista) {
         lista
@@ -4633,46 +4736,107 @@ fun GrelhaArquivos(
     val scopeGrid = rememberCoroutineScope()
     var isDraggingScrollbar by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
+    var retryThumbTick by remember { mutableIntStateOf(0) }
 
-    // Pré-carregamento (prefetch) silencioso das próximas 15 capas leves abaixo da tela quando parado
-    LaunchedEffect(gridState.isScrollInProgress, totalItensGrid, usuarioAtivo) {
-        if (!gridState.isScrollInProgress && totalItensGrid > 0 && usuarioAtivo.isNotBlank()) {
-            delay(180)
-            val ultimoVisivel = gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
-            val inicioPrefetch = (ultimoVisivel + 1).coerceAtMost(indicesParaArquivo.size)
-            val fimPrefetch = (ultimoVisivel + 20).coerceAtMost(indicesParaArquivo.size)
-            val candidatos = mutableListOf<ArquivoNuvem>()
-            for (i in inicioPrefetch until fimPrefetch) {
-                val arq = indicesParaArquivo.getOrNull(i) ?: continue
-                val suporta = ehArquivoImagem(arq.nomeArquivo) ||
-                    ehArquivoVideo(arq.nomeArquivo) ||
-                    arq.nomeArquivo.substringAfterLast('.', "").equals("PDF", ignoreCase = true)
-                if (!suporta) continue
-                val thumbAtual = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
-                if (!miniaturaExisteLocalmente(thumbAtual, arq.nomeArquivo) &&
-                    !NexusThumbCache.emProgresso.contains(arq.dataUpload)
-                ) {
-                    candidatos.add(arq)
-                    if (candidatos.size >= 15) break
-                }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            NexusPreviewTurbo.usuarioRolando = false
+            NexusPreviewTurbo.cancelarDownloadsPreviewAtivos(client)
+        }
+    }
+
+    // CONTROLADOR ÚNICO DA TELA: zero coroutines por quadrado durante o arrasto rápido
+    LaunchedEffect(totalItensGrid, usuarioAtivo, indicesParaArquivo) {
+        if (totalItensGrid == 0 || usuarioAtivo.isBlank()) return@LaunchedEffect
+        var jobTelaAtual: kotlinx.coroutines.Job? = null
+        androidx.compose.runtime.snapshotFlow {
+            val emMovimento = gridState.isScrollInProgress || isDraggingScrollbar
+            val primeiro = gridState.firstVisibleItemIndex
+            val qtdVis = gridState.layoutInfo.visibleItemsInfo.size
+            "$emMovimento|$primeiro|$qtdVis|$retryThumbTick"
+        }.collect { estadoStr ->
+            val emMovimento = estadoStr.startsWith("true|")
+            NexusPreviewTurbo.usuarioRolando = emMovimento
+            jobTelaAtual?.cancel()
+
+            if (emMovimento) {
+                NexusPreviewTurbo.cancelarDownloadsPreviewAtivos(client)
+                return@collect
             }
-            candidatos.forEach { arqPrefetch ->
-                scopeGrid.launch(Dispatchers.IO) {
-                    if (!NexusThumbCache.emProgresso.contains(arqPrefetch.dataUpload)) {
-                        NexusThumbCache.emProgresso.add(arqPrefetch.dataUpload)
-                        try {
-                            carregarMiniaturaIndividualDaNuvem(
-                                context = context,
-                                client = client,
-                                usuarioAtivo = usuarioAtivo,
-                                arq = arqPrefetch,
-                                vm = vm,
-                                atualizarSubBarra = false,
-                                prioridadeRede = 24,
-                                apenasCapaLeve = true
-                            )
-                        } finally {
-                            NexusThumbCache.emProgresso.remove(arqPrefetch.dataUpload)
+
+            jobTelaAtual = launch {
+                val visiveis = gridState.layoutInfo.visibleItemsInfo
+                    .mapNotNull { indicesParaArquivo.getOrNull(it.index) }
+                    .distinctBy { it.dataUpload }
+
+                if (visiveis.isEmpty()) return@launch
+
+                val idsVisiveis = visiveis.map { it.dataUpload }.toSet()
+                NexusPreviewTurbo.cancelarForaDosVisiveis(client, idsVisiveis)
+
+                val pendentesVisiveis = visiveis.filter { arq ->
+                    val thumbAtual = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
+                    !miniaturaExisteLocalmente(thumbAtual, arq.nomeArquivo)
+                }
+
+                // 1. Baixa em 0 ms apenas os itens visíveis na tela parada
+                val jobsVisiveis = pendentesVisiveis.map { arq ->
+                    launch(Dispatchers.IO) {
+                        if (NexusThumbCache.emProgresso.add(arq.dataUpload)) {
+                            try {
+                                carregarMiniaturaIndividualDaNuvem(
+                                    context = context,
+                                    client = client,
+                                    usuarioAtivo = usuarioAtivo,
+                                    arq = arq,
+                                    vm = vm,
+                                    atualizarSubBarra = false,
+                                    prioridadeRede = 31,
+                                    apenasCapaLeve = false
+                                )
+                            } finally {
+                                NexusPreviewTurbo.limparDownloadAtivo(arq.dataUpload)
+                                NexusThumbCache.emProgresso.remove(arq.dataUpload)
+                            }
+                        }
+                    }
+                }
+                jobsVisiveis.forEach { it.join() }
+
+                // 2. Só depois que a tela atual ficou pronta, pré-carrega as próximas 12 capas leves abaixo
+                val ultimoVisivel = gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+                val inicioPref = (ultimoVisivel + 1).coerceAtMost(indicesParaArquivo.size)
+                val fimPref = (ultimoVisivel + 20).coerceAtMost(indicesParaArquivo.size)
+                val candidatosPref = mutableListOf<ArquivoNuvem>()
+                for (i in inicioPref until fimPref) {
+                    val arq = indicesParaArquivo.getOrNull(i) ?: continue
+                    if ((NexusThumbCache.mapaThumbIdsNuvem[arq.fileId] ?: 0) == 0) continue
+                    val thumbAtual = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
+                    if (!miniaturaExisteLocalmente(thumbAtual, arq.nomeArquivo) &&
+                        !NexusThumbCache.emProgresso.contains(arq.dataUpload)
+                    ) {
+                        candidatosPref.add(arq)
+                        if (candidatosPref.size >= 12) break
+                    }
+                }
+                candidatosPref.forEach { arqPref ->
+                    launch(Dispatchers.IO) {
+                        if (NexusThumbCache.emProgresso.add(arqPref.dataUpload)) {
+                            try {
+                                carregarMiniaturaIndividualDaNuvem(
+                                    context = context,
+                                    client = client,
+                                    usuarioAtivo = usuarioAtivo,
+                                    arq = arqPref,
+                                    vm = vm,
+                                    atualizarSubBarra = false,
+                                    prioridadeRede = 18,
+                                    apenasCapaLeve = true
+                                )
+                            } finally {
+                                NexusPreviewTurbo.limparDownloadAtivo(arqPref.dataUpload)
+                                NexusThumbCache.emProgresso.remove(arqPref.dataUpload)
+                            }
                         }
                     }
                 }
@@ -4760,17 +4924,16 @@ fun GrelhaArquivos(
                     val pasta = mapaPastas[arq.dataUpload]
                     val thumbSafe = NexusThumbCache.mapaMiniaturas[arq.dataUpload] ?: arq.caminhoMiniatura ?: ""
                     val estaSelecionado = idsSelecionados.contains(arq.id)
-                    var erroThumbTick by remember(arq.dataUpload) { mutableIntStateOf(0) }
 
                     val isImage = remember(arq.nomeArquivo) { ehArquivoImagem(arq.nomeArquivo) }
                     val isVideo = remember(arq.nomeArquivo) { ehArquivoVideo(arq.nomeArquivo) }
 
-                    val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo, erroThumbTick) {
+                    val temArquivoMiniatura = remember(thumbSafe, arq.nomeArquivo, retryThumbTick) {
                         miniaturaExisteLocalmente(thumbSafe, arq.nomeArquivo)
                     }
 
-                    val miniBytesInstantaneo = remember(arq.dataUpload, temArquivoMiniatura) {
-                        if (!temArquivoMiniatura) NexusPreviewTurbo.miniThumbBytes[arq.dataUpload] else null
+                    val miniModeloInstantaneo = remember(arq.dataUpload, temArquivoMiniatura) {
+                        if (!temArquivoMiniatura) NexusPreviewTurbo.obterModeloMiniThumb(context, arq.dataUpload) else null
                     }
 
                     val thumbModelRequest = remember(thumbSafe, temArquivoMiniatura, tamanhoDecode) {
@@ -4783,50 +4946,25 @@ fun GrelhaArquivos(
                                 .allowHardware(true)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
                                 .diskCachePolicy(CachePolicy.ENABLED)
-                                .crossfade(70)
+                                .crossfade(false)
                                 .build()
                         } else null
                     }
 
-                    val miniModelRequest = remember(miniBytesInstantaneo) {
-                        if (miniBytesInstantaneo != null) {
+                    val miniModelRequest = remember(miniModeloInstantaneo) {
+                        if (miniModeloInstantaneo != null) {
                             ImageRequest.Builder(context)
-                                .data(miniBytesInstantaneo)
+                                .data(miniModeloInstantaneo)
                                 .size(96, 96)
                                 .bitmapConfig(Bitmap.Config.RGB_565)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
+                                .crossfade(false)
                                 .build()
                         } else null
                     }
 
-                    LaunchedEffect(arq.dataUpload, temArquivoMiniatura, erroThumbTick) {
-                        if (!temArquivoMiniatura && !NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
-                            // 0 ms quando parado; pausa breve apenas durante rolagem rápida
-                            if (gridState.isScrollInProgress) {
-                                delay(120)
-                            }
-                            if (!NexusThumbCache.emProgresso.contains(arq.dataUpload)) {
-                                NexusThumbCache.emProgresso.add(arq.dataUpload)
-                                try {
-                                    carregarMiniaturaIndividualDaNuvem(
-                                        context = context,
-                                        client = client,
-                                        usuarioAtivo = usuarioAtivo,
-                                        arq = arq,
-                                        vm = vm,
-                                        atualizarSubBarra = false,
-                                        prioridadeRede = 31,
-                                        apenasCapaLeve = false
-                                    )
-                                } finally {
-                                    NexusThumbCache.emProgresso.remove(arq.dataUpload)
-                                }
-                            }
-                        }
-                    }
-
                     if (ehLista) {
-                        // === VISUALIZAÇÃO EM MODO LISTA ===
+                        // === MODO LISTA ULTRA-LEVE ===
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -4854,27 +4992,22 @@ fun GrelhaArquivos(
                             ) {
                                 when {
                                     isImage -> {
-                                        if (thumbModelRequest != null) {
+                                        val imgModel = thumbModelRequest ?: miniModelRequest
+                                        if (imgModel != null) {
                                             AsyncImage(
-                                                model = thumbModelRequest,
+                                                model = imgModel,
                                                 contentDescription = arq.nomeArquivo,
                                                 contentScale = ContentScale.Crop,
                                                 onError = {
-                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                    erroThumbTick++
+                                                    if (thumbModelRequest != null) {
+                                                        NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                        retryThumbTick++
+                                                    }
                                                 },
                                                 modifier = Modifier.fillMaxSize()
                                             )
                                         } else {
-                                            if (miniModelRequest != null) {
-                                                AsyncImage(
-                                                    model = miniModelRequest,
-                                                    contentDescription = arq.nomeArquivo,
-                                                    contentScale = ContentScale.Crop,
-                                                    modifier = Modifier.fillMaxSize()
-                                                )
-                                            }
-                                            CircularProgressIndicator(color = Gold, strokeWidth = 2.dp, modifier = Modifier.size(18.dp))
+                                            Icon(Icons.Default.Image, null, tint = TextGrey.copy(alpha = 0.25f), modifier = Modifier.size(22.dp))
                                         }
                                     }
                                     isVideo -> {
@@ -4887,7 +5020,7 @@ fun GrelhaArquivos(
                                                 onError = {
                                                     if (thumbModelRequest != null) {
                                                         NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                        erroThumbTick++
+                                                        retryThumbTick++
                                                     }
                                                 },
                                                 modifier = Modifier.fillMaxSize()
@@ -4903,7 +5036,7 @@ fun GrelhaArquivos(
                                         }
                                     }
                                     ext == "PDF" -> {
-                                        val possuiCapa = remember(thumbSafe, erroThumbTick) { temCapaPdfLocal(thumbSafe) }
+                                        val possuiCapa = remember(thumbSafe, retryThumbTick) { temCapaPdfLocal(thumbSafe) }
                                         if (possuiCapa && thumbModelRequest != null) {
                                             AsyncImage(
                                                 model = thumbModelRequest,
@@ -4911,7 +5044,7 @@ fun GrelhaArquivos(
                                                 contentScale = ContentScale.Crop,
                                                 onError = {
                                                     NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                    erroThumbTick++
+                                                    retryThumbTick++
                                                 },
                                                 modifier = Modifier.fillMaxSize()
                                             )
@@ -4940,15 +5073,13 @@ fun GrelhaArquivos(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Spacer(Modifier.height(3.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        text = "${formatarTamanhoNuvem(arq.tamanhoBytes)} • ${formatarDataNuvem(arq.dataUpload)}",
-                                        color = TextGrey,
-                                        fontSize = 10.sp,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
+                                Text(
+                                    text = "${formatarTamanhoNuvem(arq.tamanhoBytes)} • ${formatarDataNuvem(arq.dataUpload)}",
+                                    color = TextGrey,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
                                 if (!pasta.isNullOrBlank()) {
                                     Spacer(Modifier.height(3.dp))
                                     Box(
@@ -4992,7 +5123,7 @@ fun GrelhaArquivos(
                             }
                         }
                     } else {
-                        // === VISUALIZAÇÃO EM GRADE (3 OU 4 COLUNAS) ===
+                        // === GRADE 3 OU 4 COLUNAS ESTILO UNLIM (ZERO SPINNERS, ZERO ANIMAÇÕES PESADAS) ===
                         Box(
                             Modifier
                                 .aspectRatio(1f)
@@ -5009,114 +5140,83 @@ fun GrelhaArquivos(
                         ) {
                             when {
                                 isImage -> {
-                                    if (thumbModelRequest != null) {
+                                    val imgModel = thumbModelRequest ?: miniModelRequest
+                                    if (imgModel != null) {
+                                        AsyncImage(
+                                            model = imgModel,
+                                            contentDescription = arq.nomeArquivo,
+                                            contentScale = ContentScale.Crop,
+                                            onError = {
+                                                if (thumbModelRequest != null) {
+                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                    retryThumbTick++
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                }
+                                isVideo -> {
+                                    val vidModel = thumbModelRequest ?: miniModelRequest
+                                    if (vidModel != null) {
+                                        AsyncImage(
+                                            model = vidModel,
+                                            contentDescription = "Video Preview",
+                                            contentScale = ContentScale.Crop,
+                                            onError = {
+                                                if (thumbModelRequest != null) {
+                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
+                                                    retryThumbTick++
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .size(if (ehQuatroColunas) 28.dp else 36.dp)
+                                            .align(Alignment.Center)
+                                            .background(BgBlack.copy(alpha = 0.45f), CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            Icons.Default.PlayArrow,
+                                            null,
+                                            tint = Color.White,
+                                            modifier = Modifier.size(if (ehQuatroColunas) 17.dp else 22.dp)
+                                        )
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.BottomEnd)
+                                            .padding(3.dp)
+                                            .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 4.dp, vertical = 1.dp)
+                                    ) {
+                                        Text("VÍDEO", color = Gold, fontSize = if (ehQuatroColunas) 6.sp else 7.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                                ext == "PDF" -> {
+                                    val possuiCapa = remember(thumbSafe, retryThumbTick) { temCapaPdfLocal(thumbSafe) }
+                                    if (possuiCapa && thumbModelRequest != null) {
                                         AsyncImage(
                                             model = thumbModelRequest,
                                             contentDescription = arq.nomeArquivo,
                                             contentScale = ContentScale.Crop,
                                             onError = {
                                                 NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                erroThumbTick++
+                                                retryThumbTick++
                                             },
                                             modifier = Modifier.fillMaxSize()
                                         )
-                                    } else {
-                                        if (miniModelRequest != null) {
-                                            AsyncImage(
-                                                model = miniModelRequest,
-                                                contentDescription = arq.nomeArquivo,
-                                                contentScale = ContentScale.Crop,
-                                                modifier = Modifier.fillMaxSize()
-                                            )
-                                        }
-                                        CircularProgressIndicator(
-                                            color = Gold,
-                                            strokeWidth = 2.dp,
-                                            modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 22.dp)
-                                        )
-                                    }
-                                }
-                                isVideo -> {
-                                    Box(Modifier.fillMaxSize()) {
-                                        val vidModel = thumbModelRequest ?: miniModelRequest
-                                        if (vidModel != null) {
-                                            AsyncImage(
-                                                model = vidModel,
-                                                contentDescription = "Video Preview",
-                                                contentScale = ContentScale.Crop,
-                                                onError = {
-                                                    if (thumbModelRequest != null) {
-                                                        NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                        erroThumbTick++
-                                                    }
-                                                },
-                                                modifier = Modifier.fillMaxSize()
-                                            )
-                                        }
-                                        if (thumbModelRequest == null) {
-                                            Column(
-                                                modifier = Modifier.align(Alignment.Center),
-                                                horizontalAlignment = Alignment.CenterHorizontally
-                                            ) {
-                                                CircularProgressIndicator(
-                                                    color = Gold,
-                                                    strokeWidth = 2.dp,
-                                                    modifier = Modifier.size(if (ehQuatroColunas) 16.dp else 20.dp)
-                                                )
-                                                if (!ehQuatroColunas && miniModelRequest == null) {
-                                                    Spacer(Modifier.height(28.dp))
-                                                    Text("Carregando capa...", color = TextGrey, fontSize = 8.sp)
-                                                }
-                                            }
-                                        }
                                         Box(
-                                            modifier = Modifier
-                                                .size(if (ehQuatroColunas) 30.dp else 38.dp)
-                                                .align(Alignment.Center)
-                                                .background(BgBlack.copy(alpha = 0.45f), CircleShape),
-                                            contentAlignment = Alignment.Center
-                                        ) {
-                                            Icon(
-                                                Icons.Default.PlayArrow,
-                                                null,
-                                                tint = Color.White,
-                                                modifier = Modifier.size(if (ehQuatroColunas) 18.dp else 24.dp)
-                                            )
-                                        }
-                                        Box(
-                                            modifier = Modifier
+                                            Modifier
                                                 .align(Alignment.BottomEnd)
-                                                .padding(3.dp)
-                                                .background(BgBlack.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
-                                                .padding(horizontal = 4.dp, vertical = 1.dp)
+                                                .padding(4.dp)
+                                                .background(DangerRed, RoundedCornerShape(4.dp))
+                                                .padding(horizontal = 4.dp, vertical = 2.dp)
                                         ) {
-                                            Text("VÍDEO", color = Gold, fontSize = if (ehQuatroColunas) 6.sp else 7.sp, fontWeight = FontWeight.Bold)
-                                        }
-                                    }
-                                }
-                                ext == "PDF" -> {
-                                    val possuiCapa = remember(thumbSafe, erroThumbTick) { temCapaPdfLocal(thumbSafe) }
-                                    if (possuiCapa && thumbModelRequest != null) {
-                                        Box(Modifier.fillMaxSize()) {
-                                            AsyncImage(
-                                                model = thumbModelRequest,
-                                                contentDescription = arq.nomeArquivo,
-                                                contentScale = ContentScale.Crop,
-                                                onError = {
-                                                    NexusPreviewTurbo.invalidarCaminho(thumbSafe)
-                                                    erroThumbTick++
-                                                },
-                                                modifier = Modifier.fillMaxSize()
-                                            )
-                                            Box(
-                                                Modifier
-                                                    .align(Alignment.BottomEnd)
-                                                    .padding(4.dp)
-                                                    .background(DangerRed, RoundedCornerShape(4.dp))
-                                                    .padding(horizontal = 4.dp, vertical = 2.dp)
-                                            ) {
-                                                Text("PDF", color = Color.White, fontSize = if (ehQuatroColunas) 7.sp else 8.sp, fontWeight = FontWeight.Bold)
-                                            }
+                                            Text("PDF", color = Color.White, fontSize = if (ehQuatroColunas) 7.sp else 8.sp, fontWeight = FontWeight.Bold)
                                         }
                                     } else {
                                         Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(4.dp)) {
@@ -5172,7 +5272,7 @@ fun GrelhaArquivos(
             }
         }
 
-        // === BARRA LATERAL DE VELOCIDADE (APARECE AUTOMATICAMENTE QUANDO HÁ MAIS DE 15 ITENS) ===
+        // === BARRA LATERAL DE VELOCIDADE ===
         if (totalItensGrid > 15) {
             val thumbOffsetY = (thumbFraction * usableTrackPx).toInt()
 
@@ -6294,6 +6394,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val sheetState = rememberModalBottomSheetState()
     var jobFilaMiniaturas by remember { mutableStateOf<Job?>(null) }
+    var jobCapasSilencioso by remember { mutableStateOf<Job?>(null) }
 
     val notifPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -6616,6 +6717,13 @@ fun NexusUI(dao: NexusDao, client: Client) {
                     }
                     delay(350)
                     verificarNovosFicheirosLocalmente(mostrarAvisoSeVazio = false)
+                    val chaveUsuarioAtual = normalizarUsuario(activeVaultUser)
+                    val donosSincronizados = carregarDonosFicheiros(context)
+                    val arquivosDoPerfil = atualizados.filter { donosSincronizados[it.dataUpload] == chaveUsuarioAtual }
+                    jobCapasSilencioso?.cancel()
+                    jobCapasSilencioso = scope.launch(Dispatchers.IO) {
+                        baixarCapasLevesEmSegundoPlano(appContext, client, activeVaultUser, arquivosDoPerfil, vm)
+                    }
                 }
             }
         }
@@ -9348,6 +9456,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     if (bloqueadoRemoto) {
                                         scope.launch(Dispatchers.Main) {
                                             jobFilaMiniaturas?.cancel()
+                                            jobCapasSilencioso?.cancel()
                                             NexusLeituraNuvem.encerrar()
                                             NexusTransfer.cancelar(client)
                                             vaultUnlocked = false
