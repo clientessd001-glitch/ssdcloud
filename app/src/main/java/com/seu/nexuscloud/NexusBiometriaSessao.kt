@@ -26,18 +26,23 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.delay
 
 private val BioGold = Color(0xFFE5B83B)
@@ -46,16 +51,20 @@ private val BioSurfaceDarker = Color(0xFF141821)
 private val BioTextGrey = Color(0xFF9AA3B2)
 
 // =========================================================================
-// 1. PROTEÇÃO DE SESSÃO NO UPLOAD (IMPEDE PEDIR PIN AO VOLTAR DO SELETOR)
+// 1. PROTEÇÃO DE SESSÃO NO UPLOAD (USO ÚNICO: SÓ PARA VOLTA DO SELETOR)
 // =========================================================================
 object NexusSessaoUpload {
     private const val PREFS = "nexus_vault_prefs"
     private const val KEY_TS = "picker_active_ts"
     private const val KEY_USER = "picker_active_user"
-    private const val JANELA_MS = 90_000L // 90 segundos só para voltar do seletor
+    private const val JANELA_MS = 90_000L // 90s somente para escolher arquivos
+
+    @Volatile
+    private var seletorEmAndamento: Boolean = false
 
     fun registrarAberturaSeletor(context: Context, usuario: String) {
         if (usuario.isBlank()) return
+        seletorEmAndamento = true
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putLong(KEY_TS, System.currentTimeMillis())
@@ -63,8 +72,16 @@ object NexusSessaoUpload {
             .commit()
     }
 
-    // Lê e já APAGA imediatamente (uso único: só vale para o retorno do seletor)
+    fun estaNoSeletorAtivo(context: Context): Boolean {
+        if (seletorEmAndamento) return true
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val ts = prefs.getLong(KEY_TS, 0L)
+        return ts > 0L && (System.currentTimeMillis() - ts) in 0L..JANELA_MS
+    }
+
+    // Lê e já APAGA imediatamente (ao fechar e reabrir o app, sempre pede PIN/Biometria)
     fun consumirUsuarioPendente(context: Context): String? {
+        seletorEmAndamento = false
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val ts = prefs.getLong(KEY_TS, 0L)
         val user = prefs.getString(KEY_USER, null)
@@ -74,6 +91,7 @@ object NexusSessaoUpload {
     }
 
     fun limparAberturaSeletor(context: Context) {
+        seletorEmAndamento = false
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .remove(KEY_TS)
@@ -82,25 +100,34 @@ object NexusSessaoUpload {
     }
 }
 
-    fun obterUsuarioPendente(context: Context): String? {
-        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val ts = prefs.getLong(KEY_TS, 0L)
-        val user = prefs.getString(KEY_USER, null)
-        val dentroDaJanela = ts > 0L && (System.currentTimeMillis() - ts) in 0L..JANELA_MS
-        return if (dentroDaJanela && !user.isNullOrBlank()) user else null
-    }
+// =========================================================================
+// 2. TRANCA AUTOMÁTICA AO SAIR / MINIMIZAR O APP (RESPEITA O UPLOAD)
+// =========================================================================
+@Composable
+fun BloqueioAutomaticoAoSair(
+    context: Context,
+    vaultUnlocked: Boolean,
+    onTrancarCofre: () -> Unit
+) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val destrancadoAtual by rememberUpdatedState(vaultUnlocked)
+    val onTrancarAtual by rememberUpdatedState(onTrancarCofre)
 
-    fun limparAberturaSeletor(context: Context) {
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-            .edit()
-            .remove(KEY_TS)
-            .remove(KEY_USER)
-            .apply()
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                if (destrancadoAtual && !NexusSessaoUpload.estaNoSeletorAtivo(context)) {
+                    onTrancarAtual()
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 }
 
 // =========================================================================
-// 2. MOTOR NATIVO DE BIOMETRIA / DIGITAL (ZERO BIBLIOTECA EXTRA NO GRADLE)
+// 3. MOTOR NATIVO DE BIOMETRIA / DIGITAL (ZERO BIBLIOTECA EXTRA)
 // =========================================================================
 object NexusBiometria {
     private const val PREFS = "nexus_vault_prefs"
@@ -210,7 +237,7 @@ object NexusBiometria {
 }
 
 // =========================================================================
-// 3. COMPONENTE PRONTO PARA A TELA DE PIN (DISPARO AUTOMÁTICO + BOTÃO)
+// 4. COMPONENTE DA TELA DE PIN (DISPARA DIGITAL AO ABRIR EM 1º PLANO)
 // =========================================================================
 @Composable
 fun BotaoBiometriaPin(
@@ -224,6 +251,23 @@ fun BotaoBiometriaPin(
     onBiometriaAprovada: () -> Unit,
     onErroBiometria: (String) -> Unit
 ) {
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var telaEmPrimeiroPlano by remember {
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> telaEmPrimeiroPlano = true
+                Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> telaEmPrimeiroPlano = false
+                else -> {}
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val disponivel = remember(context) { NexusBiometria.disponivelNoAparelho(context) }
     val podeUsar = disponivel && biometriaAtiva && temPinLocal && usuarioAtivo.isNotBlank()
     var jaDisparouAuto by remember(usuarioAtivo, vaultUnlocked) { mutableStateOf(false) }
@@ -238,8 +282,8 @@ fun BotaoBiometriaPin(
         )
     }
 
-    LaunchedEffect(podeUsar, vaultUnlocked, usuarioTrancouManualmente, isCheckingVault) {
-        if (podeUsar && !vaultUnlocked && !usuarioTrancouManualmente && !isCheckingVault && !jaDisparouAuto) {
+    LaunchedEffect(podeUsar, vaultUnlocked, usuarioTrancouManualmente, isCheckingVault, telaEmPrimeiroPlano) {
+        if (podeUsar && !vaultUnlocked && !usuarioTrancouManualmente && !isCheckingVault && telaEmPrimeiroPlano && !jaDisparouAuto) {
             jaDisparouAuto = true
             delay(250)
             dispararDigital()
@@ -269,7 +313,7 @@ fun BotaoBiometriaPin(
 }
 
 // =========================================================================
-// 4. COMPONENTE PRONTO PARA O MENU LATERAL (CHAVE LIGAR / DESLIGAR)
+// 5. ITEM DO MENU LATERAL (CHAVE LIGAR / DESLIGAR BIOMETRIA)
 // =========================================================================
 @Composable
 fun ItemMenuBiometria(
