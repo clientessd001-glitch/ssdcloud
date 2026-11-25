@@ -149,11 +149,30 @@ fun recolherDiagnosticoNativo(context: Context): String {
     return sb.toString().replace("\u0000", "").trim()
 }
 
-class NexusApp : Application() {
+class NexusApp : Application(), coil.ImageLoaderFactory {
     @Volatile
     var client: Client? = null
     @Volatile
     var startupError: String? = null
+
+    override fun newImageLoader(): coil.ImageLoader {
+        return coil.ImageLoader.Builder(this)
+            .memoryCache {
+                coil.memory.MemoryCache.Builder(this)
+                    .maxSizePercent(0.28)
+                    .build()
+            }
+            .diskCache {
+                coil.disk.DiskCache.Builder()
+                    .directory(File(cacheDir, "nexus_coil_cache"))
+                    .maxSizeBytes(80L * 1024L * 1024L)
+                    .build()
+            }
+            .allowRgb565(true)
+            .crossfade(false)
+            .respectCacheHeaders(false)
+            .build()
+    }
 
     override fun onCreate() {
         super.onCreate()
