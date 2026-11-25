@@ -1481,20 +1481,26 @@ object NexusPreviewTurbo {
         }
     }
 
-    fun cancelarDownloadsPreviewAtivos(client: Client) {
-        val chaves = downloadsAtivosPorItem.keys.toList()
-        for (ts in chaves) {
-            cancelarDownloadItem(client, ts)
-        }
+fun cancelarDownloadsPreviewAtivos(client: Client) {
+        try {
+            val it = downloadsAtivosPorItem.keys.iterator()
+            while (it.hasNext()) {
+                val ts = it.next()
+                cancelarDownloadItem(client, ts)
+            }
+        } catch (_: Throwable) {}
     }
 
     fun cancelarForaDosVisiveis(client: Client, idsVisiveis: Set<Long>) {
-        val chaves = downloadsAtivosPorItem.keys.toList()
-        for (ts in chaves) {
-            if (!idsVisiveis.contains(ts)) {
-                cancelarDownloadItem(client, ts)
+        try {
+            val it = downloadsAtivosPorItem.keys.iterator()
+            while (it.hasNext()) {
+                val ts = it.next()
+                if (!idsVisiveis.contains(ts)) {
+                    cancelarDownloadItem(client, ts)
+                }
             }
-        }
+        } catch (_: Throwable) {}
     }
 
     fun registrarCaminhoValido(caminho: String?) {
