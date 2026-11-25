@@ -7537,13 +7537,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         }
 
                         Spacer(Modifier.height(12.dp))
-                        TextButton(
-                            onClick = {
-                                vaultErrorMsg = null
-                                vaultPinInput = ""
-                                vaultNameInput = ""
-                                isSwitchingUser = true
-                            }
                             BotaoBiometriaPin(
                             context = context,
                             usuarioAtivo = activeVaultUser,
