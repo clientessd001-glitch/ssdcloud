@@ -6444,20 +6444,34 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
 
-    // Recupera o último utilizador salvo e o seu modo híbrido (MS ou CP)
+ // Recupera o último utilizador salvo (ou retorno do seletor de upload) e o modo híbrido (MS ou CP)
     val ultimoUsuarioSalvo = remember { obterUltimoUsuarioCofre(context) }
-    var activeVaultUser by remember { mutableStateOf(ultimoUsuarioSalvo) }
-    var vaultStorageMode by remember { mutableStateOf(obterModoCofreLocal(context, ultimoUsuarioSalvo)) }
+    val usuarioRetornoUpload = remember { NexusSessaoUpload.obterUsuarioPendente(context) }
+    val usuarioInicial = usuarioRetornoUpload ?: ultimoUsuarioSalvo
+
+    var activeVaultUser by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(usuarioInicial)
+    }
+    var vaultStorageMode by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(obterModoCofreLocal(context, usuarioInicial))
+    }
     var newVaultModeInput by remember { mutableStateOf("MS") }
-    var vaultUnlocked by remember { mutableStateOf(false) }
-    var isSwitchingUser by remember { mutableStateOf(ultimoUsuarioSalvo.isBlank()) }
+    var vaultUnlocked by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(usuarioRetornoUpload != null)
+    }
+    var isSwitchingUser by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(usuarioInicial.isBlank())
+    }
     var isCreatingNewVault by remember { mutableStateOf(false) }
     var vaultNameInput by remember { mutableStateOf("") }
     var vaultPinInput by remember { mutableStateOf("") }
     var vaultErrorMsg by remember { mutableStateOf<String?>(null) }
     var isCheckingVault by remember { mutableStateOf(false) }
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
-
+    var biometriaAtiva by remember { mutableStateOf(NexusBiometria.estaAtiva(context)) }
+    var usuarioTrancouManualmente by androidx.compose.runtime.saveable.rememberSaveable {
+        mutableStateOf(false)
+    }
     // Estados do Painel Admin e do Bloqueio Remoto Anti-Offline
     var showAdminPanel by remember { mutableStateOf(false) }
     val statusInicialLocal = remember(ultimoUsuarioSalvo) { obterStatusCofreLocal(context, ultimoUsuarioSalvo) }
@@ -6584,6 +6598,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     fun processarFilaMiniaturasNuvem(listaArquivosCofre: List<ArquivoNuvem>) {
         jobFilaMiniaturas?.cancel()
+        NexusSessaoUpload.limparAberturaSeletor(context)
+                    usuarioTrancouManualmente = true
         jobFilaMiniaturas = scope.launch(Dispatchers.IO) {
             val pendentes = listaArquivosCofre
                 .sortedByDescending { it.dataUpload }
@@ -6686,6 +6702,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                 if (bloqueadoRemoto) {
                     scope.launch(Dispatchers.Main) {
                         jobFilaMiniaturas?.cancel()
+                        NexusSessaoUpload.limparAberturaSeletor(context)
+                    usuarioTrancouManualmente = true
                         NexusLeituraNuvem.encerrar()
                         NexusTransfer.cancelar(client)
                         vaultUnlocked = false
@@ -7204,7 +7222,10 @@ fun NexusUI(dao: NexusDao, client: Client) {
 
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
-            uris.forEach { u ->
+            uris.forEach { u -> NexusSessaoUpload.limparAberturaSeletor(context)
+        if (uris.isNotEmpty() && activeVaultUser.isNotBlank()) {
+            vaultUnlocked = true
+        }
                 try { context.contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
             }
             if (pastaAberta != null) executarUploads(uris, pastaAberta!!)
@@ -7523,6 +7544,44 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 vaultNameInput = ""
                                 isSwitchingUser = true
                             }
+                            BotaoBiometriaPin(
+                            context = context,
+                            usuarioAtivo = activeVaultUser,
+                            biometriaAtiva = biometriaAtiva,
+                            vaultUnlocked = vaultUnlocked,
+                            usuarioTrancouManualmente = usuarioTrancouManualmente,
+                            isCheckingVault = isCheckingVault,
+                            temPinLocal = obterPinCofreLocal(context, activeVaultUser) != null,
+                            onBiometriaAprovada = {
+                                vaultErrorMsg = null
+                                val stLocalBio = obterStatusCofreLocal(context, activeVaultUser)
+                                if (stLocalBio.bloqueado) {
+                                    isCheckingVault = true
+                                    verificarStatusRemotoCliente(context, client, activeVaultUser) { blq, mot ->
+                                        scope.launch(Dispatchers.Main) {
+                                            isCheckingVault = false
+                                            if (blq) {
+                                                vaultBlockedReason = mot
+                                                vaultBlocked = true
+                                            } else {
+                                                vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
+                                                usuarioTrancouManualmente = false
+                                                vaultPinInput = ""
+                                                vaultUnlocked = true
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    vaultStorageMode = obterModoCofreLocal(context, activeVaultUser)
+                                    usuarioTrancouManualmente = false
+                                    vaultPinInput = ""
+                                    vaultUnlocked = true
+                                }
+                            },
+                            onErroBiometria = { msgErro ->
+                                vaultErrorMsg = msgErro
+                            }
+                        )
                         ) {
                             Text("Entrar com outro utilizador / Criar Cofre", color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
@@ -9417,6 +9476,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 fontSize = 10.sp
                             )
                         }
+                        ItemMenuBiometria(
+                        context = context,
+                        biometriaAtiva = biometriaAtiva,
+                        onAlterar = { biometriaAtiva = it }
+                    )
                         Switch(
                             checked = ocrAutoNoUpload,
                             onCheckedChange = { novo ->
@@ -9477,6 +9541,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     if (bloqueadoRemoto) {
                                         scope.launch(Dispatchers.Main) {
                                             jobFilaMiniaturas?.cancel()
+                                            NexusSessaoUpload.limparAberturaSeletor(context)
+                                            usuarioTrancouManualmente = true
                                             jobCapasSilencioso?.cancel()
                                             NexusLeituraNuvem.encerrar()
                                             NexusTransfer.cancelar(client)
@@ -9527,6 +9593,8 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         onClick = {
                             scope.launch { drawerState.close() }
                             jobFilaMiniaturas?.cancel()
+                            NexusSessaoUpload.limparAberturaSeletor(context)
+                            usuarioTrancouManualmente = true
                             NexusLeituraNuvem.encerrar()
                             NexusTransfer.cancelar(client)
                             pastaAberta = null
@@ -9642,6 +9710,8 @@ var modoVisualizacao by remember { mutableIntStateOf(obterModoVisualizacaoGaleri
                                 onAlternarExpandido = { progressoExpandido = !progressoExpandido },
                                 onTrancar = {
                                     jobFilaMiniaturas?.cancel()
+                                    NexusSessaoUpload.limparAberturaSeletor(context)
+                                    usuarioTrancouManualmente = true
                                     NexusLeituraNuvem.encerrar()
                                     NexusTransfer.cancelar(client)
                                     progressoExpandido = false
@@ -9667,6 +9737,8 @@ var modoVisualizacao by remember { mutableIntStateOf(obterModoVisualizacaoGaleri
                         onRecolher = { progressoExpandido = false },
                         onCancelarLeitura = {
                             jobFilaMiniaturas?.cancel()
+                            NexusSessaoUpload.limparAberturaSeletor(context)
+                            usuarioTrancouManualmente = true
                             NexusLeituraNuvem.encerrar()
                         },
                         onTransferCancelada = {
@@ -9799,6 +9871,7 @@ var modoVisualizacao by remember { mutableIntStateOf(obterModoVisualizacaoGaleri
             },
             floatingActionButton = {
                 if (!isSelectionMode) {
+                    NexusSessaoUpload.registrarAberturaSeletor(context, activeVaultUser)
                     FloatingActionButton(onClick = { filePicker.launch(arrayOf("*/*")) }, containerColor = DangerRed, contentColor = Color.White, shape = CircleShape, modifier = Modifier.shadow(16.dp, CircleShape)) {
                         Icon(Icons.Default.CloudUpload, null)
                     }
