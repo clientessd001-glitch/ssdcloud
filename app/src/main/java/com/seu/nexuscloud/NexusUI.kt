@@ -9381,7 +9381,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
         }
     }
 
-    ModalNavigationDrawer(
+ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
             ModalDrawerSheet(drawerContainerColor = SurfaceDark, modifier = Modifier.width(300.dp)) {
@@ -9442,7 +9442,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         },
                         colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
                     )
-    // Chave liga/desliga do OCR automático no upload (economia de bateria em lotes grandes)
+                    // Chave liga/desliga do OCR automático no upload (economia de bateria em lotes grandes)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -9486,37 +9486,6 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 Toast.makeText(
                                     context,
                                     if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            },
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = BgBlack,
-                                checkedTrackColor = Gold,
-                                uncheckedThumbColor = TextGrey,
-                                uncheckedTrackColor = SurfaceDarker
-                            )
-                        )
-                    }
-
-                        Switch(
-                            checked = ocrAutoNoUpload,
-                            onCheckedChange = { novo ->
-                                ocrAutoNoUpload = novo
-                                salvarOcrAutoNoUpload(context, novo)
-                                Toast.makeText(
-                                    context,
-                                    if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
-                                    Toast.LENGTH_SHORT
-                                ).show()
-                            },
-                            Switch(
-                            checked = ocrAutoNoUpload,
-                            onCheckedChange = { novo ->
-                                ocrAutoNoUpload = novo
-                                salvarOcrAutoNoUpload(context, novo)
-                                Toast.makeText(
-                                    context,
-if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
                                     Toast.LENGTH_SHORT
                                 ).show()
                             },
