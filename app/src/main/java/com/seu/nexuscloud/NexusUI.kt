@@ -9497,11 +9497,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             )
                         )
                     }
-                    ItemMenuBiometria(
-                        context = context,
-                        biometriaAtiva = biometriaAtiva,
-                        onAlterar = { biometriaAtiva = it }
-                    )
+
                         Switch(
                             checked = ocrAutoNoUpload,
                             onCheckedChange = { novo ->
@@ -9513,6 +9509,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                     Toast.LENGTH_SHORT
                                 ).show()
                             },
+                            Switch(
+                            checked = ocrAutoNoUpload,
+                            onCheckedChange = { novo ->
+                                ocrAutoNoUpload = novo
+                                salvarOcrAutoNoUpload(context, novo)
+                                Toast.makeText(
+                                    context,
+if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = BgBlack,
                                 checkedTrackColor = Gold,
@@ -9521,6 +9528,11 @@ fun NexusUI(dao: NexusDao, client: Client) {
                             )
                         )
                     }
+                    ItemMenuBiometria(
+                        context = context,
+                        biometriaAtiva = biometriaAtiva,
+                        onAlterar = { biometriaAtiva = it }
+                    )
                     NavigationDrawerItem(
                         icon = { Icon(Icons.Default.Refresh, null) },
                         label = { Text("Cache do SSD Nexus") },
