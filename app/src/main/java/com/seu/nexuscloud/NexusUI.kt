@@ -7582,6 +7582,14 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 vaultErrorMsg = msgErro
                             }
                         )
+
+                        TextButton(
+                            onClick = {
+                                vaultErrorMsg = null
+                                vaultPinInput = ""
+                                vaultNameInput = ""
+                                isSwitchingUser = true
+                            }
                         ) {
                             Text("Entrar com outro utilizador / Criar Cofre", color = Gold, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
