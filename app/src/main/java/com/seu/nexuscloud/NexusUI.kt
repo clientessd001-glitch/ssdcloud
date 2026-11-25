@@ -6444,24 +6444,16 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var smsCode by remember { mutableStateOf("") }
     var password2FA by remember { mutableStateOf("") }
 
- // Recupera o último utilizador salvo (ou retorno do seletor de upload) e o modo híbrido (MS ou CP)
+// Recupera o último utilizador salvo (ou retorno imediato do seletor de upload)
     val ultimoUsuarioSalvo = remember { obterUltimoUsuarioCofre(context) }
-    val usuarioRetornoUpload = remember { NexusSessaoUpload.obterUsuarioPendente(context) }
+    val usuarioRetornoUpload = remember { NexusSessaoUpload.consumirUsuarioPendente(context) }
     val usuarioInicial = usuarioRetornoUpload ?: ultimoUsuarioSalvo
 
-    var activeVaultUser by androidx.compose.runtime.saveable.rememberSaveable {
-        mutableStateOf(usuarioInicial)
-    }
-    var vaultStorageMode by androidx.compose.runtime.saveable.rememberSaveable {
-        mutableStateOf(obterModoCofreLocal(context, usuarioInicial))
-    }
+    var activeVaultUser by remember { mutableStateOf(usuarioInicial) }
+    var vaultStorageMode by remember { mutableStateOf(obterModoCofreLocal(context, usuarioInicial)) }
     var newVaultModeInput by remember { mutableStateOf("MS") }
-    var vaultUnlocked by androidx.compose.runtime.saveable.rememberSaveable {
-        mutableStateOf(usuarioRetornoUpload != null)
-    }
-    var isSwitchingUser by androidx.compose.runtime.saveable.rememberSaveable {
-        mutableStateOf(usuarioInicial.isBlank())
-    }
+    var vaultUnlocked by remember { mutableStateOf(usuarioRetornoUpload != null) }
+    var isSwitchingUser by remember { mutableStateOf(usuarioInicial.isBlank()) }
     var isCreatingNewVault by remember { mutableStateOf(false) }
     var vaultNameInput by remember { mutableStateOf("") }
     var vaultPinInput by remember { mutableStateOf("") }
@@ -6469,8 +6461,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var isCheckingVault by remember { mutableStateOf(false) }
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
     var biometriaAtiva by remember { mutableStateOf(NexusBiometria.estaAtiva(context)) }
-    var usuarioTrancouManualmente by androidx.compose.runtime.saveable.rememberSaveable {
-        mutableStateOf(false)
+    var usuarioTrancouManualmente by remember { mutableStateOf(false) }
     }
     // Estados do Painel Admin e do Bloqueio Remoto Anti-Offline
     var showAdminPanel by remember { mutableStateOf(false) }
@@ -9441,7 +9432,7 @@ fun NexusUI(dao: NexusDao, client: Client) {
                         },
                         colors = NavigationDrawerItemDefaults.colors(unselectedTextColor = Color.White, unselectedIconColor = Gold)
                     )
-                    // Chave liga/desliga do OCR automático no upload (economia de bateria em lotes grandes)
+    // Chave liga/desliga do OCR automático no upload (economia de bateria em lotes grandes)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -9477,7 +9468,26 @@ fun NexusUI(dao: NexusDao, client: Client) {
                                 fontSize = 10.sp
                             )
                         }
-                        ItemMenuBiometria(
+                        Switch(
+                            checked = ocrAutoNoUpload,
+                            onCheckedChange = { novo ->
+                                ocrAutoNoUpload = novo
+                                salvarOcrAutoNoUpload(context, novo)
+                                Toast.makeText(
+                                    context,
+                                    if (novo) "OCR automático no upload ativado." else "OCR automático desligado (economia de bateria).",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = BgBlack,
+                                checkedTrackColor = Gold,
+                                uncheckedThumbColor = TextGrey,
+                                uncheckedTrackColor = SurfaceDarker
+                            )
+                        )
+                    }
+                    ItemMenuBiometria(
                         context = context,
                         biometriaAtiva = biometriaAtiva,
                         onAlterar = { biometriaAtiva = it }
