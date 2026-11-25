@@ -52,7 +52,7 @@ object NexusSessaoUpload {
     private const val PREFS = "nexus_vault_prefs"
     private const val KEY_TS = "picker_active_ts"
     private const val KEY_USER = "picker_active_user"
-    private const val JANELA_MS = 300_000L // 5 minutos para escolher arquivos
+    private const val JANELA_MS = 90_000L // 90 segundos só para voltar do seletor
 
     fun registrarAberturaSeletor(context: Context, usuario: String) {
         if (usuario.isBlank()) return
@@ -60,8 +60,27 @@ object NexusSessaoUpload {
             .edit()
             .putLong(KEY_TS, System.currentTimeMillis())
             .putString(KEY_USER, usuario)
-            .commit() // commit síncrono antes de sair para o seletor nativo
+            .commit()
     }
+
+    // Lê e já APAGA imediatamente (uso único: só vale para o retorno do seletor)
+    fun consumirUsuarioPendente(context: Context): String? {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val ts = prefs.getLong(KEY_TS, 0L)
+        val user = prefs.getString(KEY_USER, null)
+        prefs.edit().remove(KEY_TS).remove(KEY_USER).commit()
+        val dentroDaJanela = ts > 0L && (System.currentTimeMillis() - ts) in 0L..JANELA_MS
+        return if (dentroDaJanela && !user.isNullOrBlank()) user else null
+    }
+
+    fun limparAberturaSeletor(context: Context) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .remove(KEY_TS)
+            .remove(KEY_USER)
+            .commit()
+    }
+}
 
     fun obterUsuarioPendente(context: Context): String? {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
