@@ -6462,7 +6462,17 @@ fun NexusUI(dao: NexusDao, client: Client) {
     var procurandoPerfisNuvem by remember { mutableStateOf(false) }
     var biometriaAtiva by remember { mutableStateOf(NexusBiometria.estaAtiva(context)) }
     var usuarioTrancouManualmente by remember { mutableStateOf(false) }
-    }
+
+    // Tranca automaticamente sempre que fechar ou minimizar o app (exceto ao escolher arquivo para upload)
+    BloqueioAutomaticoAoSair(
+        context = context,
+        vaultUnlocked = vaultUnlocked,
+        onTrancarCofre = {
+            vaultUnlocked = false
+            vaultPinInput = ""
+            usuarioTrancouManualmente = false
+        }
+    )
     // Estados do Painel Admin e do Bloqueio Remoto Anti-Offline
     var showAdminPanel by remember { mutableStateOf(false) }
     val statusInicialLocal = remember(ultimoUsuarioSalvo) { obterStatusCofreLocal(context, ultimoUsuarioSalvo) }
