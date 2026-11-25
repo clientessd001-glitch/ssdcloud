@@ -3559,7 +3559,7 @@ fun sincronizarCofreDaNuvem(
     }
 }
 
-// === CARREGAMENTO TURBO DE MINIATURAS: 6 PARALELOS PARA CAPAS LEVES + 2 PARA FALLBACK ===
+// === CARREGAMENTO TURBO MODO UNLIM: 8 CAPAS LEVES + 5 FOTOS SEM THUMB + CANCELAMENTO TDLIB ===
 suspend fun carregarMiniaturaIndividualDaNuvem(
     context: Context,
     client: Client,
@@ -3603,7 +3603,6 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
     var fIdAtual = arq.fileId
     var thumbIdLeve = NexusThumbCache.mapaThumbIdsNuvem[fIdAtual] ?: 0
 
-    // Evita varrer o histórico repetidamente para o mesmo arquivo
     if ((fIdAtual == 0 || (thumbIdLeve == 0 && ehArquivoVideo(arq.nomeArquivo))) &&
         usuarioAtivo.isNotBlank() &&
         !apenasCapaLeve &&
@@ -3621,19 +3620,27 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
 
     var miniaturaPronta = ""
 
-    // 1. Via expressa: 6 downloads simultâneos só para capas leves (~15-30 KB)
+    // 1. Via expressa: 8 downloads simultâneos só para capas leves (~15-30 KB)
     if (thumbIdLeve != 0) {
         val arqThumb = NexusPreviewTurbo.semaforoCapasLeves.withPermit {
-            baixarArquivoTDLibAssincrono(
-                client = client,
-                fileId = thumbIdLeve,
-                prioridade = prioridadeRede,
-                maxTentativas = 70,
-                controlarPausaTransfer = false
-            ) { pct, _, _ ->
-                if (atualizarSubBarra) {
-                    NexusLeituraNuvem.atualizarSubProgresso(pct, "Capa rápida SSD: ${arq.nomeArquivo}")
+            NexusPreviewTurbo.registrarDownloadAtivo(arq.dataUpload, thumbIdLeve, ehCapaLeve = true)
+            try {
+                baixarArquivoTDLibAssincrono(
+                    client = client,
+                    fileId = thumbIdLeve,
+                    prioridade = prioridadeRede,
+                    maxTentativas = 70,
+                    controlarPausaTransfer = false
+                ) { pct, _, _ ->
+                    if (atualizarSubBarra) {
+                        NexusLeituraNuvem.atualizarSubProgresso(pct, "Capa rápida SSD: ${arq.nomeArquivo}")
+                    }
                 }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                NexusPreviewTurbo.cancelarDownloadItem(client, arq.dataUpload)
+                throw ce
+            } finally {
+                NexusPreviewTurbo.limparDownloadAtivo(arq.dataUpload)
             }
         }
         if (arqThumb != null && arqThumb.exists() && arqThumb.length() > 100L) {
@@ -3641,29 +3648,37 @@ suspend fun carregarMiniaturaIndividualDaNuvem(
         }
     }
 
-    // 2. Fallback completo (semáforo separado de 2 conexões; ignorado no prefetch de arquivos pesados)
+    // 2. Fallback separado: 5 paralelos para fotos/PDFs sem thumbId; 2 para vídeos
     val ext = arq.nomeArquivo.substringAfterLast('.', "").uppercase(Locale.ROOT)
     val ehVideo = ehArquivoVideo(arq.nomeArquivo)
     val podeBaixarParaCapa = ehArquivoImagem(arq.nomeArquivo) || ehVideo || ext == "PDF"
     val limiteBytesCapa = when {
-        apenasCapaLeve && ehVideo -> 0L
-        apenasCapaLeve -> 3L * 1024L * 1024L
+        apenasCapaLeve -> 0L
         ehVideo -> 25L * 1024L * 1024L
         else -> 60L * 1024L * 1024L
     }
 
     if (miniaturaPronta.isBlank() && fIdAtual != 0 && podeBaixarParaCapa && limiteBytesCapa > 0L && arq.tamanhoBytes <= limiteBytesCapa) {
-        val arqFull = NexusPreviewTurbo.semaforoFallbackCompleto.withPermit {
-            baixarArquivoTDLibAssincrono(
-                client = client,
-                fileId = fIdAtual,
-                prioridade = (prioridadeRede - 8).coerceAtLeast(10),
-                maxTentativas = 350,
-                controlarPausaTransfer = false
-            ) { pct, _, _ ->
-                if (atualizarSubBarra) {
-                    NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
+        val semaforoAlvo = if (ehVideo) NexusPreviewTurbo.semaforoFallbackVideos else NexusPreviewTurbo.semaforoFallbackFotos
+        val arqFull = semaforoAlvo.withPermit {
+            NexusPreviewTurbo.registrarDownloadAtivo(arq.dataUpload, fIdAtual, ehCapaLeve = false)
+            try {
+                baixarArquivoTDLibAssincrono(
+                    client = client,
+                    fileId = fIdAtual,
+                    prioridade = if (ehVideo) (prioridadeRede - 10).coerceAtLeast(10) else (prioridadeRede - 3).coerceAtLeast(18),
+                    maxTentativas = if (ehVideo) 350 else 180,
+                    controlarPausaTransfer = false
+                ) { pct, _, _ ->
+                    if (atualizarSubBarra) {
+                        NexusLeituraNuvem.atualizarSubProgresso(pct, "Gerando capa nítida: ${arq.nomeArquivo} ($pct%)")
+                    }
                 }
+            } catch (ce: kotlinx.coroutines.CancellationException) {
+                NexusPreviewTurbo.cancelarDownloadItem(client, arq.dataUpload)
+                throw ce
+            } finally {
+                NexusPreviewTurbo.limparDownloadAtivo(arq.dataUpload)
             }
         }
         if (arqFull != null && arqFull.exists() && arqFull.length() > 100L) {
